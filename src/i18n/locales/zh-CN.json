@@ -1,0 +1,16 @@
+{
+  "app": { "name": "BucketCat" },
+  "sidebar": {
+    "connections": "连接",
+    "addConnection": "添加连接",
+    "settings": "设置"
+  },
+  "main": {
+    "breadcrumbPlaceholder": "选择一个存储桶开始浏览",
+    "searchPlaceholder": "按前缀搜索",
+    "upload": "上传",
+    "emptyTitle": "还没有连接",
+    "emptyHint": "添加一个对象存储连接开始使用"
+  },
+  "transfer": { "idle": "暂无传输任务" }
+}

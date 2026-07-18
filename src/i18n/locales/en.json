@@ -1,0 +1,16 @@
+{
+  "app": { "name": "BucketCat" },
+  "sidebar": {
+    "connections": "Connections",
+    "addConnection": "Add Connection",
+    "settings": "Settings"
+  },
+  "main": {
+    "breadcrumbPlaceholder": "Select a bucket to start browsing",
+    "searchPlaceholder": "Search by prefix",
+    "upload": "Upload",
+    "emptyTitle": "No connections yet",
+    "emptyHint": "Add an object storage connection to get started"
+  },
+  "transfer": { "idle": "No active transfers" }
+}
