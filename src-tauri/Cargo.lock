@@ -317,7 +317,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bucketcat-scaffold"
+name = "bucketcat"
 version = "0.1.0"
 dependencies = [
  "serde",

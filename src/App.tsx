@@ -1,11 +1,7 @@
-import { Button } from "@/components/ui/button";
+import { AppShell } from "@/components/layout/app-shell";
 
 function App() {
-  return (
-    <div className="flex h-screen items-center justify-center bg-background">
-      <Button>BucketCat</Button>
-    </div>
-  );
+  return <AppShell />;
 }
 
 export default App;

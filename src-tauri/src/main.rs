@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    bucketcat_scaffold_lib::run()
+    bucketcat_lib::run()
 }
