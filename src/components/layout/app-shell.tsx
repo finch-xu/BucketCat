@@ -1,15 +1,32 @@
+import { AddConnectionModal } from "@/components/modals/add-connection-modal";
+import { SettingsModal } from "@/components/modals/settings-modal";
+import { AppStoreProvider } from "@/store/app-store";
+import { DetailsPanel } from "./details-panel";
+import { FileBrowser } from "./file-browser";
 import { Sidebar } from "./sidebar";
-import { MainPanel } from "./main-panel";
+import { TitleBar } from "./title-bar";
+import { Toolbar } from "./toolbar";
 import { TransferBar } from "./transfer-bar";
 
 export function AppShell() {
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground">
-      <div className="flex min-h-0 flex-1">
-        <Sidebar />
-        <MainPanel />
+    <AppStoreProvider>
+      <div className="relative flex h-screen flex-col overflow-hidden bg-background text-foreground">
+        <TitleBar />
+        <div className="flex min-h-0 flex-1">
+          <Sidebar />
+          <section className="flex min-w-0 flex-1 flex-col bg-panel">
+            <Toolbar />
+            <div className="flex min-h-0 flex-1">
+              <FileBrowser />
+              <DetailsPanel />
+            </div>
+          </section>
+        </div>
+        <TransferBar />
+        <AddConnectionModal />
+        <SettingsModal />
       </div>
-      <TransferBar />
-    </div>
+    </AppStoreProvider>
   );
 }
