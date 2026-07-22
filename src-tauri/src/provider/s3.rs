@@ -284,17 +284,43 @@ pub(crate) fn folder_marker_key(prefix: &str) -> AppResult<String> {
 /// Maps one per-key DeleteObjects error into a [`FailedKey`], reusing
 /// [`classify_error_code`] so the `code` is an `AppError`-style i18n code
 /// (`auth/access-denied`, `storage/key-not-found`, ...), falling back to
-/// `"internal"` for codes we don't model. Pure, unit-tested below.
+/// the same "unclassified" code [`AppError::Internal`] itself reports, so
+/// this can never drift from that mapping. Pure, unit-tested below.
 fn failed_key(err: &aws_sdk_s3::types::Error) -> FailedKey {
     let code = err
         .code()
         .and_then(|c| classify_error_code(c, err.message()))
         .map(|e| e.code().to_string())
-        .unwrap_or_else(|| "internal".to_string());
+        .unwrap_or_else(|| {
+            AppError::Internal {
+                message: String::new(),
+            }
+            .code()
+            .to_string()
+        });
     FailedKey {
         key: err.key().unwrap_or_default().to_string(),
         code,
     }
+}
+
+/// Converts a whole-chunk `DeleteObjects` request failure -- a
+/// network/service error that rejected the *entire* chunk before S3 could
+/// even report which individual keys succeeded or failed -- into one
+/// [`FailedKey`] per key in that chunk, all carrying the same normalized
+/// `err.code()`. This is what lets `delete_objects` keep going after a
+/// mid-batch chunk failure (design §7: never abort the whole batch)
+/// instead of losing track of which keys in the failing chunk were never
+/// even attempted. Pure, unit-tested below.
+fn chunk_failure_keys(chunk: &[String], err: &AppError) -> Vec<FailedKey> {
+    let code = err.code().to_string();
+    chunk
+        .iter()
+        .map(|key| FailedKey {
+            key: key.clone(),
+            code: code.clone(),
+        })
+        .collect()
 }
 
 /// Normalizes any of the three bucket-operation `SdkError`s into an
@@ -433,17 +459,30 @@ impl Provider for S3Provider {
                 .map_err(|e| AppError::Internal {
                     message: format!("failed to build delete request: {e}"),
                 })?;
-            let output = self
+            // A whole-chunk failure here (network blip, expired creds mid-
+            // batch, ...) must NOT abort the loop or discard whatever
+            // `succeeded`/`failed` were already accumulated from earlier
+            // chunks (design §7) -- so this is deliberately NOT `?`. Every
+            // key in the failing chunk is instead recorded as failed via
+            // `chunk_failure_keys`, and the loop moves on to the next
+            // chunk.
+            match self
                 .client
                 .delete_objects()
                 .bucket(bucket)
                 .delete(delete)
                 .send()
                 .await
-                .map_err(normalize_s3_error)?;
-            let errors = output.errors();
-            succeeded += (chunk.len() - errors.len()) as u32;
-            failed.extend(errors.iter().map(failed_key));
+            {
+                Ok(output) => {
+                    let errors = output.errors();
+                    succeeded += (chunk.len() - errors.len()) as u32;
+                    failed.extend(errors.iter().map(failed_key));
+                }
+                Err(e) => {
+                    failed.extend(chunk_failure_keys(chunk, &normalize_s3_error(e)));
+                }
+            }
         }
         Ok(BatchResult { succeeded, failed })
     }
@@ -955,6 +994,14 @@ mod tests {
         assert_eq!(encode_copy_source("bkt", "a-b_c.d~e/f"), "bkt/a-b_c.d~e/f");
     }
 
+    #[test]
+    fn encode_copy_source_encodes_question_mark_and_hash() {
+        assert_eq!(
+            encode_copy_source("bkt", "weird?name#1.txt"),
+            "bkt/weird%3Fname%231.txt"
+        );
+    }
+
     // --- folder_marker_key (pure) -------------------------------------------
 
     #[test]
@@ -966,6 +1013,16 @@ mod tests {
     fn folder_marker_key_normalizes_existing_slashes() {
         assert_eq!(folder_marker_key("newdir/").unwrap(), "newdir/");
         assert_eq!(folder_marker_key("/newdir").unwrap(), "newdir/");
+    }
+
+    #[test]
+    fn folder_marker_key_single_segment_without_slash() {
+        assert_eq!(folder_marker_key("a").unwrap(), "a/");
+    }
+
+    #[test]
+    fn folder_marker_key_collapses_multiple_trailing_slashes() {
+        assert_eq!(folder_marker_key("a//").unwrap(), "a/");
     }
 
     #[test]
@@ -1008,6 +1065,30 @@ mod tests {
         let f = failed_key(&aws_sdk_s3::types::Error::builder().build());
         assert_eq!(f.key, "");
         assert_eq!(f.code, "internal");
+    }
+
+    // --- chunk_failure_keys (pure) ------------------------------------------
+
+    #[test]
+    fn chunk_failure_keys_maps_every_key_to_the_same_normalized_code() {
+        let chunk = vec![
+            "a.txt".to_string(),
+            "b.txt".to_string(),
+            "c.txt".to_string(),
+        ];
+
+        let result = chunk_failure_keys(&chunk, &AppError::Timeout);
+
+        assert_eq!(result.len(), chunk.len());
+        for (failed, key) in result.iter().zip(chunk.iter()) {
+            assert_eq!(&failed.key, key);
+            assert_eq!(failed.code, "network/timeout");
+        }
+    }
+
+    #[test]
+    fn chunk_failure_keys_empty_chunk_yields_empty_vec() {
+        assert!(chunk_failure_keys(&[], &AppError::Unreachable).is_empty());
     }
 
     // --- classify_error_code: NoSuchKey -------------------------------------
