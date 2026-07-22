@@ -29,6 +29,9 @@ pub enum AppError {
     #[error("bucket already exists: {bucket}")]
     BucketExists { bucket: String },
 
+    #[error("object key not found: {key}")]
+    KeyNotFound { key: String },
+
     #[error("connection not found: {id}")]
     ConnectionNotFound { id: String },
 
@@ -53,6 +56,7 @@ impl AppError {
             AppError::Unreachable => "network/unreachable",
             AppError::BucketNotFound { .. } => "storage/bucket-not-found",
             AppError::BucketExists { .. } => "storage/bucket-exists",
+            AppError::KeyNotFound { .. } => "storage/key-not-found",
             AppError::ConnectionNotFound { .. } => "storage/connection-not-found",
             AppError::StoreIo { .. } => "local/store-io",
             AppError::DecryptFailed => "local/decrypt-failed",
@@ -67,6 +71,9 @@ impl AppError {
         match self {
             AppError::BucketNotFound { bucket } | AppError::BucketExists { bucket } => {
                 p.insert("bucket".to_string(), bucket.clone());
+            }
+            AppError::KeyNotFound { key } => {
+                p.insert("key".to_string(), key.clone());
             }
             AppError::ConnectionNotFound { id } => {
                 p.insert("id".to_string(), id.clone());
@@ -283,5 +290,16 @@ mod tests {
             .build();
         let e: AppError = aws_sdk_s3::Error::AccessDenied(inner).into();
         assert_eq!(e.code(), "auth/access-denied");
+    }
+
+    #[test]
+    fn key_not_found_maps_code_and_params() {
+        let e = AppError::KeyNotFound {
+            key: "docs/readme.md".into(),
+        };
+        assert_eq!(e.code(), "storage/key-not-found");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "storage/key-not-found");
+        assert_eq!(v["params"]["key"], "docs/readme.md");
     }
 }
