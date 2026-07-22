@@ -8,7 +8,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
 import { useAddConnection } from "@/hooks/use-connections";
@@ -86,6 +86,11 @@ export function AddConnectionModal() {
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [testStatus, setTestStatus] = useState<TestStatus>({ kind: "idle" });
+  // Guards against a stale in-flight `testConnection` result landing after
+  // the user has since edited a field or fired off a newer test -- only the
+  // most recent request id's resolution/rejection is allowed to update
+  // `testStatus`.
+  const testReqIdRef = useRef(0);
 
   // Reset the whole wizard every time it's (re)opened, so a previous run's
   // step/provider/values/test result never leak into the next one.
@@ -96,6 +101,7 @@ export function AddConnectionModal() {
       setForm(EMPTY_FORM);
       setFieldErrors({});
       setTestStatus({ kind: "idle" });
+      testReqIdRef.current++;
       addMutation.reset();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -105,10 +111,20 @@ export function AddConnectionModal() {
 
   const provider = PROVIDERS.find((p) => p.id === providerId);
 
+  /** Advances to step 2 for the tapped provider. Re-tapping the SAME
+   * provider (e.g. after using the step-2 back button) leaves the form
+   * completely untouched. Switching to a DIFFERENT provider preserves
+   * whatever the user already typed into name/access_key_id/
+   * secret_access_key/default_bucket and only re-seeds endpoint/region
+   * from the new provider's metadata. */
   function chooseProvider(id: string) {
+    if (id === providerId) {
+      setStep(2);
+      return;
+    }
     const meta = providerMeta(id);
     setProviderId(id);
-    setForm({ ...EMPTY_FORM, endpoint: meta.endpoint, region: meta.region });
+    setForm((f) => ({ ...f, endpoint: meta.endpoint, region: meta.region }));
     setFieldErrors({});
     setTestStatus({ kind: "idle" });
     setStep(2);
@@ -116,7 +132,6 @@ export function AddConnectionModal() {
 
   function backToProviders() {
     setStep(1);
-    setProviderId(null);
   }
 
   function updateField(key: keyof FormState, value: string) {
@@ -124,6 +139,9 @@ export function AddConnectionModal() {
     if (fieldErrors[key as RequiredField]) {
       setFieldErrors((e) => ({ ...e, [key]: undefined }));
     }
+    // Invalidate any in-flight test request -- its result must not land on
+    // a form the user has since changed -- and clear a stale result.
+    testReqIdRef.current++;
     if (testStatus.kind !== "idle") setTestStatus({ kind: "idle" });
   }
 
@@ -134,7 +152,7 @@ export function AddConnectionModal() {
       endpoint: form.endpoint.trim(),
       region: form.region.trim(),
       access_key_id: form.access_key_id.trim(),
-      secret_access_key: form.secret_access_key,
+      secret_access_key: form.secret_access_key.trim(),
       default_bucket: form.default_bucket.trim() ? form.default_bucket.trim() : null,
     };
   }
@@ -150,12 +168,15 @@ export function AddConnectionModal() {
 
   async function handleTest() {
     if (!validate()) return;
+    const reqId = ++testReqIdRef.current;
     setTestStatus({ kind: "pending" });
     try {
       await testConnection(buildInput());
-      setTestStatus({ kind: "success" });
+      if (reqId === testReqIdRef.current) setTestStatus({ kind: "success" });
     } catch (err) {
-      setTestStatus({ kind: "error", error: err as AppError });
+      if (reqId === testReqIdRef.current) {
+        setTestStatus({ kind: "error", error: err as AppError });
+      }
     }
   }
 
@@ -323,7 +344,7 @@ export function AddConnectionModal() {
             <button
               type="button"
               onClick={handleTest}
-              disabled={testStatus.kind === "pending"}
+              disabled={testStatus.kind === "pending" || addMutation.isPending}
               className="inline-flex h-9 shrink-0 cursor-pointer items-center gap-[7px] rounded-[9px] border border-border bg-background px-3.5 text-[13px] font-medium text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
             >
               {testStatus.kind === "pending" ? (
@@ -365,7 +386,7 @@ export function AddConnectionModal() {
             <button
               type="button"
               onClick={handleSave}
-              disabled={addMutation.isPending}
+              disabled={addMutation.isPending || testStatus.kind === "pending"}
               className="inline-flex h-9 shrink-0 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-[18px] text-[13px] font-semibold text-primary-foreground hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-70"
             >
               {addMutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
