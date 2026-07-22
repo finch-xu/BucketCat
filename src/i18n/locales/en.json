@@ -4,7 +4,12 @@
   "sidebar": {
     "connections": "Connections",
     "addConnection": "Add Connection",
-    "settings": "Settings"
+    "settings": "Settings",
+    "loading": "Loading connections…",
+    "retry": "Retry",
+    "noBuckets": "No buckets",
+    "emptyTitle": "No connections yet",
+    "emptyHint": "Click the + above to add your first connection"
   },
   "main": {
     "searchPlaceholder": "Search by prefix…",
@@ -85,6 +90,19 @@
     "about": "About",
     "github": "GitHub repo",
     "checkUpdate": "Check for updates"
+  },
+  "errors": {
+    "auth/invalid-credentials": "Invalid credentials -- check the access key and secret key",
+    "auth/access-denied": "Access denied -- check this account's permissions",
+    "network/timeout": "Connection timed out -- check your network and try again",
+    "network/unreachable": "Could not reach that endpoint",
+    "storage/bucket-not-found": "Bucket not found",
+    "storage/bucket-exists": "Bucket name already taken",
+    "storage/connection-not-found": "Connection not found -- it may have been removed",
+    "local/store-io": "Local connection store read/write failed",
+    "local/decrypt-failed": "Failed to decrypt the local connection store",
+    "local/key-derivation-failed": "Failed to derive the local store encryption key",
+    "internal": "Something went wrong -- please try again"
   },
   "fileTypes": {
     "folder": "Folder",

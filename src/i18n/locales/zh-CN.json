@@ -4,7 +4,12 @@
   "sidebar": {
     "connections": "连接",
     "addConnection": "添加连接",
-    "settings": "设置"
+    "settings": "设置",
+    "loading": "正在加载连接…",
+    "retry": "重试",
+    "noBuckets": "没有存储桶",
+    "emptyTitle": "还没有连接",
+    "emptyHint": "点击右上角的 + 添加第一个连接"
   },
   "main": {
     "searchPlaceholder": "按前缀搜索…",
@@ -85,6 +90,19 @@
     "about": "关于",
     "github": "GitHub 仓库",
     "checkUpdate": "检查更新"
+  },
+  "errors": {
+    "auth/invalid-credentials": "凭据无效，请检查 Access Key 与 Secret Key",
+    "auth/access-denied": "访问被拒绝，请检查该账号的权限",
+    "network/timeout": "连接超时，请检查网络后重试",
+    "network/unreachable": "无法连接到该 Endpoint",
+    "storage/bucket-not-found": "存储桶不存在",
+    "storage/bucket-exists": "存储桶名称已被占用",
+    "storage/connection-not-found": "连接不存在，可能已被删除",
+    "local/store-io": "本地连接存储读写失败",
+    "local/decrypt-failed": "本地连接存储解密失败",
+    "local/key-derivation-failed": "本地密钥派生失败",
+    "internal": "发生未知错误，请稍后重试"
   },
   "fileTypes": {
     "folder": "文件夹",

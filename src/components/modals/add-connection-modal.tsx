@@ -1,7 +1,7 @@
 import { Check, ChevronLeft, ChevronRight, Lock, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
-import { PROVIDERS } from "@/lib/mock-data";
+import { PROVIDERS } from "@/lib/providers";
 import { useApp } from "@/store/app-store";
 
 const INPUT_CLASS =

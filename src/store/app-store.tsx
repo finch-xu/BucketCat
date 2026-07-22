@@ -100,10 +100,10 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
   const [view, setView] = useState<ViewMode>("list");
   const [defaultView, setDefaultView] = useState<ViewMode>("list");
 
-  const [activeConn, setActiveConn] = useState("r2");
-  const [activeBucket, setActiveBucket] = useState("assets");
+  const [activeConn, setActiveConn] = useState("");
+  const [activeBucket, setActiveBucket] = useState("");
   const [path, setPath] = useState<string[]>([]);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({ r2: true });
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
 
