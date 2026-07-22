@@ -4,8 +4,8 @@ pub mod provider;
 pub mod store;
 
 use commands::{
-    add_connection, delete_connection, list_buckets, list_connections, test_connection,
-    update_connection, AppState,
+    add_connection, create_folder, delete_connection, delete_objects, list_buckets,
+    list_connections, list_objects, rename_object, test_connection, update_connection, AppState,
 };
 use tauri::Manager;
 
@@ -24,7 +24,11 @@ pub fn run() {
             update_connection,
             delete_connection,
             test_connection,
-            list_buckets
+            list_buckets,
+            list_objects,
+            delete_objects,
+            rename_object,
+            create_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

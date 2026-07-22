@@ -69,6 +69,15 @@ impl AppState {
             store: Mutex::new(SecureStore { path }),
         })
     }
+
+    /// Loads the full decrypted connection list. The store lock is scoped
+    /// to just this call, so no network-bound work ever holds it — the
+    /// same locking discipline `list_buckets` pioneered, now shared by the
+    /// object commands in `super::object`.
+    pub(crate) async fn load_connections(&self) -> AppResult<Vec<Connection>> {
+        let store = self.store.lock().await;
+        store.load()
+    }
 }
 
 /// Creates `dir` (and any missing parents) if it doesn't already exist, then
@@ -233,10 +242,7 @@ pub async fn list_buckets(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> AppResult<Vec<Bucket>> {
-    let connections = {
-        let store = state.store.lock().await;
-        store.load()?
-    };
+    let connections = state.load_connections().await?;
 
     let connection = connections
         .iter()

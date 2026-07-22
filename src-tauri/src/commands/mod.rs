@@ -7,8 +7,10 @@
 //! `{ code, params }`.
 
 pub mod connection;
+pub mod object;
 
 pub use connection::{
     add_connection, delete_connection, list_buckets, list_connections, test_connection,
     update_connection, AppState,
 };
+pub use object::{create_folder, delete_objects, list_objects, rename_object};
