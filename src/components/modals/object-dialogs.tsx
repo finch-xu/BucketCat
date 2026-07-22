@@ -38,6 +38,15 @@ function NewFolderDialog() {
     () => (pathListingQuery.data?.pages ?? []).flatMap((p) => p.entries),
     [pathListingQuery.data],
   );
+  // Fail CLOSED, not open: until this listing has resolved at least once,
+  // `pathEntries` is `[]` and `nameCollides` would trivially report "no
+  // collision" -- indistinguishable from an actually-empty folder. That's
+  // reachable in practice (the New Folder button is enabled the instant a
+  // bucket is selected, before any listing has loaded) so submission is
+  // blocked, not just left to an optimistic "probably fine". Deliberately
+  // `data !== undefined`, not `!isFetching`: a background refetch of
+  // already-loaded data must not re-block a guard that's already usable.
+  const guardReady = pathListingQuery.data !== undefined;
   const [name, setName] = useState("");
   const [touched, setTouched] = useState(false);
 
@@ -56,7 +65,7 @@ function NewFolderDialog() {
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setTouched(true);
-    if (!valid || collision || createMutation.isPending) return;
+    if (!guardReady || !valid || collision || createMutation.isPending) return;
     createMutation.mutate(pathToPrefix(path) + trimmed, {
       onSuccess: () => closeNewFolder(),
     });
@@ -82,11 +91,19 @@ function NewFolderDialog() {
               placeholder={t("objects.newFolderPlaceholder")}
               className={`${INPUT_CLASS} mt-1.5`}
             />
-            {touched && !valid && (
-              <p className="mt-1.5 text-[12px] text-destructive">{t("objects.invalidName")}</p>
-            )}
-            {touched && valid && collision && (
-              <p className="mt-1.5 text-[12px] text-destructive">{t("objects.nameExists")}</p>
+            {!guardReady ? (
+              <p className="mt-1.5 text-[12px] text-muted-foreground">
+                {t("objects.checkingNames")}
+              </p>
+            ) : (
+              <>
+                {touched && !valid && (
+                  <p className="mt-1.5 text-[12px] text-destructive">{t("objects.invalidName")}</p>
+                )}
+                {touched && valid && collision && (
+                  <p className="mt-1.5 text-[12px] text-destructive">{t("objects.nameExists")}</p>
+                )}
+              </>
             )}
             {createMutation.isError && (
               <p className="mt-1.5 text-[12px] text-destructive">
@@ -104,7 +121,11 @@ function NewFolderDialog() {
           >
             {t("objects.cancel")}
           </button>
-          <button type="submit" disabled={createMutation.isPending} className={PRIMARY_CLASS}>
+          <button
+            type="submit"
+            disabled={createMutation.isPending || !guardReady}
+            className={PRIMARY_CLASS}
+          >
             {createMutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
             {createMutation.isPending ? t("objects.creating") : t("objects.create")}
           </button>
@@ -134,6 +155,12 @@ function RenameObjectDialog() {
     () => (pathListingQuery.data?.pages ?? []).flatMap((p) => p.entries),
     [pathListingQuery.data],
   );
+  // Fail CLOSED, not open -- see the matching comment in `NewFolderDialog`.
+  // Reachable here too: navigate into a large folder, search fast, and
+  // rename before the unfiltered first page has resolved. `data !==
+  // undefined` (not `isFetching`) so an already-usable, merely-refetching
+  // guard doesn't needlessly re-block submission.
+  const guardReady = pathListingQuery.data !== undefined;
   // Safe as the initial value because `ObjectDialogs` keys this component by
   // the target's key -- a different target mounts a fresh instance.
   const [name, setName] = useState(renameTarget?.name ?? "");
@@ -157,7 +184,7 @@ function RenameObjectDialog() {
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setTouched(true);
-    if (!valid || collision || renameMutation.isPending) return;
+    if (!guardReady || !valid || collision || renameMutation.isPending) return;
     renameMutation.mutate(
       { fromKey: target.key, toKey: renameKey(target.key, trimmed) },
       {
@@ -191,11 +218,19 @@ function RenameObjectDialog() {
               onBlur={() => setTouched(true)}
               className={`${INPUT_CLASS} mt-1.5`}
             />
-            {touched && !valid && (
-              <p className="mt-1.5 text-[12px] text-destructive">{t("objects.invalidName")}</p>
-            )}
-            {touched && valid && collision && (
-              <p className="mt-1.5 text-[12px] text-destructive">{t("objects.nameExists")}</p>
+            {!guardReady ? (
+              <p className="mt-1.5 text-[12px] text-muted-foreground">
+                {t("objects.checkingNames")}
+              </p>
+            ) : (
+              <>
+                {touched && !valid && (
+                  <p className="mt-1.5 text-[12px] text-destructive">{t("objects.invalidName")}</p>
+                )}
+                {touched && valid && collision && (
+                  <p className="mt-1.5 text-[12px] text-destructive">{t("objects.nameExists")}</p>
+                )}
+              </>
             )}
             {renameMutation.isError && (
               <p className="mt-1.5 text-[12px] text-destructive">
@@ -213,7 +248,11 @@ function RenameObjectDialog() {
           >
             {t("objects.cancel")}
           </button>
-          <button type="submit" disabled={renameMutation.isPending} className={PRIMARY_CLASS}>
+          <button
+            type="submit"
+            disabled={renameMutation.isPending || !guardReady}
+            className={PRIMARY_CLASS}
+          >
             {renameMutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
             {renameMutation.isPending ? t("objects.renaming") : t("objects.renameSubmit")}
           </button>

@@ -69,6 +69,7 @@
     "cancel": "取消",
     "invalidName": "名称不能为空，且不能包含「/」",
     "nameExists": "当前位置已存在同名的对象或文件夹",
+    "checkingNames": "正在检查现有名称…",
     "partialTitle": "部分对象删除失败",
     "partialSummary": "成功 {{succeeded}} 个 · 失败 {{failed}} 个",
     "close": "关闭",

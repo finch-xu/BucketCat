@@ -69,6 +69,7 @@
     "cancel": "Cancel",
     "invalidName": "A name can't be empty or contain \"/\"",
     "nameExists": "An object or folder with this name already exists here",
+    "checkingNames": "Checking existing names…",
     "partialTitle": "Some objects could not be deleted",
     "partialSummary": "{{succeeded}} succeeded · {{failed}} failed",
     "close": "Close",
