@@ -7,7 +7,9 @@
 //! other caller (in particular `crate::commands`) free of an SDK dependency.
 
 use async_trait::async_trait;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::config::{
+    Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::primitives::DateTimeFormat;
@@ -68,6 +70,15 @@ pub struct S3Provider {
 ///   requests at the wrong region instead of failing fast.
 /// - `force_path_style` is the negation of [`is_aws_endpoint`]: MinIO, R2
 ///   and other self-hosted backends need path-style addressing.
+/// - For every non-AWS endpoint, `request_checksum_calculation` and
+///   `response_checksum_validation` are both explicitly set to
+///   [`RequestChecksumCalculation::WhenRequired`] /
+///   [`ResponseChecksumValidation::WhenRequired`] (design §2, 2026-07-23
+///   revision, **mandatory**): aws-sdk-rust >=1.69 defaults both to
+///   `WhenSupported`, which attaches a request checksum / demands response
+///   checksum validation on every eligible operation -- Cloudflare R2,
+///   older MinIO and Dell ECS all reject that with `NotImplemented`. A real
+///   AWS endpoint keeps the SDK's own default (`WhenSupported`) untouched.
 pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
     if conn.endpoint.trim().is_empty() {
         return Err(AppError::Internal {
@@ -96,13 +107,24 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
         "bucketcat",
     );
 
-    let config = aws_sdk_s3::Config::builder()
+    let mut config_builder = aws_sdk_s3::Config::builder()
         .behavior_version_latest()
         .endpoint_url(conn.endpoint.clone())
         .region(Region::new(region))
         .credentials_provider(credentials)
-        .force_path_style(!is_aws)
-        .build();
+        .force_path_style(!is_aws);
+
+    // See the `from_connection` doc comment: non-AWS endpoints must not get
+    // the SDK's `WhenSupported` default, which breaks R2/older MinIO/Dell
+    // ECS with `NotImplemented`. Real AWS endpoints are left on the SDK
+    // default.
+    if !is_aws {
+        config_builder = config_builder
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+    }
+
+    let config = config_builder.build();
 
     Ok(S3Provider {
         client: aws_sdk_s3::Client::from_conf(config),
@@ -200,8 +222,12 @@ pub(crate) fn display_name(key: &str, is_prefix: bool) -> String {
 /// common prefixes become `is_prefix` entries (listed first), objects
 /// become file entries, and the zero-byte folder-marker object whose key
 /// equals the listed `prefix` itself (created by `create_folder`) is
-/// filtered out. Pure — unit-tested against builder-constructed outputs,
-/// no network.
+/// filtered out -- but *only* when `prefix` denotes a folder (ends with
+/// `/`). The search box (design §6) feeds arbitrary typed text straight
+/// into `prefix`, so typing a file's complete name (e.g. `"readme.md"`)
+/// makes that file's key equal `prefix` too; filtering it out in that case
+/// would make an exact-name search vanish the very file it matched. Pure —
+/// unit-tested against builder-constructed outputs, no network.
 fn to_list_page(
     output: &aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
     prefix: &str,
@@ -220,7 +246,7 @@ fn to_list_page(
     }
     for obj in output.contents() {
         let Some(key) = obj.key() else { continue };
-        if key == prefix {
+        if key == prefix && prefix.ends_with('/') {
             continue;
         }
         entries.push(ObjectEntry {
@@ -669,6 +695,40 @@ mod tests {
         assert!(from_connection(&conn).is_err());
     }
 
+    // --- checksum config (design §2, 2026-07-23 revision) -------------------
+    //
+    // `aws_sdk_s3::Config` exposes public getters for both settings
+    // (`Config::request_checksum_calculation` / `::response_checksum_validation`,
+    // verified against the vendored aws-sdk-s3 1.139.0 source), so this is
+    // asserted directly rather than only smoke-tested.
+
+    #[test]
+    fn non_aws_endpoint_forces_checksum_when_required() {
+        let provider = from_connection(&minio_connection()).unwrap();
+        let config = provider.client.config();
+
+        assert_eq!(
+            config.request_checksum_calculation(),
+            Some(&RequestChecksumCalculation::WhenRequired)
+        );
+        assert_eq!(
+            config.response_checksum_validation(),
+            Some(&ResponseChecksumValidation::WhenRequired)
+        );
+    }
+
+    #[test]
+    fn aws_endpoint_leaves_checksum_config_on_sdk_default() {
+        let provider = from_connection(&aws_connection()).unwrap();
+        let config = provider.client.config();
+
+        // Deliberately unset (not explicitly `WhenSupported`) -- an AWS
+        // endpoint must fall through to whatever the SDK's own default is,
+        // not have this code bake one in.
+        assert_eq!(config.request_checksum_calculation(), None);
+        assert_eq!(config.response_checksum_validation(), None);
+    }
+
     // --- SdkError classification (pure, no network) -------------------------
 
     #[test]
@@ -936,6 +996,37 @@ mod tests {
 
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].key, "docs/readme.md");
+    }
+
+    #[test]
+    fn to_list_page_keeps_a_file_whose_key_exactly_equals_a_non_folder_search_prefix() {
+        // The search box feeds typed text straight into `prefix` (design
+        // §6). Typing a file's complete name, e.g. "readme.md", produces a
+        // ListObjectsV2 call with `prefix == "readme.md"`, and the object
+        // itself has key "readme.md" too -- since "readme.md" doesn't end
+        // in "/", this is NOT the create_folder marker case, so the object
+        // must still be returned instead of silently vanishing.
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .contents(sample_object("readme.md", 42, 1_752_830_520))
+            .build();
+
+        let page = to_list_page(&output, "readme.md");
+
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].key, "readme.md");
+    }
+
+    #[test]
+    fn to_list_page_still_filters_folder_marker_when_prefix_ends_in_slash() {
+        // Companion to the test above: a folder-style prefix ("docs/") must
+        // keep filtering out its own zero-byte marker object.
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .contents(sample_object("docs/", 0, 1_752_830_520))
+            .build();
+
+        let page = to_list_page(&output, "docs/");
+
+        assert!(page.entries.is_empty());
     }
 
     #[test]
