@@ -36,6 +36,8 @@ pub enum AppError {
     StoreIo { message: String },
     #[error("failed to decrypt local store")]
     DecryptFailed,
+    #[error("failed to derive local store encryption key")]
+    KeyDerivationFailed,
 
     #[error("internal error: {message}")]
     Internal { message: String },
@@ -54,6 +56,7 @@ impl AppError {
             AppError::ConnectionNotFound { .. } => "storage/connection-not-found",
             AppError::StoreIo { .. } => "local/store-io",
             AppError::DecryptFailed => "local/decrypt-failed",
+            AppError::KeyDerivationFailed => "local/key-derivation-failed",
             AppError::Internal { .. } => "internal",
         }
     }
@@ -189,12 +192,24 @@ mod tests {
         );
         assert_eq!(AppError::DecryptFailed.code(), "local/decrypt-failed");
         assert_eq!(
+            AppError::KeyDerivationFailed.code(),
+            "local/key-derivation-failed"
+        );
+        assert_eq!(
             AppError::Internal {
                 message: "boom".into()
             }
             .code(),
             "internal"
         );
+    }
+
+    #[test]
+    fn key_derivation_failed_serializes_with_empty_params() {
+        let e = AppError::KeyDerivationFailed;
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "local/key-derivation-failed");
+        assert!(v["params"].as_object().unwrap().is_empty());
     }
 
     #[test]

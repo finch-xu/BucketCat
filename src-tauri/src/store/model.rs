@@ -12,6 +12,8 @@
 //!   serialization, so leaking the secret to the UI is a compile error
 //!   rather than a runtime bug.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// A saved connection profile, including its secret access key.
@@ -19,7 +21,11 @@ use serde::{Deserialize, Serialize};
 /// This type must never be serialized to the frontend; use
 /// [`ConnectionDto`] (via `From<&Connection>`) for anything that crosses
 /// the Tauri command boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (not derived) so that logging a `Connection` --
+/// e.g. in an error message, a `dbg!()`, or a panic payload -- can never
+/// print `secret_access_key` in the clear; see the manual `impl` below.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Connection {
     pub id: String,
     pub provider: String,
@@ -29,6 +35,21 @@ pub struct Connection {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub default_bucket: Option<String>,
+}
+
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("id", &self.id)
+            .field("provider", &self.provider)
+            .field("name", &self.name)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("default_bucket", &self.default_bucket)
+            .finish()
+    }
 }
 
 /// Frontend -> backend payload for creating a connection. Has no `id`;
@@ -72,5 +93,31 @@ impl From<&Connection> for ConnectionDto {
             access_key_id: c.access_key_id.clone(),
             default_bucket: c.default_bucket.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_debug_redacts_secret_access_key() {
+        let conn = Connection {
+            id: "c1".to_string(),
+            provider: "aws".to_string(),
+            name: "test bucket".to_string(),
+            endpoint: "https://s3.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "super-secret-value".to_string(),
+            default_bucket: Some("my-bucket".to_string()),
+        };
+
+        let debugged = format!("{:?}", conn);
+
+        assert!(!debugged.contains("super-secret-value"));
+        assert!(debugged.contains("<redacted>"));
+        // Sanity: other fields still show up normally.
+        assert!(debugged.contains("AKIAEXAMPLE"));
     }
 }

@@ -5,10 +5,15 @@
 //!
 //! [`derive_key`] derives a deterministic 256-bit key from this machine's
 //! hardware id (`machine_uid::get()`) via HKDF-SHA256 with a fixed salt.
-//! Same machine => same key every time; a different machine (or a machine
-//! where the id can't be read) derives a different key, so a copied store
-//! file is simply unreadable elsewhere -- by design, not as an error case
-//! callers need to handle specially.
+//! Same machine => same key every time; a different machine derives a
+//! different key, so a copied store file is simply unreadable elsewhere --
+//! by design, not as an error case callers need to handle specially. If the
+//! machine id itself can't be read, `derive_key` **fails closed**
+//! (`AppError::KeyDerivationFailed`) rather than falling back to a fixed
+//! IKM: a fallback constant would be visible in this public repo's source,
+//! which would make it a well-known key rather than a machine-bound one --
+//! silently encrypting under a public key is worse than refusing to encrypt
+//! at all.
 //!
 //! ## API shape / testability
 //!
@@ -26,9 +31,38 @@
 //! anything whose authentication tag doesn't check out, with
 //! `AppError::DecryptFailed` -- never a panic and never surfaced as a
 //! plain io error.
+//!
+//! ## Accepted threat model
+//!
+//! This store deliberately trades some cryptographic strength for "no
+//! external dependency, no user-managed passphrase": the key is derived
+//! from machine-uid entropy (not attacker-unpredictable, and machine ids
+//! are sometimes readable by other local software) combined with a *public*
+//! salt/info (visible in this repo's source, so it grants an attacker no
+//! advantage to keep secret, but also grants the defender none either). The
+//! design goal is **not** "resistant to an attacker who already has a
+//! process running as the same local user" -- that attacker can typically
+//! also just ask `machine_uid::get()` themselves, or read process memory,
+//! or use OS APIs to read the plaintext connections through this app while
+//! it's running. What machine-binding *does* defend against is casual file
+//! exfiltration: someone who copies `connections.enc` off this machine (via
+//! a stolen backup, a synced folder, a lost drive, ...) cannot decrypt it
+//! elsewhere without also reproducing this exact machine's hardware id. An
+//! OS keychain (Keychain/Credential Manager/Secret Service) would raise the
+//! bar further (hardware-backed, per-user-session-gated secrets) at the
+//! cost of a platform-specific dependency and its own failure modes; that
+//! tradeoff was considered and explicitly not chosen for this iteration.
+//! Future reviews should treat "weak key derivation" as a known, accepted
+//! property of this design rather than a bug to re-flag, unless the actual
+//! goal (defend against same-user local processes) changes.
 
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use aes_gcm::aead::{Aead, KeyInit, Nonce as AeadNonce};
 use aes_gcm::{Aes256Gcm, Key};
@@ -52,19 +86,20 @@ const HKDF_INFO: &[u8] = b"bucketcat-connections-store-key";
 const NONCE_LEN: usize = 12;
 
 /// Derive this machine's deterministic 256-bit store encryption key.
-pub fn derive_key() -> [u8; 32] {
-    // `machine_uid::get()` only fails on unusual platforms/sandboxes where
-    // no machine id source is available. Fall back to a fixed string
-    // rather than panicking: the app should still start, and the worst
-    // case is simply that the store is unreadable if the real machine id
-    // later becomes available -- an acceptable degrade for local config.
-    let ikm = machine_uid::get().unwrap_or_else(|_| "bucketcat-no-machine-id".to_string());
+///
+/// Fails closed: if `machine_uid::get()` can't read a machine id (unusual
+/// platforms/sandboxes), this returns `AppError::KeyDerivationFailed`
+/// rather than silently falling back to some fixed, source-visible IKM --
+/// see the module doc comment for why a fallback constant here would be
+/// worse than refusing to encrypt.
+pub fn derive_key() -> AppResult<[u8; 32]> {
+    let ikm = machine_uid::get().map_err(|_| AppError::KeyDerivationFailed)?;
 
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), ikm.as_bytes());
     let mut okm = [0u8; 32];
     hk.expand(HKDF_INFO, &mut okm)
         .expect("32 bytes is always a valid HKDF-SHA256 output length");
-    okm
+    Ok(okm)
 }
 
 /// Encrypt `plaintext` under `key`, returning `nonce (12 bytes) || ciphertext`.
@@ -121,23 +156,26 @@ impl SecureStore {
             return Ok(Vec::new());
         }
 
-        let key = derive_key();
+        let key = derive_key()?;
         let plaintext = decrypt(&key, &data)?;
         serde_json::from_slice(&plaintext).map_err(|_| AppError::DecryptFailed)
     }
 
     /// Encrypt and atomically persist `connections`: write to a sibling
     /// `<path>.tmp` file, then `fs::rename` it over `self.path`, so a
-    /// crash mid-write can never leave a half-written store in place.
+    /// crash mid-write can never leave a half-written store in place. On
+    /// unix, the tmp file is created with mode `0600` (owner read/write
+    /// only) from the moment it's opened, before any ciphertext is
+    /// written, and `fs::rename` preserves that mode onto the final path.
     pub fn save(&self, connections: &[Connection]) -> AppResult<()> {
-        let key = derive_key();
+        let key = derive_key()?;
         let plaintext = serde_json::to_vec(connections).map_err(|e| AppError::Internal {
             message: e.to_string(),
         })?;
         let ciphertext = encrypt(&key, &plaintext)?;
 
         let tmp_path = self.tmp_path();
-        if let Err(e) = fs::write(&tmp_path, &ciphertext) {
+        if let Err(e) = write_tmp_file(&tmp_path, &ciphertext) {
             let _ = fs::remove_file(&tmp_path);
             return Err(e.into());
         }
@@ -154,6 +192,24 @@ impl SecureStore {
         tmp_os.push(".tmp");
         PathBuf::from(tmp_os)
     }
+}
+
+/// Create (or truncate) `path` and write `data` to it. On unix the file is
+/// opened with mode `0600` set at creation time via `OpenOptions::mode`, so
+/// there is no window where the secret payload sits in a file with
+/// world/group-readable permissions -- the mode is fixed before any byte of
+/// ciphertext is written, not applied afterward with a separate
+/// `set_permissions` call. On non-unix platforms this is a plain create +
+/// write with the platform default permissions.
+fn write_tmp_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let mut open_options = OpenOptions::new();
+    open_options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    open_options.mode(0o600);
+
+    let mut file = open_options.open(path)?;
+    file.write_all(data)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -255,6 +311,26 @@ mod tests {
 
         let loaded = store.load().expect("load should succeed");
         assert_eq!(loaded, connections);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_file_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("connections.enc");
+        let store = SecureStore { path: path.clone() };
+
+        store
+            .save(&[sample_connection("c1")])
+            .expect("save should succeed");
+
+        let mode = fs::metadata(&path)
+            .expect("saved file must exist")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "store file must be owner-only (0600)");
     }
 
     #[test]
