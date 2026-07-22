@@ -1,5 +1,12 @@
-import { useEffect, useRef, type ComponentType, type ReactNode } from "react";
-import { AlertTriangle, FolderOpen, Loader2, MousePointerClick } from "lucide-react";
+import { useEffect, useMemo, useRef, type ComponentType, type ReactNode } from "react";
+import {
+  AlertTriangle,
+  FolderOpen,
+  Loader2,
+  MousePointerClick,
+  Pencil,
+  Trash2,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
@@ -58,10 +65,93 @@ function useEntryHandlers(orderedFileKeys: string[]) {
   });
 }
 
-function ListView({ entries, query }: { entries: ObjectEntry[]; query: BrowseQuery }) {
+/** Per-row hover actions, revealed on hover and kept keyboard-reachable via
+ * `group-focus-within` (same affordance the sidebar's connection row uses).
+ *
+ * Folders deliberately get no actions: renaming a prefix means copying every
+ * key underneath it and deleting one means a recursive delete -- both need
+ * M4's batch engine, and offering a button that silently touched only the
+ * zero-byte marker object would be worse than offering nothing. */
+function RowActions({ entry }: { entry: ObjectEntry }) {
+  const { t } = useTranslation();
+  const { openRename, openDeleteObjects } = useApp();
+
+  if (entry.is_prefix) return <span className="w-[64px] shrink-0" />;
+
+  return (
+    <span className="flex w-[64px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          openRename(entry);
+        }}
+        title={t("objects.rename")}
+        aria-label={t("objects.rename")}
+        className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-active hover:text-primary"
+      >
+        <Pencil className="size-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          openDeleteObjects([entry.key]);
+        }}
+        title={t("objects.delete")}
+        aria-label={t("objects.delete")}
+        className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+      >
+        <Trash2 className="size-3.5" />
+      </button>
+    </span>
+  );
+}
+
+/** Batch action bar, visible only while objects are selected. */
+function SelectionBar() {
+  const { t } = useTranslation();
+  const { selectedKeys, clearSelection, openDeleteObjects } = useApp();
+
+  if (selectedKeys.length === 0) return null;
+
+  return (
+    <div className="flex h-11 shrink-0 items-center justify-between gap-3 border-t border-border bg-background px-4">
+      <span className="text-[12.5px] font-medium text-fg2">
+        {t("objects.selectedCount", { count: selectedKeys.length })}
+      </span>
+      <span className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={clearSelection}
+          className="h-7 cursor-pointer rounded-[8px] border border-border bg-background px-3 text-[12.5px] font-medium text-fg2 hover:bg-hover"
+        >
+          {t("objects.clearSelection")}
+        </button>
+        <button
+          type="button"
+          onClick={() => openDeleteObjects(selectedKeys)}
+          className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-[8px] bg-destructive/10 px-3 text-[12.5px] font-semibold text-destructive hover:bg-destructive/20"
+        >
+          <Trash2 className="size-3.5" />
+          {t("objects.delete")}
+        </button>
+      </span>
+    </div>
+  );
+}
+
+function ListView({
+  entries,
+  query,
+  orderedFileKeys,
+}: {
+  entries: ObjectEntry[];
+  query: BrowseQuery;
+  orderedFileKeys: string[];
+}) {
   const { t } = useTranslation();
   const { selectedKeys } = useApp();
-  const orderedFileKeys = entries.filter((e) => !e.is_prefix).map((e) => e.key);
   const handlers = useEntryHandlers(orderedFileKeys);
 
   const parentRef = useRef<HTMLDivElement>(null);
@@ -73,14 +163,19 @@ function ListView({ entries, query }: { entries: ObjectEntry[]; query: BrowseQue
   });
   const virtualItems = rowVirtualizer.getVirtualItems();
 
-  const { hasNextPage, isFetchingNextPage, fetchNextPage } = query;
+  const { hasNextPage, isFetchingNextPage, isPlaceholderData, fetchNextPage } = query;
   useEffect(() => {
+    // Skip while `entries`/`hasNextPage` are still the *previous* location's
+    // placeholder data (see `useObjects`) -- its continuation cursor
+    // belongs to that other prefix, not this one, so fetching "next" here
+    // would page the wrong listing.
+    if (isPlaceholderData) return;
     const last = virtualItems[virtualItems.length - 1];
     if (!last) return;
     if (last.index >= entries.length - 10 && hasNextPage && !isFetchingNextPage) {
       fetchNextPage();
     }
-  }, [virtualItems, entries.length, hasNextPage, isFetchingNextPage, fetchNextPage]);
+  }, [virtualItems, entries.length, hasNextPage, isFetchingNextPage, isPlaceholderData, fetchNextPage]);
 
   return (
     <div ref={parentRef} className="min-w-0 flex-1 overflow-y-auto">
@@ -103,7 +198,7 @@ function ListView({ entries, query }: { entries: ObjectEntry[]; query: BrowseQue
               key={entry.key}
               {...handlers(entry)}
               className={cn(
-                "absolute inset-x-0 flex cursor-pointer items-center border-b border-border2 px-4",
+                "group absolute inset-x-0 flex cursor-pointer items-center border-b border-border2 px-4",
                 selected ? "bg-active" : "hover:bg-hover",
               )}
               style={{ height: vi.size, transform: `translateY(${vi.start}px)` }}
@@ -128,7 +223,7 @@ function ListView({ entries, query }: { entries: ObjectEntry[]; query: BrowseQue
               <span className="w-[150px] pl-5 text-[12.5px] text-muted-foreground tabular-nums">
                 {entry.is_prefix ? "—" : formatDate(entry.last_modified)}
               </span>
-              <span className="w-[64px]" />
+              <RowActions entry={entry} />
             </div>
           );
         })}
@@ -143,12 +238,19 @@ function ListView({ entries, query }: { entries: ObjectEntry[]; query: BrowseQue
   );
 }
 
-function GridView({ entries, query }: { entries: ObjectEntry[]; query: BrowseQuery }) {
+function GridView({
+  entries,
+  query,
+  orderedFileKeys,
+}: {
+  entries: ObjectEntry[];
+  query: BrowseQuery;
+  orderedFileKeys: string[];
+}) {
   const { t } = useTranslation();
   const { selectedKeys } = useApp();
-  const orderedFileKeys = entries.filter((e) => !e.is_prefix).map((e) => e.key);
   const handlers = useEntryHandlers(orderedFileKeys);
-  const { hasNextPage, isFetchingNextPage, fetchNextPage } = query;
+  const { hasNextPage, isFetchingNextPage, isPlaceholderData, fetchNextPage } = query;
   return (
     <div className="min-w-0 flex-1 overflow-y-auto">
       <div className="grid grid-cols-[repeat(auto-fill,minmax(148px,1fr))] gap-3.5 p-[18px]">
@@ -179,7 +281,11 @@ function GridView({ entries, query }: { entries: ObjectEntry[]; query: BrowseQue
           );
         })}
       </div>
-      {hasNextPage && (
+      {/* Same stale-cursor guard as the list view's auto-fetch effect --
+       * `hasNextPage` still describes the previous location while
+       * `isPlaceholderData` is true, so the button stays hidden rather than
+       * page the wrong listing. */}
+      {hasNextPage && !isPlaceholderData && (
         <div className="flex justify-center pb-4">
           <button
             type="button"
@@ -201,6 +307,12 @@ export function FileBrowser() {
   const errorText = useErrorText();
   const { activeBucket, path, view } = useApp();
   const { query, entries, searching } = useBrowse();
+  // Computed once here and passed down instead of recomputed identically in
+  // both ListView and GridView.
+  const orderedFileKeys = useMemo(
+    () => entries.filter((e) => !e.is_prefix).map((e) => e.key),
+    [entries],
+  );
 
   // Empty-state semantics (M2 carried finding): no bucket selected is a
   // *placeholder*, never "this bucket is empty".
@@ -246,6 +358,21 @@ export function FileBrowser() {
   }
 
   if (entries.length === 0) {
+    // `query.isPlaceholderData` (set by `useObjects`'s `keepPreviousData`)
+    // means `entries` is still the *previous* location's listing, kept on
+    // screen while this one's real page loads. An empty previous listing
+    // says nothing about whether *this* folder is empty, so the settled
+    // empty/no-match copy must wait for the real fetch -- otherwise a
+    // placeholder carried over from an empty folder would flash "this
+    // folder is empty" over whatever the new location actually turns out
+    // to hold.
+    if (query.isPlaceholderData) {
+      return (
+        <div className="flex min-w-0 flex-1 flex-col">
+          <CenterState icon={Loader2} spin title={t("main.loadingList")} hint="" />
+        </div>
+      );
+    }
     return (
       <div className="flex min-w-0 flex-1 flex-col">
         {searching ? (
@@ -264,10 +391,11 @@ export function FileBrowser() {
   return (
     <div className="flex min-w-0 flex-1 flex-col">
       {view === "list" ? (
-        <ListView entries={entries} query={query} />
+        <ListView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
       ) : (
-        <GridView entries={entries} query={query} />
+        <GridView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
       )}
+      <SelectionBar />
     </div>
   );
 }

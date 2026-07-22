@@ -54,10 +54,11 @@ function BucketList({ connId, isOpen, activeConn, activeBucket, onSelect }: Buck
   return (
     <div className="mt-px mb-1 ml-[22px] border-l border-border pl-1.5">
       {bucketsQuery.isPending && (
-        <>
+        <div aria-busy="true" aria-live="polite">
+          <span className="sr-only">{t("sidebar.loadingBuckets")}</span>
           <BucketRowSkeleton />
           <BucketRowSkeleton />
-        </>
+        </div>
       )}
       {bucketsQuery.isError && (
         <div role="alert" className="flex items-center justify-between gap-2 px-[9px] py-1.5">

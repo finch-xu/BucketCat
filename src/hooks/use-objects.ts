@@ -1,4 +1,5 @@
 import {
+  keepPreviousData,
   useInfiniteQuery,
   useMutation,
   useQueryClient,
@@ -27,7 +28,17 @@ const objectsKey = (connectionId: string, bucket: string, prefix: string) =>
   ["objects", connectionId, bucket, prefix] as const;
 
 /** Infinite listing of one browse location. Pages chain through the
- * backend's continuation token (`ListPage.next_token`; null = done). */
+ * backend's continuation token (`ListPage.next_token`; null = done).
+ *
+ * `placeholderData: keepPreviousData` keeps the previous location's listing
+ * on screen while a new prefix/bucket/search is fetched, instead of
+ * flashing the full-page loading state on every navigation. Callers that
+ * render `data` for correctness (not just as a visual holdover -- e.g. the
+ * empty-state decision, or whether to trigger the next page) must check
+ * `isPlaceholderData` first: the placeholder is the *previous* location's
+ * data, so an empty result during that window says nothing about whether
+ * the new location is actually empty, and `hasNextPage`/`next_token` still
+ * describe the previous location's pagination cursor. */
 export function useObjects(
   connectionId: string,
   bucket: string,
@@ -39,6 +50,7 @@ export function useObjects(
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) => lastPage.next_token,
     enabled: connectionId.length > 0 && bucket.length > 0,
+    placeholderData: keepPreviousData,
   });
 }
 

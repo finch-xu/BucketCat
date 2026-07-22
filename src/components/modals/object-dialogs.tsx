@@ -2,9 +2,10 @@ import { useState, type FormEvent } from "react";
 import { AlertTriangle, FolderPlus, Loader2, Pencil } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
+import { useBrowse } from "@/hooks/use-browse";
 import { useCreateFolder, useDeleteObjects, useRenameObject } from "@/hooks/use-objects";
 import { useErrorText } from "@/hooks/use-error-text";
-import { isValidObjectName, pathToPrefix, renameKey } from "@/lib/entries";
+import { isValidObjectName, nameCollides, pathToPrefix, renameKey } from "@/lib/entries";
 import { useApp } from "@/store/app-store";
 
 const INPUT_CLASS =
@@ -24,18 +25,28 @@ function NewFolderDialog() {
   const errorText = useErrorText();
   const { activeConn, activeBucket, path, showNewFolder, closeNewFolder } = useApp();
   const createMutation = useCreateFolder(activeConn, activeBucket);
+  // Same listing the browser renders for the current path -- used only for
+  // the best-effort client-side duplicate-name guard below.
+  const { entries } = useBrowse();
   const [name, setName] = useState("");
   const [touched, setTouched] = useState(false);
 
   if (!showNewFolder) return null;
 
+  const trimmed = name.trim();
   const valid = isValidObjectName(name);
+  // A folder is a zero-byte `<name>/` marker PUT with no existence check on
+  // the backend, so a name collision here doesn't overwrite data the way a
+  // colliding rename does -- but it would still silently produce two rows
+  // with the same displayed name. Checked only against already-loaded
+  // page(s) of the current listing, not the server.
+  const collision = valid && nameCollides(entries, trimmed);
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setTouched(true);
-    if (!valid || createMutation.isPending) return;
-    createMutation.mutate(pathToPrefix(path) + name.trim(), {
+    if (!valid || collision || createMutation.isPending) return;
+    createMutation.mutate(pathToPrefix(path) + trimmed, {
       onSuccess: () => closeNewFolder(),
     });
   }
@@ -62,6 +73,9 @@ function NewFolderDialog() {
             />
             {touched && !valid && (
               <p className="mt-1.5 text-[12px] text-destructive">{t("objects.invalidName")}</p>
+            )}
+            {touched && valid && collision && (
+              <p className="mt-1.5 text-[12px] text-destructive">{t("objects.nameExists")}</p>
             )}
             {createMutation.isError && (
               <p className="mt-1.5 text-[12px] text-destructive">
@@ -97,6 +111,9 @@ function RenameObjectDialog() {
   const errorText = useErrorText();
   const { activeConn, activeBucket, renameTarget, closeRename, clearSelection } = useApp();
   const renameMutation = useRenameObject(activeConn, activeBucket);
+  // Same listing the browser renders for the current path -- used only for
+  // the best-effort client-side duplicate-name guard below.
+  const { entries } = useBrowse();
   // Safe as the initial value because `ObjectDialogs` keys this component by
   // the target's key -- a different target mounts a fresh instance.
   const [name, setName] = useState(renameTarget?.name ?? "");
@@ -107,11 +124,19 @@ function RenameObjectDialog() {
 
   const trimmed = name.trim();
   const valid = isValidObjectName(name) && trimmed !== target.name;
+  // Rename is copy-then-delete: colliding with another existing key would
+  // silently overwrite it (copy target = the sibling's key) before the
+  // original is deleted. Excludes the target's own current entry so
+  // renaming it back to its unchanged name isn't flagged as a "collision"
+  // -- that no-op case is already blocked above by `trimmed !== target.name`.
+  // Checked only against already-loaded page(s) of the current listing, not
+  // the server.
+  const collision = valid && nameCollides(entries, trimmed, target.key);
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setTouched(true);
-    if (!valid || renameMutation.isPending) return;
+    if (!valid || collision || renameMutation.isPending) return;
     renameMutation.mutate(
       { fromKey: target.key, toKey: renameKey(target.key, trimmed) },
       {
@@ -147,6 +172,9 @@ function RenameObjectDialog() {
             />
             {touched && !valid && (
               <p className="mt-1.5 text-[12px] text-destructive">{t("objects.invalidName")}</p>
+            )}
+            {touched && valid && collision && (
+              <p className="mt-1.5 text-[12px] text-destructive">{t("objects.nameExists")}</p>
             )}
             {renameMutation.isError && (
               <p className="mt-1.5 text-[12px] text-destructive">
@@ -211,80 +239,93 @@ function DeleteObjectsDialog() {
     closeDeleteObjects();
   }
 
+  // Form submit is the single Enter-key path for both modes -- `report` is
+  // read at submit time, not baked into which handler got wired up, so it
+  // can never fire the destructive action once the dialog has flipped to
+  // reporting a partial failure.
+  function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (report) {
+      handleClose();
+      return;
+    }
+    if (deleteMutation.isPending) return;
+    handleConfirm();
+  }
+
   const singleName = keys[0].replace(/\/$/, "").split("/").pop() ?? keys[0];
 
   return (
     <Modal onClose={handleClose} className="w-[460px]">
-      <div className="flex items-start gap-3 px-5 pt-5 pb-1">
-        <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
-          <AlertTriangle className="size-[18px]" />
-        </span>
-        <div className="min-w-0 flex-1 pt-1">
-          <div className="text-[15px] font-bold">
-            {report
-              ? t("objects.partialTitle")
-              : keys.length === 1
-                ? t("objects.deleteTitleOne")
-                : t("objects.deleteTitleMany", { count: keys.length })}
-          </div>
-          {report ? (
-            <>
+      <form onSubmit={handleSubmit}>
+        <div className="flex items-start gap-3 px-5 pt-5 pb-1">
+          <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
+            <AlertTriangle className="size-[18px]" />
+          </span>
+          <div className="min-w-0 flex-1 pt-1">
+            <div className="text-[15px] font-bold">
+              {report
+                ? t("objects.partialTitle")
+                : keys.length === 1
+                  ? t("objects.deleteTitleOne")
+                  : t("objects.deleteTitleMany", { count: keys.length })}
+            </div>
+            {report ? (
+              <>
+                <p className="mt-1.5 text-[13px] text-fg2">
+                  {t("objects.partialSummary", {
+                    succeeded: report.succeeded,
+                    failed: report.failed.length,
+                  })}
+                </p>
+                <ul className="mt-2.5 max-h-[180px] overflow-y-auto rounded-[9px] border border-border2 bg-panel p-2.5">
+                  {report.failed.map((f) => (
+                    <li key={f.key} className="py-1 text-[12px]">
+                      <span className="block truncate font-mono text-fg2">{f.key}</span>
+                      <span className="text-destructive">
+                        {errorText({ code: f.code, params: {} })}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            ) : (
               <p className="mt-1.5 text-[13px] text-fg2">
-                {t("objects.partialSummary", {
-                  succeeded: report.succeeded,
-                  failed: report.failed.length,
-                })}
+                {keys.length === 1
+                  ? t("objects.deleteBodyOne", { name: singleName })
+                  : t("objects.deleteBodyMany", { count: keys.length })}
               </p>
-              <ul className="mt-2.5 max-h-[180px] overflow-y-auto rounded-[9px] border border-border2 bg-panel p-2.5">
-                {report.failed.map((f) => (
-                  <li key={f.key} className="py-1 text-[12px]">
-                    <span className="block truncate font-mono text-fg2">{f.key}</span>
-                    <span className="text-destructive">
-                      {errorText({ code: f.code, params: {} })}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </>
+            )}
+            {deleteMutation.isError && (
+              <p className="mt-1.5 text-[12px] text-destructive">
+                {errorText(deleteMutation.error)}
+              </p>
+            )}
+          </div>
+        </div>
+        <div className="mt-3 flex items-center justify-end gap-2.5 border-t border-border2 px-5 py-4">
+          {report ? (
+            <button type="submit" autoFocus className={PRIMARY_CLASS}>
+              {t("objects.close")}
+            </button>
           ) : (
-            <p className="mt-1.5 text-[13px] text-fg2">
-              {keys.length === 1
-                ? t("objects.deleteBodyOne", { name: singleName })
-                : t("objects.deleteBodyMany", { count: keys.length })}
-            </p>
-          )}
-          {deleteMutation.isError && (
-            <p className="mt-1.5 text-[12px] text-destructive">{errorText(deleteMutation.error)}</p>
+            <>
+              <button
+                type="button"
+                onClick={handleClose}
+                disabled={deleteMutation.isPending}
+                className={CANCEL_CLASS}
+              >
+                {t("objects.cancel")}
+              </button>
+              <button type="submit" autoFocus disabled={deleteMutation.isPending} className={DANGER_CLASS}>
+                {deleteMutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
+                {deleteMutation.isPending ? t("objects.deleting") : t("objects.delete")}
+              </button>
+            </>
           )}
         </div>
-      </div>
-      <div className="mt-3 flex items-center justify-end gap-2.5 border-t border-border2 px-5 py-4">
-        {report ? (
-          <button type="button" onClick={handleClose} className={PRIMARY_CLASS}>
-            {t("objects.close")}
-          </button>
-        ) : (
-          <>
-            <button
-              type="button"
-              onClick={handleClose}
-              disabled={deleteMutation.isPending}
-              className={CANCEL_CLASS}
-            >
-              {t("objects.cancel")}
-            </button>
-            <button
-              type="button"
-              onClick={handleConfirm}
-              disabled={deleteMutation.isPending}
-              className={DANGER_CLASS}
-            >
-              {deleteMutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
-              {deleteMutation.isPending ? t("objects.deleting") : t("objects.delete")}
-            </button>
-          </>
-        )}
-      </div>
+      </form>
     </Modal>
   );
 }

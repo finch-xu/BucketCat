@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   isValidObjectName,
   listPrefix,
+  nameCollides,
   pathToPrefix,
   renameKey,
   sortEntries,
@@ -66,5 +67,43 @@ describe("isValidObjectName", () => {
     expect(isValidObjectName("")).toBe(false);
     expect(isValidObjectName("   ")).toBe(false);
     expect(isValidObjectName("a/b")).toBe(false);
+  });
+});
+
+describe("nameCollides", () => {
+  const entries = [e("photos", true), e("readme.md", false)];
+
+  it("blocks a name matching an existing file", () => {
+    expect(nameCollides(entries, "readme.md")).toBe(true);
+  });
+
+  it("blocks a name matching an existing folder", () => {
+    expect(nameCollides(entries, "photos")).toBe(true);
+  });
+
+  it("blocks a folder name colliding with a same-named file, and vice versa", () => {
+    // A new folder named after an existing file (different key: "x" vs
+    // "x/") wouldn't overwrite anything server-side, but it would still
+    // produce two rows with an identical displayed name -- rejected too.
+    expect(nameCollides([e("x", false)], "x")).toBe(true);
+    expect(nameCollides([e("x", true)], "x")).toBe(true);
+  });
+
+  it("trims before comparing", () => {
+    expect(nameCollides(entries, "  photos  ")).toBe(true);
+  });
+
+  it("allows a name that isn't taken", () => {
+    expect(nameCollides(entries, "new-name")).toBe(false);
+  });
+
+  it("ignores the excluded key (renaming a target back to its own name)", () => {
+    expect(nameCollides(entries, "photos", "photos/")).toBe(false);
+    // Excluding one entry doesn't hide a collision with a *different* entry.
+    expect(nameCollides(entries, "readme.md", "photos/")).toBe(true);
+  });
+
+  it("treats an empty/blank candidate as non-colliding (isValidObjectName already rejects it)", () => {
+    expect(nameCollides(entries, "   ")).toBe(false);
   });
 });

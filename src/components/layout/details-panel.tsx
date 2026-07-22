@@ -10,7 +10,7 @@ import { useApp } from "@/store/app-store";
  * wired to the object dialogs. ETag/head_object detail arrives in M6. */
 export function DetailsPanel() {
   const { t } = useTranslation();
-  const { selectedKeys, clearSelection } = useApp();
+  const { selectedKeys, clearSelection, openDeleteObjects } = useApp();
   const { entries } = useBrowse();
 
   const entry =
@@ -71,6 +71,7 @@ export function DetailsPanel() {
           </button>
           <button
             type="button"
+            onClick={() => openDeleteObjects([entry.key])}
             className="inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] bg-destructive/10 text-[12.5px] font-medium text-destructive hover:bg-destructive/20"
           >
             <Trash2 className="size-3.5" />
