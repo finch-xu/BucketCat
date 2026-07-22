@@ -163,7 +163,20 @@ function RenameObjectDialog() {
   // and thus `pathEntries`, unused for that render. Computed unconditionally
   // (not inside a hook) so `useObjects`'s hook call stays unconditional.
   const guardPrefix = renameTarget ? parentPrefix(renameTarget.key) : "";
-  const pathListingQuery = useObjects(activeConn, activeBucket, guardPrefix);
+  // Passing "" as the connection id when there's no target leans on
+  // `useObjects`'s own `enabled: connectionId.length > 0 && ...` guard to
+  // keep this query idle for as long as this "closed" instance is mounted
+  // (`ObjectDialogs` keys this component by target, so a `null` target here
+  // means EVERY render of this instance has a `null` target -- see that
+  // comment). Without this, the "closed" instance would run a live,
+  // continuously-refetched ListObjectsV2 against the bucket root the whole
+  // time the user browses (refetched on every objectsRootKey invalidation:
+  // delete/rename/create-folder/refresh) only to be thrown away the moment
+  // it resolves. Once a real target mounts a fresh instance (a different
+  // `key`, per `ObjectDialogs`), `activeConn` flows through unchanged and
+  // `guardReady` below still fails closed exactly as before until that
+  // target's own parent-prefix listing has loaded.
+  const pathListingQuery = useObjects(renameTarget ? activeConn : "", activeBucket, guardPrefix);
   const pathEntries = useMemo(
     () => (pathListingQuery.data?.pages ?? []).flatMap((p) => p.entries),
     [pathListingQuery.data],

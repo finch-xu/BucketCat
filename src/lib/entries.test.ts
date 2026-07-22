@@ -57,6 +57,14 @@ describe("renameKey", () => {
     expect(renameKey("docs/old.md", "new.md")).toBe("docs/new.md");
     expect(renameKey("root.txt", "renamed.txt")).toBe("renamed.txt");
   });
+
+  it("leaves a file key unaffected by folder handling", () => {
+    expect(renameKey("docs/a.txt", "b.txt")).toBe("docs/b.txt");
+  });
+
+  it("preserves the trailing slash on a folder key", () => {
+    expect(renameKey("docs/sub/", "new")).toBe("docs/new/");
+  });
 });
 
 describe("parentPrefix", () => {
@@ -70,6 +78,18 @@ describe("parentPrefix", () => {
 
   it("returns the full parent path for a deeply nested key", () => {
     expect(parentPrefix("a/b/c.txt")).toBe("a/b/");
+  });
+
+  it("returns the folder's own parent for a nested folder key", () => {
+    expect(parentPrefix("docs/sub/")).toBe("docs/");
+  });
+
+  it("returns the bucket root for a top-level folder key", () => {
+    expect(parentPrefix("docs/")).toBe("");
+  });
+
+  it("returns the full parent path for a deeply nested folder key", () => {
+    expect(parentPrefix("a/b/c/")).toBe("a/b/");
   });
 });
 

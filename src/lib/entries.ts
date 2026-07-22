@@ -27,14 +27,31 @@ export function listPrefix(path: string[], search: string): string {
   return pathToPrefix(path) + search.trim();
 }
 
-/** Rename target key: `key` with its final path segment replaced. */
+/** Rename target key: `key` with its final path segment replaced. Handles
+ * folder keys (trailing "/") by stripping that one trailing slash before
+ * locating the final segment, then re-appending it to the result -- so a
+ * renamed folder key stays a folder key instead of turning into a bare
+ * (non-prefix) key: `renameKey("docs/sub/", "new")` -> `"docs/new/"`, not
+ * `"docs/new"`. File keys are unaffected: `renameKey("docs/a.txt", "b.txt")`
+ * -> `"docs/b.txt"`. */
 export function renameKey(key: string, newName: string): string {
-  const idx = key.lastIndexOf("/");
-  return idx === -1 ? newName : key.slice(0, idx + 1) + newName;
+  const isFolder = key.endsWith("/");
+  const stripped = isFolder ? key.slice(0, -1) : key;
+  const idx = stripped.lastIndexOf("/");
+  const base = idx === -1 ? newName : stripped.slice(0, idx + 1) + newName;
+  return isFolder ? `${base}/` : base;
 }
 
 /** The prefix `key` itself lives under: `"a.txt"` -> `""` (bucket root),
  * `"sub/a.txt"` -> `"sub/"`, `"a/b/c.txt"` -> `"a/b/"`.
+ *
+ * Handles folder keys (trailing "/") by stripping exactly one trailing
+ * slash before locating the parent, so the result is the folder's OWN
+ * parent -- the prefix its siblings live under -- not the folder's own key:
+ * `"docs/sub/"` -> `"docs/"`, `"docs/"` -> `""` (bucket root), `"a/b/c/"` ->
+ * `"a/b/"`. Without this, a folder key's trailing "/" would itself be the
+ * rightmost "/", so `lastIndexOf` would return the key unchanged instead of
+ * its parent.
  *
  * Used to derive the rename collision guard's listing prefix from the
  * *target's own key*, not from the store's browsed `path`. Those two can
@@ -42,10 +59,13 @@ export function renameKey(key: string, newName: string): string {
  * (design §6 -- search is a prefix search scoped to the current path), so
  * typing a search term containing "/" lists rows that live under a deeper
  * prefix than `pathToPrefix(path)` alone. A guard built from `path` would
- * then check the wrong (shallower) listing and miss a real collision. */
+ * then check the wrong (shallower) listing and miss a real collision. This
+ * folder-key handling matters for the same reason once folder rename lands
+ * (M4/M6): the guard must list the folder's SIBLINGS, not its own contents. */
 export function parentPrefix(key: string): string {
-  const idx = key.lastIndexOf("/");
-  return idx === -1 ? "" : key.slice(0, idx + 1);
+  const stripped = key.endsWith("/") ? key.slice(0, -1) : key;
+  const idx = stripped.lastIndexOf("/");
+  return idx === -1 ? "" : stripped.slice(0, idx + 1);
 }
 
 /** Derives the browsed `path` segments from an entry's own key rather than
