@@ -33,6 +33,32 @@ export function renameKey(key: string, newName: string): string {
   return idx === -1 ? newName : key.slice(0, idx + 1) + newName;
 }
 
+/** The prefix `key` itself lives under: `"a.txt"` -> `""` (bucket root),
+ * `"sub/a.txt"` -> `"sub/"`, `"a/b/c.txt"` -> `"a/b/"`.
+ *
+ * Used to derive the rename collision guard's listing prefix from the
+ * *target's own key*, not from the store's browsed `path`. Those two can
+ * diverge: the browsed listing prefix is `pathToPrefix(path) + search`
+ * (design §6 -- search is a prefix search scoped to the current path), so
+ * typing a search term containing "/" lists rows that live under a deeper
+ * prefix than `pathToPrefix(path)` alone. A guard built from `path` would
+ * then check the wrong (shallower) listing and miss a real collision. */
+export function parentPrefix(key: string): string {
+  const idx = key.lastIndexOf("/");
+  return idx === -1 ? "" : key.slice(0, idx + 1);
+}
+
+/** Derives the browsed `path` segments from an entry's own key rather than
+ * its display name: `"sub/img/"` -> `["sub", "img"]`. Navigating by key
+ * (instead of appending the display name to the current `path`) keeps
+ * double-click-to-open correct when the listing was reached via a search
+ * term that lists rows under a deeper prefix than `pathToPrefix(path)`
+ * (see `parentPrefix`). */
+export function keyToPath(key: string): string[] {
+  const trimmed = key.endsWith("/") ? key.slice(0, -1) : key;
+  return trimmed.length === 0 ? [] : trimmed.split("/");
+}
+
 /** A single object/folder display name: non-empty after trimming and free
  * of "/" (path separators are navigation, not names). */
 export function isValidObjectName(name: string): boolean {

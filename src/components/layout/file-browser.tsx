@@ -60,7 +60,10 @@ function useEntryHandlers(orderedFileKeys: string[]) {
       }
     },
     onDoubleClick: () => {
-      if (entry.is_prefix) openFolder(entry.name);
+      // Navigate by the entry's key, not its display name -- see the doc
+      // comment on `openFolder` in the store for why this matters whenever
+      // the current listing was reached via a search term.
+      if (entry.is_prefix) openFolder(entry.key);
     },
   });
 }

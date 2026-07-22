@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
 import { useCreateFolder, useDeleteObjects, useObjects, useRenameObject } from "@/hooks/use-objects";
 import { useErrorText } from "@/hooks/use-error-text";
-import { isValidObjectName, nameCollides, pathToPrefix, renameKey } from "@/lib/entries";
+import { isValidObjectName, nameCollides, parentPrefix, pathToPrefix, renameKey } from "@/lib/entries";
 import { useApp } from "@/store/app-store";
 
 const INPUT_CLASS =
@@ -141,16 +141,29 @@ function NewFolderDialog() {
 function RenameObjectDialog() {
   const { t } = useTranslation();
   const errorText = useErrorText();
-  const { activeConn, activeBucket, path, renameTarget, closeRename, clearSelection } = useApp();
+  const { activeConn, activeBucket, renameTarget, closeRename, clearSelection } = useApp();
   const renameMutation = useRenameObject(activeConn, activeBucket);
-  // Deliberately the *unfiltered* current-path listing, not `useBrowse`'s
-  // search-scoped one -- see the matching comment in `NewFolderDialog`. This
-  // matters even more here: rename is copy-then-delete, so if an active
-  // search hid a same-named sibling from the check, this dialog would
-  // silently overwrite that sibling instead of just producing a confusing
-  // duplicate row.
-  const pathPrefix = pathToPrefix(path);
-  const pathListingQuery = useObjects(activeConn, activeBucket, pathPrefix);
+  // Deliberately the *unfiltered* listing of the prefix the RENAME TARGET
+  // itself lives under, not the store's browsed `path` -- see the matching
+  // `pathToPrefix(path)` comment in `NewFolderDialog`, which is safe there
+  // only because a new folder is always created directly under the browsed
+  // path. Rename can't reuse that: the browsed listing prefix is
+  // `pathToPrefix(path) + search` (design §6), so a search term containing
+  // "/" lists rows that live under a deeper prefix than `pathToPrefix(path)`
+  // alone. Deriving the guard from `target.key` via `parentPrefix` keeps it
+  // correct regardless of how this listing was reached -- and it matters
+  // even more here than in `NewFolderDialog`: rename is copy-then-delete, so
+  // checking the wrong (too-shallow) listing would silently overwrite a
+  // same-named sibling instead of just producing a confusing duplicate row.
+  //
+  // `renameTarget` can be `null` on this render (the component always
+  // mounts; it only returns `null` below once we know there's no target),
+  // so this falls back to the bucket root ("") -- irrelevant in practice
+  // since the early return right after makes the rest of this component,
+  // and thus `pathEntries`, unused for that render. Computed unconditionally
+  // (not inside a hook) so `useObjects`'s hook call stays unconditional.
+  const guardPrefix = renameTarget ? parentPrefix(renameTarget.key) : "";
+  const pathListingQuery = useObjects(activeConn, activeBucket, guardPrefix);
   const pathEntries = useMemo(
     () => (pathListingQuery.data?.pages ?? []).flatMap((p) => p.entries),
     [pathListingQuery.data],
@@ -176,9 +189,9 @@ function RenameObjectDialog() {
   // original is deleted. Excludes the target's own current entry so
   // renaming it back to its unchanged name isn't flagged as a "collision"
   // -- that no-op case is already blocked above by `trimmed !== target.name`.
-  // Checked only against already-loaded page(s) of the unfiltered
-  // current-path listing, not the server (and not narrowed by whatever
-  // search text happens to be active elsewhere).
+  // Checked only against already-loaded page(s) of the unfiltered listing
+  // of `target`'s own parent prefix, not the server (and not narrowed by
+  // whatever search text happens to be active elsewhere).
   const collision = valid && nameCollides(pathEntries, trimmed, target.key);
 
   function handleSubmit(e: FormEvent) {

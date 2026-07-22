@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   isValidObjectName,
+  keyToPath,
   listPrefix,
   nameCollides,
+  parentPrefix,
   pathToPrefix,
   renameKey,
   sortEntries,
@@ -54,6 +56,34 @@ describe("renameKey", () => {
   it("replaces the final segment", () => {
     expect(renameKey("docs/old.md", "new.md")).toBe("docs/new.md");
     expect(renameKey("root.txt", "renamed.txt")).toBe("renamed.txt");
+  });
+});
+
+describe("parentPrefix", () => {
+  it("returns the bucket root for a key with no slash", () => {
+    expect(parentPrefix("a.txt")).toBe("");
+  });
+
+  it("returns the immediate parent prefix for a nested key", () => {
+    expect(parentPrefix("sub/a.txt")).toBe("sub/");
+  });
+
+  it("returns the full parent path for a deeply nested key", () => {
+    expect(parentPrefix("a/b/c.txt")).toBe("a/b/");
+  });
+});
+
+describe("keyToPath", () => {
+  it("splits a folder key into its path segments", () => {
+    expect(keyToPath("sub/img/")).toEqual(["sub", "img"]);
+  });
+
+  it("splits a single-segment folder key", () => {
+    expect(keyToPath("docs/")).toEqual(["docs"]);
+  });
+
+  it("treats the bucket root key as an empty path", () => {
+    expect(keyToPath("")).toEqual([]);
   });
 });
 

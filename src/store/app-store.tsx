@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import type { ConnectionDto, ObjectEntry } from "@/lib/api";
+import { keyToPath } from "@/lib/entries";
 import {
   applyThemeMode,
   getThemeMode,
@@ -55,7 +56,9 @@ interface AppStore {
   expanded: Record<string, boolean>;
   toggleConn: (id: string) => void;
   selectBucket: (connId: string, bucket: string) => void;
-  openFolder: (name: string) => void;
+  /** Navigates into a folder by its full key (e.g. `"sub/img/"`), not its
+   * display name -- see the call site in `file-browser.tsx` for why. */
+  openFolder: (key: string) => void;
   gotoCrumb: (index: number) => void;
   /** Called after a connection is successfully deleted -- clears the active
    * selection and expanded state for it if it was the one being browsed. */
@@ -216,8 +219,17 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
       setSearchState("");
       setExpanded((e) => ({ ...e, [connId]: true }));
     },
-    openFolder: (name) => {
-      setPath((p) => [...p, name]);
+    openFolder: (key) => {
+      // Derived from the entry's own key, not appended from its display
+      // name onto the current `path`: the browsed listing prefix is
+      // `pathToPrefix(path) + search` (design §6), so when the current
+      // search term contains "/" the listed rows can live under a deeper
+      // prefix than `pathToPrefix(path)` alone -- appending just the
+      // display name there would navigate to a path that doesn't match
+      // where the folder actually is. `keyToPath` reconstructs the correct
+      // absolute path directly from the key regardless of how the listing
+      // that produced this entry was reached.
+      setPath(keyToPath(key));
       clearSelection();
       setSearchState("");
     },
