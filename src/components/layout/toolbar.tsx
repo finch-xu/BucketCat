@@ -14,25 +14,31 @@ export function Toolbar() {
   return (
     <div className="flex h-[52px] shrink-0 items-center gap-2.5 border-b border-border bg-background px-4">
       <div className="flex min-w-0 flex-1 items-center gap-px">
-        {crumbs.map((label, i) => {
-          const last = i === crumbs.length - 1;
-          return (
-            <Fragment key={`${i}-${label}`}>
-              {i > 0 && <ChevronRight className="size-[13px] shrink-0 text-muted2" />}
-              <button
-                type="button"
-                onClick={() => gotoCrumb(i - 1)}
-                className={cn(
-                  "flex max-w-[190px] cursor-pointer items-center gap-[7px] truncate rounded-[7px] px-2 py-[5px] text-[13.5px] hover:bg-hover",
-                  last ? "font-semibold text-foreground" : "font-medium text-muted-foreground",
-                )}
-              >
-                {i === 0 && <Database className="size-[15px] shrink-0 text-sky" />}
-                {label}
-              </button>
-            </Fragment>
-          );
-        })}
+        {activeBucket === "" ? (
+          <span className="truncate px-2 py-[5px] text-[13.5px] text-muted-foreground">
+            {t("main.breadcrumbPlaceholder")}
+          </span>
+        ) : (
+          crumbs.map((label, i) => {
+            const last = i === crumbs.length - 1;
+            return (
+              <Fragment key={`${i}-${label}`}>
+                {i > 0 && <ChevronRight className="size-[13px] shrink-0 text-muted2" />}
+                <button
+                  type="button"
+                  onClick={() => gotoCrumb(i - 1)}
+                  className={cn(
+                    "flex max-w-[190px] cursor-pointer items-center gap-[7px] truncate rounded-[7px] px-2 py-[5px] text-[13.5px] hover:bg-hover",
+                    last ? "font-semibold text-foreground" : "font-medium text-muted-foreground",
+                  )}
+                >
+                  {i === 0 && <Database className="size-[15px] shrink-0 text-muted-foreground" />}
+                  {label}
+                </button>
+              </Fragment>
+            );
+          })
+        )}
       </div>
       <div className="flex h-8 w-[206px] items-center gap-[7px] rounded-[9px] border border-border bg-panel px-2.5 text-muted-foreground focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary-soft">
         <Search className="size-[15px]" />

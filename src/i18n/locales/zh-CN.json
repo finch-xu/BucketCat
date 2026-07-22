@@ -24,7 +24,8 @@
     "colName": "名称",
     "colSize": "大小",
     "colType": "类型",
-    "colModified": "修改时间"
+    "colModified": "修改时间",
+    "breadcrumbPlaceholder": "选择左侧的一个存储桶开始"
   },
   "details": {
     "title": "详情",
@@ -60,8 +61,13 @@
     "defaultBucket": "默认存储桶",
     "optional": "（可选）",
     "test": "测试连接",
+    "testing": "正在测试连接…",
+    "testOk": "连接成功",
+    "testFail": "连接失败",
     "cancel": "取消",
-    "save": "保存连接"
+    "save": "保存连接",
+    "saving": "正在保存…",
+    "required": "此项为必填"
   },
   "providers": {
     "s3": "亚马逊云对象存储",

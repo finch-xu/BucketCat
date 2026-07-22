@@ -71,12 +71,8 @@ interface AppStore {
   startMockUpload: () => void;
 
   showAdd: boolean;
-  addStep: 1 | 2;
-  addProvider: string | null;
   openAdd: () => void;
   closeAdd: () => void;
-  chooseProvider: (id: string) => void;
-  backToProviders: () => void;
 
   showSettings: boolean;
   openSettings: () => void;
@@ -112,8 +108,6 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
   const [nextTid, setNextTid] = useState(3);
 
   const [showAdd, setShowAdd] = useState(false);
-  const [addStep, setAddStep] = useState<1 | 2>(1);
-  const [addProvider, setAddProvider] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
 
   const [transferSettings, setTransferSettingsState] = useState<TransferSettings>({
@@ -224,22 +218,8 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
       setNextTid((n) => n + 1);
     },
     showAdd,
-    addStep,
-    addProvider,
-    openAdd: () => {
-      setShowAdd(true);
-      setAddStep(1);
-      setAddProvider(null);
-    },
+    openAdd: () => setShowAdd(true),
     closeAdd: () => setShowAdd(false),
-    chooseProvider: (id) => {
-      setAddProvider(id);
-      setAddStep(2);
-    },
-    backToProviders: () => {
-      setAddStep(1);
-      setAddProvider(null);
-    },
     showSettings,
     openSettings: () => setShowSettings(true),
     closeSettings: () => setShowSettings(false),

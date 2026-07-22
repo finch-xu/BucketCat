@@ -4,19 +4,8 @@ import { cn } from "@/lib/utils";
 import { providerMeta } from "@/lib/providers";
 import { useApp } from "@/store/app-store";
 import { useBuckets, useConnections } from "@/hooks/use-connections";
-import type { AppError, ConnectionDto } from "@/lib/api";
-
-/** Maps a rejected query's `AppError` to display text via the `errors.*`
- * i18n namespace (mirrors `src-tauri/src/error.rs`'s `code()`), falling
- * back to the generic `errors.internal` copy for codes this build's
- * dictionary doesn't have an entry for yet. */
-function useErrorText() {
-  const { t, i18n } = useTranslation();
-  return (error: AppError): string => {
-    const key = `errors.${error.code}`;
-    return i18n.exists(key) ? t(key, error.params) : t("errors.internal", error.params);
-  };
-}
+import { useErrorText } from "@/hooks/use-error-text";
+import type { ConnectionDto } from "@/lib/api";
 
 function SkeletonBar({ className }: { className?: string }) {
   return <span className={cn("block animate-pulse rounded bg-muted", className)} />;
@@ -101,7 +90,7 @@ function BucketList({ connId, isOpen, activeConn, activeBucket, onSelect }: Buck
                 active ? "bg-primary-soft text-primary" : "text-fg2 hover:bg-hover",
               )}
             >
-              <Folder className={cn("size-3.5", active ? "text-primary" : "text-sky")} />
+              <Folder className={cn("size-3.5", active ? "text-primary" : "text-muted-foreground")} />
               <span
                 className={cn("truncate text-[12.5px]", active ? "font-semibold" : "font-medium")}
               >

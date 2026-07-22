@@ -24,7 +24,8 @@
     "colName": "Name",
     "colSize": "Size",
     "colType": "Type",
-    "colModified": "Modified"
+    "colModified": "Modified",
+    "breadcrumbPlaceholder": "Pick a bucket on the left to get started"
   },
   "details": {
     "title": "Details",
@@ -60,8 +61,13 @@
     "defaultBucket": "Default bucket",
     "optional": "(optional)",
     "test": "Test connection",
+    "testing": "Testing connection…",
+    "testOk": "Connection succeeded",
+    "testFail": "Connection failed",
     "cancel": "Cancel",
-    "save": "Save connection"
+    "save": "Save connection",
+    "saving": "Saving…",
+    "required": "This field is required"
   },
   "providers": {
     "s3": "Amazon object storage",

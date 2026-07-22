@@ -28,8 +28,6 @@
     --color-secondary: var(--secondary);
     --color-secondary-foreground: var(--secondary-foreground);
     --color-destructive: var(--destructive);
-    --color-sky: var(--sky);
-    --color-sky-soft: var(--sky-soft);
     --radius-sm: calc(var(--radius) * 0.6);
     --radius-md: calc(var(--radius) * 0.8);
     --radius-lg: var(--radius);
@@ -62,8 +60,6 @@
     --secondary: #f1efea;
     --secondary-foreground: #22201d;
     --destructive: #c8503f;
-    --sky: #7cb3d8;
-    --sky-soft: #e9f3fa;
     --shadow: rgba(40, 36, 30, 0.16);
     --radius: 0.625rem;
 }
@@ -91,8 +87,6 @@
     --secondary: #2a2723;
     --secondary-foreground: #f4f1ec;
     --destructive: #d76a5a;
-    --sky: #6fa6cc;
-    --sky-soft: #22303a;
     --shadow: rgba(0, 0, 0, 0.55);
 }
 
