@@ -86,6 +86,13 @@ fn ensure_config_dir(dir: &Path) -> AppResult<()> {
 
 /// Builds the full [`Connection`] a fresh `add_connection` call should
 /// persist: an `input`'s fields plus a freshly generated id.
+///
+/// `access_key_id` and `secret_access_key` are both stored trimmed, so
+/// accidental leading/trailing whitespace (e.g. from a copy-paste) doesn't
+/// silently become part of the stored credential -- the same rationale, and
+/// the same trimming, that [`merge_update`] applies on every edit, so a
+/// connection's credentials get identical treatment whether they arrive via
+/// `add_connection` or `update_connection`.
 fn new_connection(input: ConnectionInput) -> Connection {
     Connection {
         id: Uuid::new_v4().to_string(),
@@ -93,8 +100,8 @@ fn new_connection(input: ConnectionInput) -> Connection {
         name: input.name,
         endpoint: input.endpoint,
         region: input.region,
-        access_key_id: input.access_key_id,
-        secret_access_key: input.secret_access_key,
+        access_key_id: input.access_key_id.trim().to_string(),
+        secret_access_key: input.secret_access_key.trim().to_string(),
         default_bucket: input.default_bucket,
     }
 }
@@ -104,10 +111,13 @@ fn new_connection(input: ConnectionInput) -> Connection {
 /// `input.secret_access_key` -- 留空或全空白则保留原值 -- means "leave the
 /// secret unchanged" (the UI's "leave blank to keep" convention for editing
 /// a connection without re-entering its secret key) rather than "set the
-/// secret to that blank value". A non-blank secret is stored trimmed, so
+/// secret to that blank value". A non-blank secret is stored trimmed, and
+/// `access_key_id` is always stored trimmed too (it has no "leave blank to
+/// keep" affordance, so there's no blank case to special-case), so
 /// accidental leading/trailing whitespace (e.g. from a copy-paste) doesn't
-/// silently become part of the stored credential. `id` is always preserved
-/// from `existing`, since `ConnectionInput` carries no id of its own.
+/// silently become part of either stored credential -- see [`new_connection`]
+/// for the matching treatment on creation. `id` is always preserved from
+/// `existing`, since `ConnectionInput` carries no id of its own.
 pub fn merge_update(existing: &Connection, input: ConnectionInput) -> Connection {
     let secret_access_key = if input.secret_access_key.trim().is_empty() {
         existing.secret_access_key.clone()
@@ -120,7 +130,7 @@ pub fn merge_update(existing: &Connection, input: ConnectionInput) -> Connection
         name: input.name,
         endpoint: input.endpoint,
         region: input.region,
-        access_key_id: input.access_key_id,
+        access_key_id: input.access_key_id.trim().to_string(),
         secret_access_key,
         default_bucket: input.default_bucket,
     }
@@ -288,6 +298,23 @@ mod tests {
         assert_eq!(conn.default_bucket, None);
     }
 
+    #[test]
+    fn new_connection_trims_a_padded_secret() {
+        let conn = new_connection(sample_input("  new-secret  "));
+
+        assert_eq!(conn.secret_access_key, "new-secret");
+    }
+
+    #[test]
+    fn new_connection_trims_a_padded_access_key_id() {
+        let mut input = sample_input("s1");
+        input.access_key_id = "  AKIANEW  ".to_string();
+
+        let conn = new_connection(input);
+
+        assert_eq!(conn.access_key_id, "AKIANEW");
+    }
+
     // --- merge_update: the "leave blank to keep secret" contract --------
 
     #[test]
@@ -328,6 +355,17 @@ mod tests {
         let updated = merge_update(&existing, input);
 
         assert_eq!(updated.secret_access_key, "new-secret");
+    }
+
+    #[test]
+    fn merge_update_trims_a_padded_access_key_id() {
+        let existing = sample_connection("c1", "original-secret");
+        let mut input = sample_input("new-secret");
+        input.access_key_id = "  AKIANEW  ".to_string();
+
+        let updated = merge_update(&existing, input);
+
+        assert_eq!(updated.access_key_id, "AKIANEW");
     }
 
     #[test]
