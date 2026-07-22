@@ -54,12 +54,15 @@ pub struct S3Provider {
 ///   signals a bug upstream, not a normal "storage" condition (like a
 ///   missing bucket) the user caused.
 /// - An empty `region` defaults to `"us-east-1"` -- the same fallback
-///   `aws-cli`/`boto3` apply when no region is configured. Applied
-///   unconditionally rather than only for non-AWS endpoints, because the
-///   SDK's signing machinery needs *some* region value regardless of
-///   provider; genuine AWS connections are expected to carry their
-///   bucket's real region, so this branch is a safety net for AWS too,
-///   not just the common path for MinIO/R2/self-hosted.
+///   `aws-cli`/`boto3` apply when no region is configured -- but **only**
+///   for non-AWS endpoints ([`is_aws_endpoint`] is false): MinIO/R2/
+///   self-hosted backends routinely don't care about region at all. A
+///   real AWS endpoint with an empty region is rejected the same way as
+///   an empty endpoint (`AppError::Internal`): the UI is expected to
+///   prefill a region for AWS connections, so an empty one reaching here
+///   signals the same kind of upstream-validation gap, and silently
+///   guessing `"us-east-1"` for a real AWS account risks pointing
+///   requests at the wrong region instead of failing fast.
 /// - `force_path_style` is the negation of [`is_aws_endpoint`]: MinIO, R2
 ///   and other self-hosted backends need path-style addressing.
 pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
@@ -69,7 +72,14 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
         });
     }
 
+    let is_aws = is_aws_endpoint(&conn.endpoint);
+
     let region = if conn.region.trim().is_empty() {
+        if is_aws {
+            return Err(AppError::Internal {
+                message: "connection region must not be empty for an AWS endpoint".to_string(),
+            });
+        }
         "us-east-1".to_string()
     } else {
         conn.region.clone()
@@ -88,7 +98,7 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
         .endpoint_url(conn.endpoint.clone())
         .region(Region::new(region))
         .credentials_provider(credentials)
-        .force_path_style(!is_aws_endpoint(&conn.endpoint))
+        .force_path_style(!is_aws)
         .build();
 
     Ok(S3Provider {
@@ -211,6 +221,19 @@ mod tests {
         }
     }
 
+    fn minio_connection() -> Connection {
+        Connection {
+            id: "c2".to_string(),
+            provider: "minio".to_string(),
+            name: "local".to_string(),
+            endpoint: "http://localhost:9000".to_string(),
+            region: "".to_string(),
+            access_key_id: "minioadmin".to_string(),
+            secret_access_key: "minioadmin".to_string(),
+            default_bucket: None,
+        }
+    }
+
     // --- is_aws_endpoint -------------------------------------------------
 
     #[test]
@@ -251,6 +274,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_suffix_spoofed_host() {
+        // "s3.amazonaws.com.evil.com" *starts* with a real AWS hostname but
+        // the actual (right-most) hostname label is "evil.com" -- must not
+        // match, since only a hostname *ending in* ".amazonaws.com" is AWS.
+        assert!(!is_aws_endpoint("s3.amazonaws.com.evil.com"));
+    }
+
+    #[test]
     fn rejects_empty_string() {
         assert!(!is_aws_endpoint(""));
     }
@@ -282,18 +313,13 @@ mod tests {
 
     #[test]
     fn valid_minio_connection_builds_successfully() {
-        let mut conn = aws_connection();
-        conn.provider = "minio".to_string();
-        conn.endpoint = "http://localhost:9000".to_string();
-        conn.region = "".to_string();
-
-        assert!(from_connection(&conn).is_ok());
+        assert!(from_connection(&minio_connection()).is_ok());
     }
 
     #[test]
-    fn empty_region_defaults_to_us_east_1() {
-        let mut conn = aws_connection();
-        conn.region = "".to_string();
+    fn non_aws_empty_region_defaults_to_us_east_1() {
+        let conn = minio_connection();
+        assert_eq!(conn.region, "");
 
         let provider = from_connection(&conn).unwrap();
 
@@ -301,6 +327,24 @@ mod tests {
             provider.client.config().region().map(|r| r.as_ref()),
             Some("us-east-1")
         );
+    }
+
+    #[test]
+    fn aws_endpoint_with_empty_region_is_rejected() {
+        let mut conn = aws_connection();
+        conn.region = "".to_string();
+
+        let err = from_connection(&conn).unwrap_err();
+
+        assert_eq!(err.code(), "internal");
+    }
+
+    #[test]
+    fn aws_endpoint_with_whitespace_only_region_is_rejected() {
+        let mut conn = aws_connection();
+        conn.region = "   ".to_string();
+
+        assert!(from_connection(&conn).is_err());
     }
 
     // --- SdkError classification (pure, no network) -------------------------
