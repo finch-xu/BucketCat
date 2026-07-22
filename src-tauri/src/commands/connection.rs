@@ -100,17 +100,19 @@ fn new_connection(input: ConnectionInput) -> Connection {
 }
 
 /// Applies an `update_connection` edit: every field of `existing` is
-/// replaced by `input`'s, **except** that an empty `input.secret_access_key`
-/// means "leave the secret unchanged" (the UI's "leave blank to keep"
-/// convention for editing a connection without re-entering its secret key)
-/// rather than "set the secret to the empty string". `id` is always
-/// preserved from `existing`, since `ConnectionInput` carries no id of its
-/// own.
+/// replaced by `input`'s, **except** that a blank (empty or all-whitespace)
+/// `input.secret_access_key` -- 留空或全空白则保留原值 -- means "leave the
+/// secret unchanged" (the UI's "leave blank to keep" convention for editing
+/// a connection without re-entering its secret key) rather than "set the
+/// secret to that blank value". A non-blank secret is stored trimmed, so
+/// accidental leading/trailing whitespace (e.g. from a copy-paste) doesn't
+/// silently become part of the stored credential. `id` is always preserved
+/// from `existing`, since `ConnectionInput` carries no id of its own.
 pub fn merge_update(existing: &Connection, input: ConnectionInput) -> Connection {
-    let secret_access_key = if input.secret_access_key.is_empty() {
+    let secret_access_key = if input.secret_access_key.trim().is_empty() {
         existing.secret_access_key.clone()
     } else {
-        input.secret_access_key
+        input.secret_access_key.trim().to_string()
     };
     Connection {
         id: existing.id.clone(),
@@ -175,18 +177,25 @@ pub async fn update_connection(
     Ok(dto)
 }
 
+/// Removes any connection with the given `id` from `connections`, in place.
+/// A no-op (not an error) when no connection has that id -- factored out of
+/// [`delete_connection`] so its idempotency is unit-testable without a live
+/// Tauri app (like [`merge_update`], `State<'_, AppState>` has no public
+/// constructor outside real command dispatch).
+fn remove_by_id(connections: &mut Vec<Connection>, id: &str) {
+    connections.retain(|c| c.id != id);
+}
+
 /// Deletes the connection with the given `id` and persists the result.
-/// Fails with `AppError::ConnectionNotFound` if no connection has that id.
+/// Idempotent: deleting an `id` that doesn't exist (already deleted, never
+/// existed, ...) is still `Ok(())` rather than an error -- the caller's
+/// postcondition ("this id is not in the store") already holds either way.
 #[tauri::command]
 pub async fn delete_connection(state: State<'_, AppState>, id: String) -> AppResult<()> {
     let store = state.store.lock().await;
     let mut connections = store.load()?;
 
-    let before = connections.len();
-    connections.retain(|c| c.id != id);
-    if connections.len() == before {
-        return Err(AppError::ConnectionNotFound { id });
-    }
+    remove_by_id(&mut connections, &id);
 
     store.save(&connections)?;
     Ok(())
@@ -204,13 +213,20 @@ pub async fn test_connection(input: ConnectionInput) -> AppResult<()> {
 
 /// Lists every bucket visible to the saved connection `connection_id`'s
 /// credentials.
+///
+/// The store lock is scoped to just the `load()` -- it's released before
+/// the network-bound `provider.list_buckets().await`, so a slow/hanging S3
+/// call never blocks other commands (e.g. `list_connections` from a second
+/// window) out of the store for its duration.
 #[tauri::command]
 pub async fn list_buckets(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> AppResult<Vec<Bucket>> {
-    let store = state.store.lock().await;
-    let connections = store.load()?;
+    let connections = {
+        let store = state.store.lock().await;
+        store.load()?
+    };
 
     let connection = connections
         .iter()
@@ -295,6 +311,26 @@ mod tests {
     }
 
     #[test]
+    fn merge_update_keeps_existing_secret_when_input_secret_is_whitespace_only() {
+        let existing = sample_connection("c1", "original-secret");
+        let input = sample_input("   ");
+
+        let updated = merge_update(&existing, input);
+
+        assert_eq!(updated.secret_access_key, "original-secret");
+    }
+
+    #[test]
+    fn merge_update_trims_a_padded_non_blank_secret() {
+        let existing = sample_connection("c1", "original-secret");
+        let input = sample_input("  new-secret  ");
+
+        let updated = merge_update(&existing, input);
+
+        assert_eq!(updated.secret_access_key, "new-secret");
+    }
+
+    #[test]
     fn merge_update_preserves_existing_id() {
         let existing = sample_connection("c1", "original-secret");
         let input = sample_input("new-secret");
@@ -316,6 +352,31 @@ mod tests {
         assert_eq!(updated.region, "us-west-2");
         assert_eq!(updated.access_key_id, "AKIANEW");
         assert_eq!(updated.default_bucket, None);
+    }
+
+    // --- remove_by_id: delete_connection's idempotency contract ---------
+
+    #[test]
+    fn remove_by_id_removes_the_matching_connection() {
+        let mut connections = vec![sample_connection("c1", "s1"), sample_connection("c2", "s2")];
+
+        remove_by_id(&mut connections, "c1");
+
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].id, "c2");
+    }
+
+    #[test]
+    fn remove_by_id_is_a_no_op_for_an_absent_id() {
+        let mut connections = vec![sample_connection("c1", "s1"), sample_connection("c2", "s2")];
+        let before = connections.clone();
+
+        // Mirrors delete_connection's contract: deleting an id that isn't
+        // in the store doesn't error or change anything -- the command
+        // still returns Ok(()) around this call.
+        remove_by_id(&mut connections, "does-not-exist");
+
+        assert_eq!(connections, before);
     }
 
     // --- ensure_config_dir -----------------------------------------------
