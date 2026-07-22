@@ -5,3 +5,10 @@
 //! [`crate::provider`] / [`crate::store`], and translate any failure into
 //! [`crate::error::AppError`] so the wire format the frontend sees is always
 //! `{ code, params }`.
+
+pub mod connection;
+
+pub use connection::{
+    add_connection, delete_connection, list_buckets, list_connections, test_connection,
+    update_connection, AppState,
+};
