@@ -12,7 +12,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::DateTimeFormat;
 
 use crate::error::{AppError, AppResult};
-use crate::provider::{Bucket, Provider};
+use crate::provider::{Bucket, ListPage, ObjectEntry, Provider};
 use crate::store::Connection;
 
 /// Returns true only for real AWS endpoints (`*.amazonaws.com`, matched on
@@ -179,6 +179,61 @@ fn classify_error_code(code: &str, message: Option<&str>) -> Option<AppError> {
     }
 }
 
+/// Display name for a key: the final path segment ("docs/2026/" -> "2026",
+/// "docs/readme.md" -> "readme.md"). Pure, unit-tested below.
+pub(crate) fn display_name(key: &str, is_prefix: bool) -> String {
+    let trimmed = if is_prefix {
+        key.trim_end_matches('/')
+    } else {
+        key
+    };
+    trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
+}
+
+/// Maps one ListObjectsV2 response page into the domain [`ListPage`]:
+/// common prefixes become `is_prefix` entries (listed first), objects
+/// become file entries, and the zero-byte folder-marker object whose key
+/// equals the listed `prefix` itself (created by `create_folder`) is
+/// filtered out. Pure — unit-tested against builder-constructed outputs,
+/// no network.
+fn to_list_page(
+    output: &aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+    prefix: &str,
+) -> ListPage {
+    let mut entries: Vec<ObjectEntry> = Vec::new();
+    for cp in output.common_prefixes() {
+        let Some(key) = cp.prefix() else { continue };
+        entries.push(ObjectEntry {
+            key: key.to_string(),
+            name: display_name(key, true),
+            size: None,
+            last_modified: None,
+            storage_class: None,
+            is_prefix: true,
+        });
+    }
+    for obj in output.contents() {
+        let Some(key) = obj.key() else { continue };
+        if key == prefix {
+            continue;
+        }
+        entries.push(ObjectEntry {
+            key: key.to_string(),
+            name: display_name(key, false),
+            size: obj.size().and_then(|s| u64::try_from(s).ok()),
+            last_modified: obj
+                .last_modified()
+                .and_then(|d| d.fmt(DateTimeFormat::DateTime).ok()),
+            storage_class: obj.storage_class().map(|c| c.as_str().to_string()),
+            is_prefix: false,
+        });
+    }
+    ListPage {
+        entries,
+        next_token: output.next_continuation_token().map(str::to_string),
+    }
+}
+
 /// Normalizes any of the three bucket-operation `SdkError`s into an
 /// [`AppError`] in three tiers:
 ///
@@ -272,6 +327,29 @@ impl Provider for S3Provider {
             .await
             .map_err(normalize_s3_error)?;
         Ok(())
+    }
+
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        token: Option<&str>,
+        max_keys: i32,
+    ) -> AppResult<ListPage> {
+        let mut request = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .delimiter("/")
+            .max_keys(max_keys);
+        if !prefix.is_empty() {
+            request = request.prefix(prefix);
+        }
+        if let Some(token) = token {
+            request = request.continuation_token(token);
+        }
+        let output = request.send().await.map_err(normalize_s3_error)?;
+        Ok(to_list_page(&output, prefix))
     }
 }
 
@@ -605,5 +683,111 @@ mod tests {
         let app_err = normalize_s3_error(sdk_err);
 
         assert_eq!(app_err.code(), "internal");
+    }
+
+    // --- display_name (pure) ------------------------------------------------
+
+    #[test]
+    fn display_name_of_root_file_is_the_key() {
+        assert_eq!(display_name("readme.md", false), "readme.md");
+    }
+
+    #[test]
+    fn display_name_of_nested_file_is_last_segment() {
+        assert_eq!(display_name("docs/2026/readme.md", false), "readme.md");
+    }
+
+    #[test]
+    fn display_name_of_prefix_strips_trailing_slash() {
+        assert_eq!(display_name("docs/2026/", true), "2026");
+    }
+
+    #[test]
+    fn display_name_of_root_prefix_is_segment() {
+        assert_eq!(display_name("docs/", true), "docs");
+    }
+
+    // --- to_list_page (pure, SDK output builders) ---------------------------
+
+    fn sample_object(key: &str, size: i64, secs: i64) -> aws_sdk_s3::types::Object {
+        aws_sdk_s3::types::Object::builder()
+            .key(key)
+            .size(size)
+            .last_modified(aws_sdk_s3::primitives::DateTime::from_secs(secs))
+            .storage_class(aws_sdk_s3::types::ObjectStorageClass::Standard)
+            .build()
+    }
+
+    #[test]
+    fn to_list_page_maps_prefixes_then_files() {
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .common_prefixes(
+                aws_sdk_s3::types::CommonPrefix::builder()
+                    .prefix("docs/photos/")
+                    .build(),
+            )
+            .contents(sample_object("docs/readme.md", 1234, 1_752_830_520))
+            .build();
+
+        let page = to_list_page(&output, "docs/");
+
+        assert_eq!(page.entries.len(), 2);
+        let folder = &page.entries[0];
+        assert_eq!(folder.key, "docs/photos/");
+        assert_eq!(folder.name, "photos");
+        assert!(folder.is_prefix);
+        assert_eq!(folder.size, None);
+        let file = &page.entries[1];
+        assert_eq!(file.key, "docs/readme.md");
+        assert_eq!(file.name, "readme.md");
+        assert!(!file.is_prefix);
+        assert_eq!(file.size, Some(1234));
+        assert_eq!(file.storage_class.as_deref(), Some("STANDARD"));
+        // RFC 3339, parseable by the frontend's `new Date(...)`.
+        assert!(file
+            .last_modified
+            .as_deref()
+            .is_some_and(|d| d.contains('T') && d.ends_with('Z')));
+    }
+
+    #[test]
+    fn to_list_page_filters_the_listed_prefixs_own_folder_marker() {
+        // Listing prefix "docs/" returns the zero-byte marker object
+        // "docs/" itself in Contents when the folder was created via
+        // create_folder -- it must not appear as a row.
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .contents(sample_object("docs/", 0, 1_752_830_520))
+            .contents(sample_object("docs/readme.md", 10, 1_752_830_520))
+            .build();
+
+        let page = to_list_page(&output, "docs/");
+
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].key, "docs/readme.md");
+    }
+
+    #[test]
+    fn to_list_page_passes_next_token_through() {
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .next_continuation_token("opaque-token")
+            .build();
+        let page = to_list_page(&output, "");
+        assert_eq!(page.next_token.as_deref(), Some("opaque-token"));
+    }
+
+    #[test]
+    fn to_list_page_has_no_token_on_last_page() {
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder().build();
+        let page = to_list_page(&output, "");
+        assert_eq!(page.next_token, None);
+    }
+
+    #[test]
+    fn to_list_page_negative_size_becomes_none() {
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .contents(sample_object("weird.bin", -1, 1_752_830_520))
+            .build();
+        let page = to_list_page(&output, "");
+        assert_eq!(page.entries[0].size, None);
     }
 }

@@ -93,6 +93,20 @@ pub trait Provider {
 
     /// Deletes the (must be empty) bucket with the given name.
     async fn delete_bucket(&self, name: &str) -> AppResult<()>;
+
+    /// Lists one page of objects and common prefixes ("folders") directly
+    /// under `prefix`, using delimiter `/` semantics. `prefix` may be `""`
+    /// (bucket root) or any string — it need not end in `/`, which is what
+    /// makes the search box's "current path + typed text" prefix search
+    /// work. `token` resumes a previous page's `next_token`; `max_keys`
+    /// caps files + folders per page.
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        token: Option<&str>,
+        max_keys: i32,
+    ) -> AppResult<ListPage>;
 }
 
 #[cfg(test)]
