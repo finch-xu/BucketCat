@@ -1,4 +1,13 @@
-import { ChevronRight, Database, LayoutGrid, List, RefreshCw, Search, Upload } from "lucide-react";
+import {
+  ChevronRight,
+  Database,
+  FolderPlus,
+  LayoutGrid,
+  List,
+  RefreshCw,
+  Search,
+  Upload,
+} from "lucide-react";
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
@@ -8,16 +17,27 @@ import { useApp } from "@/store/app-store";
 
 export function Toolbar() {
   const { t } = useTranslation();
-  const { activeConn, activeBucket, path, gotoCrumb, search, setSearch, view, setView, startMockUpload } =
-    useApp();
+  const {
+    activeConn,
+    activeBucket,
+    path,
+    gotoCrumb,
+    search,
+    setSearch,
+    view,
+    setView,
+    startMockUpload,
+    openNewFolder,
+  } = useApp();
   const queryClient = useQueryClient();
 
+  const noBucket = activeBucket === "";
   const crumbs = [activeBucket, ...path];
 
   return (
     <div className="flex h-[52px] shrink-0 items-center gap-2.5 border-b border-border bg-background px-4">
       <div className="flex min-w-0 flex-1 items-center gap-px">
-        {activeBucket === "" ? (
+        {noBucket ? (
           <span className="truncate px-2 py-[5px] text-[13.5px] text-muted-foreground">
             {t("main.breadcrumbPlaceholder")}
           </span>
@@ -43,13 +63,19 @@ export function Toolbar() {
           })
         )}
       </div>
-      <div className="flex h-8 w-[206px] items-center gap-[7px] rounded-[9px] border border-border bg-panel px-2.5 text-muted-foreground focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary-soft">
+      <div
+        className={cn(
+          "flex h-8 w-[206px] items-center gap-[7px] rounded-[9px] border border-border bg-panel px-2.5 text-muted-foreground focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary-soft",
+          noBucket && "opacity-50",
+        )}
+      >
         <Search className="size-[15px]" />
         <input
           value={search}
+          disabled={noBucket}
           onChange={(e) => setSearch(e.target.value)}
           placeholder={t("main.searchPlaceholder")}
-          className="min-w-0 flex-1 border-none bg-transparent text-[13px] text-foreground outline-none"
+          className="min-w-0 flex-1 border-none bg-transparent text-[13px] text-foreground outline-none disabled:cursor-not-allowed"
         />
       </div>
       <div className="flex rounded-[9px] border border-border bg-panel p-0.5">
@@ -82,8 +108,19 @@ export function Toolbar() {
       </div>
       <button
         type="button"
+        title={t("objects.newFolder")}
+        aria-label={t("objects.newFolder")}
+        disabled={noBucket}
+        onClick={openNewFolder}
+        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-background text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <FolderPlus className="size-[15px]" />
+      </button>
+      <button
+        type="button"
         title={t("main.refresh")}
-        disabled={activeBucket === ""}
+        aria-label={t("main.refresh")}
+        disabled={noBucket}
         onClick={() =>
           queryClient.invalidateQueries({ queryKey: objectsRootKey(activeConn, activeBucket) })
         }

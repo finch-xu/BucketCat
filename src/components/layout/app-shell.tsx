@@ -1,4 +1,5 @@
 import { ConnectionModals } from "@/components/modals/connection-modals";
+import { ObjectDialogs } from "@/components/modals/object-dialogs";
 import { SettingsModal } from "@/components/modals/settings-modal";
 import { AppStoreProvider } from "@/store/app-store";
 import { DetailsPanel } from "./details-panel";
@@ -25,6 +26,7 @@ export function AppShell() {
         </div>
         <TransferBar />
         <ConnectionModals />
+        <ObjectDialogs />
         <SettingsModal />
       </div>
     </AppStoreProvider>
