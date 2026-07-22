@@ -13,19 +13,26 @@ function storedLocale(): AppLocale | null {
     : null;
 }
 
+const initialLocale = storedLocale() ?? resolveLocale(navigator.language);
+
 i18n.use(initReactI18next).init({
   resources: {
     "zh-CN": { translation: zhCN },
     en: { translation: en },
   },
-  lng: storedLocale() ?? resolveLocale(navigator.language),
+  lng: initialLocale,
   fallbackLng: "en",
   interpolation: { escapeValue: false },
 });
 
+// Keep <html lang> in sync with the active locale (a11y + correct font and
+// hyphenation selection). Updated again on manual switch in setLocale().
+document.documentElement.lang = initialLocale;
+
 export function setLocale(locale: AppLocale) {
   localStorage.setItem(STORAGE_KEY, locale);
   i18n.changeLanguage(locale);
+  document.documentElement.lang = locale;
 }
 
 export default i18n;
