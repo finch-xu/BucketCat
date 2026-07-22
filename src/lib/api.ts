@@ -135,3 +135,85 @@ export function testConnection(input: ConnectionInput): Promise<void> {
 export function listBuckets(connectionId: string): Promise<Bucket[]> {
   return invokeCommand<Bucket[]>("list_buckets", { connectionId });
 }
+
+/** One row of an object listing. Mirrors `ObjectEntry` in
+ * `src-tauri/src/provider/mod.rs`: `is_prefix` marks a "folder" (common
+ * prefix, `key` ends with "/", size/mtime/class are null); `size` is
+ * numeric bytes and `last_modified` an RFC 3339 string — display
+ * formatting happens in `src/lib/format.ts`. */
+export interface ObjectEntry {
+  key: string;
+  name: string;
+  size: number | null;
+  last_modified: string | null;
+  storage_class: string | null;
+  is_prefix: boolean;
+}
+
+/** One page of `list_objects`. Feed `next_token` back as the next call's
+ * `token` to continue; null means this was the last page. Mirrors
+ * `ListPage` in `src-tauri/src/provider/mod.rs`. */
+export interface ListPage {
+  entries: ObjectEntry[];
+  next_token: string | null;
+}
+
+/** A per-key failure inside a batch operation. `code` is an
+ * `errors.*`-namespace i18n code (same space as `AppError.code`), not a
+ * raw S3 code. Mirrors `FailedKey` in `src-tauri/src/provider/mod.rs`. */
+export interface FailedKey {
+  key: string;
+  code: string;
+}
+
+/** Batch outcome:「成功 N / 失败 M」(design §7). Mirrors `BatchResult` in
+ * `src-tauri/src/provider/mod.rs`. */
+export interface BatchResult {
+  succeeded: number;
+  failed: FailedKey[];
+}
+
+/** Lists one page (backend-fixed page size) of objects + folders under
+ * `prefix` — the current path plus any prefix-search text. */
+export function listObjects(
+  connectionId: string,
+  bucket: string,
+  prefix: string,
+  token: string | null,
+): Promise<ListPage> {
+  return invokeCommand<ListPage>("list_objects", {
+    connectionId,
+    bucket,
+    prefix,
+    token,
+  });
+}
+
+/** Batch-deletes object keys; resolves (not rejects) with per-key partial
+ * failures in `BatchResult.failed`. */
+export function deleteObjects(
+  connectionId: string,
+  bucket: string,
+  keys: string[],
+): Promise<BatchResult> {
+  return invokeCommand<BatchResult>("delete_objects", { connectionId, bucket, keys });
+}
+
+/** Renames one object (backend implements copy + delete). */
+export function renameObject(
+  connectionId: string,
+  bucket: string,
+  fromKey: string,
+  toKey: string,
+): Promise<void> {
+  return invokeCommand<void>("rename_object", { connectionId, bucket, fromKey, toKey });
+}
+
+/** Creates a folder: a zero-byte `prefix/` marker object. */
+export function createFolder(
+  connectionId: string,
+  bucket: string,
+  prefix: string,
+): Promise<void> {
+  return invokeCommand<void>("create_folder", { connectionId, bucket, prefix });
+}
