@@ -1,0 +1,137 @@
+/**
+ * Typed IPC layer over the Tauri connection commands.
+ *
+ * Mirrors `src-tauri/src/commands/connection.rs` and
+ * `src-tauri/src/store/model.rs` exactly:
+ * - Payload *struct* fields (ConnectionInput/ConnectionDto/Bucket) serialize
+ *   with their Rust field names via serde -- snake_case, unchanged here.
+ * - Command *argument* names get camelCased by Tauri's JS bridge, so
+ *   `list_buckets(connection_id)` is invoked as `{ connectionId }` while
+ *   `input`/`id` (no underscores) pass through unchanged.
+ * - Every command rejects with `AppError`'s wire shape: `{ code, params }`
+ *   (see `src-tauri/src/error.rs`). `toAppError` narrows whatever Tauri
+ *   hands back into that shape, with an `internal` fallback for anything
+ *   that doesn't conform.
+ */
+import { invoke } from "@tauri-apps/api/core";
+
+/** Provider ids the UI knows about today (see `PROVIDERS` in
+ * `src/lib/mock-data.ts`). The Rust side stores `provider` as a plain
+ * `String` with no enum constraint, so this is a *soft* union: known ids
+ * get autocomplete/exhaustiveness, but `(string & {})` keeps arbitrary
+ * strings (e.g. from an older/future build) assignable without widening
+ * the whole type to `string`. */
+export type ProviderKind =
+  | "s3"
+  | "r2"
+  | "minio"
+  | "oss"
+  | "cos"
+  | "b2"
+  | "generic"
+  | (string & {});
+
+/** Frontend -> backend payload for creating/updating a connection. Mirrors
+ * `ConnectionInput` in `src-tauri/src/store/model.rs` field-for-field. */
+export interface ConnectionInput {
+  provider: ProviderKind;
+  name: string;
+  endpoint: string;
+  region: string;
+  access_key_id: string;
+  secret_access_key: string;
+  default_bucket: string | null;
+}
+
+/** Backend -> frontend view of a saved connection (never the secret key).
+ * Mirrors `ConnectionDto` in `src-tauri/src/store/model.rs`. */
+export interface ConnectionDto {
+  id: string;
+  provider: ProviderKind;
+  name: string;
+  endpoint: string;
+  region: string;
+  access_key_id: string;
+  default_bucket: string | null;
+}
+
+/** A bucket as returned by `list_buckets`. Mirrors `Bucket` in
+ * `src-tauri/src/provider/mod.rs`; `creation_date` is a pre-formatted
+ * RFC 3339 string, not a Date. */
+export interface Bucket {
+  name: string;
+  creation_date: string | null;
+}
+
+/** Wire shape of every command rejection -- `AppError`'s `Serialize` impl
+ * in `src-tauri/src/error.rs`. `code` is a stable i18n key (e.g.
+ * `"storage/bucket-not-found"`); `params` interpolates into its message. */
+export interface AppError {
+  code: string;
+  params: Record<string, string>;
+}
+
+function isAppError(value: unknown): value is AppError {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { code?: unknown }).code === "string" &&
+    typeof (value as { params?: unknown }).params === "object" &&
+    (value as { params?: unknown }).params !== null
+  );
+}
+
+/** Narrows an unknown Tauri rejection reason into an `AppError`, falling
+ * back to a synthetic `internal` error for anything that doesn't conform
+ * to the wire shape (e.g. a plain string, or an error thrown before the
+ * command body ever ran). */
+export function toAppError(reason: unknown): AppError {
+  if (isAppError(reason)) return reason;
+  const message =
+    reason instanceof Error
+      ? reason.message
+      : typeof reason === "string"
+        ? reason
+        : String(reason);
+  return { code: "internal", params: { message } };
+}
+
+async function invokeCommand<T>(
+  cmd: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  try {
+    return await invoke<T>(cmd, args);
+  } catch (reason) {
+    throw toAppError(reason);
+  }
+}
+
+export function listConnections(): Promise<ConnectionDto[]> {
+  return invokeCommand<ConnectionDto[]>("list_connections");
+}
+
+export function addConnection(input: ConnectionInput): Promise<ConnectionDto> {
+  return invokeCommand<ConnectionDto>("add_connection", { input });
+}
+
+export function updateConnection(
+  id: string,
+  input: ConnectionInput,
+): Promise<ConnectionDto> {
+  return invokeCommand<ConnectionDto>("update_connection", { id, input });
+}
+
+export function deleteConnection(id: string): Promise<void> {
+  return invokeCommand<void>("delete_connection", { id });
+}
+
+/** Tests connectivity for an as-yet-unsaved connection profile. Called
+ * imperatively by the add-connection wizard -- not a query/mutation hook. */
+export function testConnection(input: ConnectionInput): Promise<void> {
+  return invokeCommand<void>("test_connection", { input });
+}
+
+export function listBuckets(connectionId: string): Promise<Bucket[]> {
+  return invokeCommand<Bucket[]>("list_buckets", { connectionId });
+}
