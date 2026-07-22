@@ -8,7 +8,7 @@ import {
   X,
   XCircle,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
 import { useAddConnection, useUpdateConnection } from "@/hooks/use-connections";
@@ -80,7 +80,17 @@ function Field({
  * carries the secret, so that field starts empty with copy explaining that
  * leaving it blank keeps the existing secret (`update_connection`'s
  * contract: an empty/whitespace secret in the input is a no-op on that
- * field). */
+ * field).
+ *
+ * `app-shell`'s `ConnectionModals` wrapper mounts this with a `key` derived
+ * from the target ("add", `edit:${id}`, or "closed"), so every distinct
+ * add/edit target gets a *fresh component instance* rather than an existing
+ * instance being patched via an effect. That's what lets initial state below
+ * be plain lazy initializers instead of a post-paint reset effect: a fresh
+ * mount's first render already has the right `editingConnection` for this
+ * target (no one-frame flash of the previous target's step/fields), and a
+ * fresh `useAddConnection`/`useUpdateConnection` mutation instance starts
+ * with no stale error/pending from a previous target automatically. */
 export function ConnectionModal() {
   const { t } = useTranslation();
   const errorText = useErrorText();
@@ -93,10 +103,25 @@ export function ConnectionModal() {
   const mutation = isEdit ? updateMutation : addMutation;
 
   // Wizard step + form state are ephemeral to this modal instance, so they
-  // live in component-local state rather than the global app store.
-  const [step, setStep] = useState<1 | 2>(1);
-  const [providerId, setProviderId] = useState<string | null>(null);
-  const [form, setForm] = useState<FormState>(EMPTY_FORM);
+  // live in component-local state rather than the global app store. Lazy
+  // initializers read `editingConnection` only on this instance's mount --
+  // safe because a new target always means a new instance (see key above).
+  const [step, setStep] = useState<1 | 2>(() => (editingConnection ? 2 : 1));
+  const [providerId, setProviderId] = useState<string | null>(
+    () => editingConnection?.provider ?? null,
+  );
+  const [form, setForm] = useState<FormState>(() =>
+    editingConnection
+      ? {
+          name: editingConnection.name,
+          endpoint: editingConnection.endpoint,
+          region: editingConnection.region,
+          access_key_id: editingConnection.access_key_id,
+          secret_access_key: "",
+          default_bucket: editingConnection.default_bucket ?? "",
+        }
+      : EMPTY_FORM,
+  );
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [testStatus, setTestStatus] = useState<TestStatus>({ kind: "idle" });
   // Guards against a stale in-flight `testConnection` result landing after
@@ -104,38 +129,6 @@ export function ConnectionModal() {
   // most recent request id's resolution/rejection is allowed to update
   // `testStatus`.
   const testReqIdRef = useRef(0);
-
-  // Reset the whole wizard every time it's (re)opened, so a previous run's
-  // step/provider/values/test result never leak into the next one. Opening
-  // to add starts at step 1 with a blank form; opening to edit jumps
-  // straight to step 2, prefilled from the connection (secret left blank).
-  useEffect(() => {
-    if (showAdd) {
-      setStep(1);
-      setProviderId(null);
-      setForm(EMPTY_FORM);
-      setFieldErrors({});
-      setTestStatus({ kind: "idle" });
-      testReqIdRef.current++;
-      addMutation.reset();
-    } else if (editingConnection) {
-      setStep(2);
-      setProviderId(editingConnection.provider);
-      setForm({
-        name: editingConnection.name,
-        endpoint: editingConnection.endpoint,
-        region: editingConnection.region,
-        access_key_id: editingConnection.access_key_id,
-        secret_access_key: "",
-        default_bucket: editingConnection.default_bucket ?? "",
-      });
-      setFieldErrors({});
-      setTestStatus({ kind: "idle" });
-      testReqIdRef.current++;
-      updateMutation.reset();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showAdd, editingConnection]);
 
   if (!isOpen) return null;
 
@@ -413,7 +406,6 @@ export function ConnectionModal() {
               type="button"
               onClick={handleTest}
               disabled={testStatus.kind === "pending" || mutation.isPending || secretBlockedForTest}
-              title={secretBlockedForTest ? t("addConn.testNeedsSecret") : undefined}
               className="inline-flex h-9 shrink-0 cursor-pointer items-center gap-[7px] rounded-[9px] border border-border bg-background px-3.5 text-[13px] font-medium text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
             >
               {testStatus.kind === "pending" ? (

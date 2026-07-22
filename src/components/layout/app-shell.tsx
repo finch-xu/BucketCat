@@ -1,5 +1,4 @@
-import { ConnectionModal } from "@/components/modals/connection-modal";
-import { DeleteConnectionDialog } from "@/components/modals/delete-connection-dialog";
+import { ConnectionModals } from "@/components/modals/connection-modals";
 import { SettingsModal } from "@/components/modals/settings-modal";
 import { AppStoreProvider } from "@/store/app-store";
 import { DetailsPanel } from "./details-panel";
@@ -25,8 +24,7 @@ export function AppShell() {
           </section>
         </div>
         <TransferBar />
-        <ConnectionModal />
-        <DeleteConnectionDialog />
+        <ConnectionModals />
         <SettingsModal />
       </div>
     </AppStoreProvider>
