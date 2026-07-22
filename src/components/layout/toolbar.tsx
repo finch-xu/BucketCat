@@ -1,13 +1,16 @@
 import { ChevronRight, Database, LayoutGrid, List, RefreshCw, Search, Upload } from "lucide-react";
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
+import { useQueryClient } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
+import { objectsRootKey } from "@/hooks/use-objects";
 import { useApp } from "@/store/app-store";
 
 export function Toolbar() {
   const { t } = useTranslation();
-  const { activeBucket, path, gotoCrumb, search, setSearch, view, setView, startMockUpload } =
+  const { activeConn, activeBucket, path, gotoCrumb, search, setSearch, view, setView, startMockUpload } =
     useApp();
+  const queryClient = useQueryClient();
 
   const crumbs = [activeBucket, ...path];
 
@@ -80,7 +83,11 @@ export function Toolbar() {
       <button
         type="button"
         title={t("main.refresh")}
-        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-background text-fg2 hover:bg-hover hover:text-foreground"
+        disabled={activeBucket === ""}
+        onClick={() =>
+          queryClient.invalidateQueries({ queryKey: objectsRootKey(activeConn, activeBucket) })
+        }
+        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-background text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
       >
         <RefreshCw className="size-[15px]" />
       </button>

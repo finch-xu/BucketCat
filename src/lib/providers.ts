@@ -10,10 +10,10 @@ import {
 /**
  * Static metadata for the object-storage providers BucketCat knows about --
  * icon, brand color, and default endpoint/region used to prefill the
- * add-connection wizard. This is real reference data (not a fixture), so it
- * lives apart from `mock-data.ts`; the sidebar maps a saved connection's
- * `provider` string (see `ProviderKind` in `@/lib/api`) back to this table
- * for its icon/color, falling back to the `generic` entry for unknown ids.
+ * add-connection wizard. This is real reference data (not a fixture); the
+ * sidebar maps a saved connection's `provider` string (see `ProviderKind` in
+ * `@/lib/api`) back to this table for its icon/color, falling back to the
+ * `generic` entry for unknown ids.
  */
 export interface ProviderMeta {
   id: string;

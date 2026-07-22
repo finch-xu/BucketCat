@@ -3,13 +3,10 @@ import {
   useCallback,
   useContext,
   useEffect,
-  useMemo,
   useState,
   type ReactNode,
 } from "react";
-import { filterByPrefix, sortEntries } from "@/lib/entries";
-import type { ConnectionDto } from "@/lib/api";
-import { MOCK_TREE, treeKey, type ObjectEntry } from "@/lib/mock-data";
+import type { ConnectionDto, ObjectEntry } from "@/lib/api";
 import {
   applyThemeMode,
   getThemeMode,
@@ -19,6 +16,10 @@ import {
 } from "@/lib/theme";
 
 export type ViewMode = "list" | "grid";
+
+/** How a row click modifies the selection: plain click replaces it,
+ * cmd/ctrl-click toggles, shift-click extends a range from the anchor. */
+export type SelectMode = "single" | "toggle" | "range";
 
 export interface Transfer {
   id: number;
@@ -62,11 +63,27 @@ interface AppStore {
 
   search: string;
   setSearch: (value: string) => void;
-  entries: ObjectEntry[];
-  rawEntries: ObjectEntry[];
 
-  selected: string | null;
-  selectEntry: (name: string | null) => void;
+  /** Selected object keys (files only -- folders navigate, they don't
+   * select). Order is insertion order for toggle, listing order for
+   * range. */
+  selectedKeys: string[];
+  /** `orderedFileKeys` is the current listing's file keys in display
+   * order -- required for `range` mode. */
+  selectKey: (key: string, mode: SelectMode, orderedFileKeys: string[]) => void;
+  clearSelection: () => void;
+
+  /** Object-mutation dialog state (dialogs themselves mount in
+   * `src/components/modals/object-dialogs.tsx`). */
+  renameTarget: ObjectEntry | null;
+  openRename: (entry: ObjectEntry) => void;
+  closeRename: () => void;
+  showNewFolder: boolean;
+  openNewFolder: () => void;
+  closeNewFolder: () => void;
+  deleteTargets: string[] | null;
+  openDeleteObjects: (keys: string[]) => void;
+  closeDeleteObjects: () => void;
 
   transfers: Transfer[];
   transferOpen: boolean;
@@ -96,6 +113,8 @@ interface AppStore {
 
 const AppStoreContext = createContext<AppStore | null>(null);
 
+// Mock transfers stay until M4 replaces them with real engine events
+// (accepted residue, per the M2 final review ledger).
 const INITIAL_TRANSFERS: Transfer[] = [
   { id: 1, name: "hero-banner.png", dir: "up", pct: 63, size: "1.4 MB", speed: "2.1 MB/s", status: "active" },
   { id: 2, name: "backup-2026-07.tar.gz", dir: "down", pct: 100, size: "318 MB", speed: "", status: "done" },
@@ -112,8 +131,14 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
   const [activeBucket, setActiveBucket] = useState("");
   const [path, setPath] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [selected, setSelected] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
+  const [search, setSearchState] = useState("");
+
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+  const [anchorKey, setAnchorKey] = useState<string | null>(null);
+
+  const [renameTarget, setRenameTarget] = useState<ObjectEntry | null>(null);
+  const [showNewFolder, setShowNewFolder] = useState(false);
+  const [deleteTargets, setDeleteTargets] = useState<string[] | null>(null);
 
   const [transfers, setTransfers] = useState<Transfer[]>(INITIAL_TRANSFERS);
   const [transferOpen, setTransferOpen] = useState(false);
@@ -164,14 +189,10 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
     return () => clearInterval(iv);
   }, [transfers]);
 
-  const rawEntries = useMemo(
-    () => MOCK_TREE[treeKey(activeBucket, path)] ?? [],
-    [activeBucket, path],
-  );
-  const entries = useMemo(
-    () => filterByPrefix(sortEntries(rawEntries), search),
-    [rawEntries, search],
-  );
+  const clearSelection = useCallback(() => {
+    setSelectedKeys([]);
+    setAnchorKey(null);
+  }, []);
 
   const value: AppStore = {
     themeMode,
@@ -191,26 +212,26 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
       setActiveConn(connId);
       setActiveBucket(bucket);
       setPath([]);
-      setSelected(null);
-      setSearch("");
+      clearSelection();
+      setSearchState("");
       setExpanded((e) => ({ ...e, [connId]: true }));
     },
     openFolder: (name) => {
       setPath((p) => [...p, name]);
-      setSelected(null);
-      setSearch("");
+      clearSelection();
+      setSearchState("");
     },
     gotoCrumb: (index) => {
       setPath((p) => (index < 0 ? [] : p.slice(0, index + 1)));
-      setSelected(null);
-      setSearch("");
+      clearSelection();
+      setSearchState("");
     },
     onConnectionDeleted: (id) => {
       if (activeConn === id) {
         setActiveConn("");
         setActiveBucket("");
         setPath([]);
-        setSelected(null);
+        clearSelection();
       }
       setExpanded((e) => {
         if (!(id in e)) return e;
@@ -220,11 +241,45 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
       });
     },
     search,
-    setSearch,
-    entries,
-    rawEntries,
-    selected,
-    selectEntry: setSelected,
+    setSearch: (valueText) => {
+      setSearchState(valueText);
+      clearSelection();
+    },
+    selectedKeys,
+    selectKey: (key, mode, orderedFileKeys) => {
+      if (mode === "single") {
+        setSelectedKeys([key]);
+        setAnchorKey(key);
+        return;
+      }
+      if (mode === "toggle") {
+        setSelectedKeys((prev) =>
+          prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key],
+        );
+        setAnchorKey(key);
+        return;
+      }
+      // range
+      const from = anchorKey ? orderedFileKeys.indexOf(anchorKey) : -1;
+      const to = orderedFileKeys.indexOf(key);
+      if (from === -1 || to === -1) {
+        setSelectedKeys([key]);
+        setAnchorKey(key);
+        return;
+      }
+      const [lo, hi] = from < to ? [from, to] : [to, from];
+      setSelectedKeys(orderedFileKeys.slice(lo, hi + 1));
+    },
+    clearSelection,
+    renameTarget,
+    openRename: (entry) => setRenameTarget(entry),
+    closeRename: () => setRenameTarget(null),
+    showNewFolder,
+    openNewFolder: () => setShowNewFolder(true),
+    closeNewFolder: () => setShowNewFolder(false),
+    deleteTargets,
+    openDeleteObjects: (keys) => setDeleteTargets(keys),
+    closeDeleteObjects: () => setDeleteTargets(null),
     transfers,
     transferOpen,
     toggleTransferPanel: () => setTransferOpen((o) => !o),

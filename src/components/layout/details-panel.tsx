@@ -1,18 +1,27 @@
 import { Download, Link2, Share2, Trash2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { fileMeta, isImageExt } from "@/lib/file-meta";
+import { extFromName, formatDate, formatSize } from "@/lib/format";
+import { useBrowse } from "@/hooks/use-browse";
 import { useApp } from "@/store/app-store";
 
+/** Shows the single selected file's real metadata. Download/copy-link/share
+ * stay visual placeholders until M4 (transfers) and M6 (presign); delete is
+ * wired to the object dialogs. ETag/head_object detail arrives in M6. */
 export function DetailsPanel() {
   const { t } = useTranslation();
-  const { entries, selected, selectEntry, activeBucket, path } = useApp();
+  const { selectedKeys, clearSelection } = useApp();
+  const { entries } = useBrowse();
 
-  const entry = entries.find((e) => e.name === selected && e.kind === "file");
+  const entry =
+    selectedKeys.length === 1
+      ? entries.find((e) => e.key === selectedKeys[0] && !e.is_prefix)
+      : undefined;
   if (!entry) return null;
 
-  const meta = fileMeta(entry.kind, entry.ext);
+  const ext = extFromName(entry.name);
+  const meta = fileMeta("file", ext);
   const BigIcon = meta.icon;
-  const objectKey = [activeBucket, ...path, entry.name].join("/");
 
   return (
     <aside className="flex w-[300px] shrink-0 flex-col border-l border-border bg-background">
@@ -20,7 +29,7 @@ export function DetailsPanel() {
         <span className="text-[13px] font-semibold">{t("details.title")}</span>
         <button
           type="button"
-          onClick={() => selectEntry(null)}
+          onClick={clearSelection}
           className="flex size-[26px] cursor-pointer items-center justify-center rounded-[7px] text-muted-foreground hover:bg-hover hover:text-fg2"
         >
           <X className="size-3.5" />
@@ -28,7 +37,7 @@ export function DetailsPanel() {
       </div>
       <div className="flex-1 overflow-y-auto p-4">
         <div className="flex h-[148px] w-full items-center justify-center overflow-hidden rounded-xl border border-border bg-[repeating-linear-gradient(45deg,var(--panel),var(--panel)_11px,var(--border2)_11px,var(--border2)_22px)]">
-          {isImageExt(entry.ext) ? (
+          {isImageExt(ext) ? (
             <span className="rounded-[7px] border border-border bg-background px-[11px] py-1.5 font-mono text-[11px] text-muted-foreground">
               {t("details.imagePreview")}
             </span>
@@ -73,24 +82,20 @@ export function DetailsPanel() {
             <div className="mb-[3px] text-[10.5px] tracking-[0.4px] text-muted-foreground uppercase">
               {t("details.objectKey")}
             </div>
-            <div className="font-mono text-xs leading-[1.4] break-all text-fg2">{objectKey}</div>
+            <div className="font-mono text-xs leading-[1.4] break-all text-fg2">{entry.key}</div>
           </div>
           <div className="flex justify-between">
             <span className="text-xs text-muted-foreground">{t("details.size")}</span>
-            <span className="text-[12.5px] text-fg2 tabular-nums">{entry.size}</span>
+            <span className="text-[12.5px] text-fg2 tabular-nums">{formatSize(entry.size)}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-xs text-muted-foreground">{t("details.storageClass")}</span>
-            <span className="text-[12.5px] text-fg2">STANDARD</span>
+            <span className="text-[12.5px] text-fg2">{entry.storage_class ?? "—"}</span>
           </div>
           <div className="flex justify-between">
             <span className="text-xs text-muted-foreground">{t("details.modified")}</span>
-            <span className="text-[12.5px] text-fg2 tabular-nums">{entry.modified}</span>
-          </div>
-          <div className="flex justify-between gap-3">
-            <span className="shrink-0 text-xs text-muted-foreground">ETag</span>
-            <span className="text-right font-mono text-xs break-all text-fg2">
-              "9f86d0818a10..."
+            <span className="text-[12.5px] text-fg2 tabular-nums">
+              {formatDate(entry.last_modified)}
             </span>
           </div>
         </div>
