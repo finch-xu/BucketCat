@@ -67,7 +67,17 @@
     "cancel": "Cancel",
     "save": "Save connection",
     "saving": "Saving…",
-    "required": "This field is required"
+    "required": "This field is required",
+    "secretKeep": "Leave blank to keep the current secret",
+    "testNeedsSecret": "Enter the secret key to test the connection"
+  },
+  "conn": {
+    "edit": "Edit connection",
+    "delete": "Delete connection",
+    "editTitle": "Edit Connection",
+    "saveEdit": "Save changes",
+    "deleteConfirm": "Delete this connection?",
+    "deleteConfirmBody": "Are you sure you want to delete \"{{name}}\"? Its buckets will no longer be reachable, and this can't be undone."
   },
   "providers": {
     "s3": "Amazon object storage",

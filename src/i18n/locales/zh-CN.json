@@ -67,7 +67,17 @@
     "cancel": "取消",
     "save": "保存连接",
     "saving": "正在保存…",
-    "required": "此项为必填"
+    "required": "此项为必填",
+    "secretKeep": "留空则不修改",
+    "testNeedsSecret": "填写 Secret Key 后才能测试连接"
+  },
+  "conn": {
+    "edit": "编辑连接",
+    "delete": "删除连接",
+    "editTitle": "编辑连接",
+    "saveEdit": "保存修改",
+    "deleteConfirm": "删除这个连接？",
+    "deleteConfirmBody": "确定要删除连接「{{name}}」吗？其存储桶将不再可访问，且此操作无法撤销。"
   },
   "providers": {
     "s3": "亚马逊云对象存储",

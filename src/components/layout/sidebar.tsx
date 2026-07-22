@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Folder, Plus, Settings } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder, Pencil, Plus, Settings, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { providerMeta } from "@/lib/providers";
@@ -110,6 +110,8 @@ interface ConnectionRowProps {
   activeBucket: string;
   onToggle: () => void;
   onSelectBucket: (bucket: string) => void;
+  onEdit: () => void;
+  onDelete: () => void;
 }
 
 function ConnectionRow({
@@ -119,6 +121,8 @@ function ConnectionRow({
   activeBucket,
   onToggle,
   onSelectBucket,
+  onEdit,
+  onDelete,
 }: ConnectionRowProps) {
   const { t } = useTranslation();
   const meta = providerMeta(conn.provider);
@@ -128,7 +132,7 @@ function ConnectionRow({
     <div className="mb-px">
       <div
         onClick={onToggle}
-        className="flex cursor-pointer items-center gap-[9px] rounded-[9px] px-2 py-[7px] hover:bg-hover"
+        className="group flex cursor-pointer items-center gap-[9px] rounded-[9px] px-2 py-[7px] hover:bg-hover"
       >
         <span className="flex w-3 justify-center text-muted2">
           {isOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
@@ -147,6 +151,35 @@ function ConnectionRow({
             {meta.nameKey ? t(meta.nameKey) : meta.name}
           </span>
         </span>
+        {/* Hover/focus-only actions -- kept keyboard-reachable via
+         * group-focus-within so tabbing to either button reveals them even
+         * without a mouse hover. */}
+        <span className="flex shrink-0 items-center gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onEdit();
+            }}
+            title={t("conn.edit")}
+            aria-label={t("conn.edit")}
+            className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-active hover:text-primary"
+          >
+            <Pencil className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            title={t("conn.delete")}
+            aria-label={t("conn.delete")}
+            className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        </span>
       </div>
       <BucketList
         connId={conn.id}
@@ -162,8 +195,17 @@ function ConnectionRow({
 export function Sidebar() {
   const { t } = useTranslation();
   const errorText = useErrorText();
-  const { activeConn, activeBucket, expanded, toggleConn, selectBucket, openAdd, openSettings } =
-    useApp();
+  const {
+    activeConn,
+    activeBucket,
+    expanded,
+    toggleConn,
+    selectBucket,
+    openAdd,
+    openSettings,
+    openEditConnection,
+    openDeleteConnection,
+  } = useApp();
   const connectionsQuery = useConnections();
 
   return (
@@ -223,6 +265,8 @@ export function Sidebar() {
               activeBucket={activeBucket}
               onToggle={() => toggleConn(conn.id)}
               onSelectBucket={(bucket) => selectBucket(conn.id, bucket)}
+              onEdit={() => openEditConnection(conn)}
+              onDelete={() => openDeleteConnection(conn)}
             />
           ))}
       </div>

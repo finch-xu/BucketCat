@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { filterByPrefix, sortEntries } from "@/lib/entries";
+import type { ConnectionDto } from "@/lib/api";
 import { MOCK_TREE, treeKey, type ObjectEntry } from "@/lib/mock-data";
 import {
   applyThemeMode,
@@ -55,6 +56,9 @@ interface AppStore {
   selectBucket: (connId: string, bucket: string) => void;
   openFolder: (name: string) => void;
   gotoCrumb: (index: number) => void;
+  /** Called after a connection is successfully deleted -- clears the active
+   * selection and expanded state for it if it was the one being browsed. */
+  onConnectionDeleted: (id: string) => void;
 
   search: string;
   setSearch: (value: string) => void;
@@ -73,6 +77,14 @@ interface AppStore {
   showAdd: boolean;
   openAdd: () => void;
   closeAdd: () => void;
+
+  editingConnection: ConnectionDto | null;
+  openEditConnection: (conn: ConnectionDto) => void;
+  closeEditConnection: () => void;
+
+  deletingConnection: ConnectionDto | null;
+  openDeleteConnection: (conn: ConnectionDto) => void;
+  closeDeleteConnection: () => void;
 
   showSettings: boolean;
   openSettings: () => void;
@@ -108,6 +120,8 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
   const [nextTid, setNextTid] = useState(3);
 
   const [showAdd, setShowAdd] = useState(false);
+  const [editingConnection, setEditingConnection] = useState<ConnectionDto | null>(null);
+  const [deletingConnection, setDeletingConnection] = useState<ConnectionDto | null>(null);
   const [showSettings, setShowSettings] = useState(false);
 
   const [transferSettings, setTransferSettingsState] = useState<TransferSettings>({
@@ -191,6 +205,20 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
       setSelected(null);
       setSearch("");
     },
+    onConnectionDeleted: (id) => {
+      if (activeConn === id) {
+        setActiveConn("");
+        setActiveBucket("");
+        setPath([]);
+        setSelected(null);
+      }
+      setExpanded((e) => {
+        if (!(id in e)) return e;
+        const next = { ...e };
+        delete next[id];
+        return next;
+      });
+    },
     search,
     setSearch,
     entries,
@@ -220,6 +248,12 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
     showAdd,
     openAdd: () => setShowAdd(true),
     closeAdd: () => setShowAdd(false),
+    editingConnection,
+    openEditConnection: (conn) => setEditingConnection(conn),
+    closeEditConnection: () => setEditingConnection(null),
+    deletingConnection,
+    openDeleteConnection: (conn) => setDeletingConnection(conn),
+    closeDeleteConnection: () => setDeletingConnection(null),
     showSettings,
     openSettings: () => setShowSettings(true),
     closeSettings: () => setShowSettings(false),

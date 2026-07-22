@@ -11,7 +11,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
-import { useAddConnection } from "@/hooks/use-connections";
+import { useAddConnection, useUpdateConnection } from "@/hooks/use-connections";
 import { useErrorText } from "@/hooks/use-error-text";
 import type { AppError, ConnectionInput } from "@/lib/api";
 import { testConnection } from "@/lib/api";
@@ -73,11 +73,24 @@ function Field({
   );
 }
 
-export function AddConnectionModal() {
+/** Add-connection wizard, reused for editing an existing connection. In
+ * "add" mode the user picks a provider on step 1, then fills in credentials
+ * on step 2. In "edit" mode (`editingConnection` set) the modal opens
+ * directly on step 2, prefilled from the `ConnectionDto` -- which never
+ * carries the secret, so that field starts empty with copy explaining that
+ * leaving it blank keeps the existing secret (`update_connection`'s
+ * contract: an empty/whitespace secret in the input is a no-op on that
+ * field). */
+export function ConnectionModal() {
   const { t } = useTranslation();
   const errorText = useErrorText();
-  const { showAdd, closeAdd } = useApp();
+  const { showAdd, closeAdd, editingConnection, closeEditConnection } = useApp();
   const addMutation = useAddConnection();
+  const updateMutation = useUpdateConnection();
+
+  const isEdit = editingConnection !== null;
+  const isOpen = showAdd || isEdit;
+  const mutation = isEdit ? updateMutation : addMutation;
 
   // Wizard step + form state are ephemeral to this modal instance, so they
   // live in component-local state rather than the global app store.
@@ -93,7 +106,9 @@ export function AddConnectionModal() {
   const testReqIdRef = useRef(0);
 
   // Reset the whole wizard every time it's (re)opened, so a previous run's
-  // step/provider/values/test result never leak into the next one.
+  // step/provider/values/test result never leak into the next one. Opening
+  // to add starts at step 1 with a blank form; opening to edit jumps
+  // straight to step 2, prefilled from the connection (secret left blank).
   useEffect(() => {
     if (showAdd) {
       setStep(1);
@@ -103,13 +118,34 @@ export function AddConnectionModal() {
       setTestStatus({ kind: "idle" });
       testReqIdRef.current++;
       addMutation.reset();
+    } else if (editingConnection) {
+      setStep(2);
+      setProviderId(editingConnection.provider);
+      setForm({
+        name: editingConnection.name,
+        endpoint: editingConnection.endpoint,
+        region: editingConnection.region,
+        access_key_id: editingConnection.access_key_id,
+        secret_access_key: "",
+        default_bucket: editingConnection.default_bucket ?? "",
+      });
+      setFieldErrors({});
+      setTestStatus({ kind: "idle" });
+      testReqIdRef.current++;
+      updateMutation.reset();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showAdd]);
+  }, [showAdd, editingConnection]);
 
-  if (!showAdd) return null;
+  if (!isOpen) return null;
 
-  const provider = PROVIDERS.find((p) => p.id === providerId);
+  const provider = providerId ? providerMeta(providerId) : undefined;
+  const secretBlockedForTest = isEdit && form.secret_access_key.trim() === "";
+
+  function handleClose() {
+    if (isEdit) closeEditConnection();
+    else closeAdd();
+  }
 
   /** Advances to step 2 for the tapped provider. Re-tapping the SAME
    * provider (e.g. after using the step-2 back button) leaves the form
@@ -127,6 +163,7 @@ export function AddConnectionModal() {
     setForm((f) => ({ ...f, endpoint: meta.endpoint, region: meta.region }));
     setFieldErrors({});
     setTestStatus({ kind: "idle" });
+    testReqIdRef.current++;
     setStep(2);
   }
 
@@ -159,7 +196,13 @@ export function AddConnectionModal() {
 
   function validate(): boolean {
     const errors: FieldErrors = {};
-    for (const key of REQUIRED_FIELDS) {
+    // In edit mode the secret is optional -- a blank field means "keep the
+    // existing secret" (`update_connection`'s contract), so it's excluded
+    // from the required-fields check there.
+    const requiredFields = isEdit
+      ? REQUIRED_FIELDS.filter((key) => key !== "secret_access_key")
+      : REQUIRED_FIELDS;
+    for (const key of requiredFields) {
       if (!form[key].trim()) errors[key] = t("addConn.required");
     }
     setFieldErrors(errors);
@@ -167,6 +210,11 @@ export function AddConnectionModal() {
   }
 
   async function handleTest() {
+    // Testing with a blank secret in edit mode would send an empty
+    // credential to `test_connection` and fail for the wrong reason -- the
+    // Test button is disabled in that state (see `secretBlockedForTest`),
+    // this is just a defensive backstop.
+    if (secretBlockedForTest) return;
     if (!validate()) return;
     const reqId = ++testReqIdRef.current;
     setTestStatus({ kind: "pending" });
@@ -182,13 +230,20 @@ export function AddConnectionModal() {
 
   function handleSave() {
     if (!validate()) return;
-    addMutation.mutate(buildInput(), {
-      onSuccess: () => closeAdd(),
-    });
+    if (isEdit && editingConnection) {
+      updateMutation.mutate(
+        { id: editingConnection.id, input: buildInput() },
+        { onSuccess: () => closeEditConnection() },
+      );
+    } else {
+      addMutation.mutate(buildInput(), {
+        onSuccess: () => closeAdd(),
+      });
+    }
   }
 
   return (
-    <Modal onClose={closeAdd} className="w-[560px]">
+    <Modal onClose={handleClose} className="w-[560px]">
       {step === 1 && (
         <>
           <div className="flex items-start justify-between px-[22px] pt-[22px] pb-1">
@@ -200,7 +255,7 @@ export function AddConnectionModal() {
             </div>
             <button
               type="button"
-              onClick={closeAdd}
+              onClick={handleClose}
               className="flex size-[30px] cursor-pointer items-center justify-center rounded-lg text-muted-foreground hover:bg-hover hover:text-fg2"
             >
               <X className="size-[17px]" />
@@ -240,29 +295,37 @@ export function AddConnectionModal() {
       {step === 2 && provider && (
         <>
           <div className="flex items-center gap-[11px] px-[22px] pt-[18px] pb-1.5">
-            <button
-              type="button"
-              onClick={backToProviders}
-              className="flex size-[30px] shrink-0 cursor-pointer items-center justify-center rounded-lg border border-border bg-background text-fg2 hover:bg-hover"
-            >
-              <ChevronLeft className="size-4" />
-            </button>
+            {!isEdit && (
+              <button
+                type="button"
+                onClick={backToProviders}
+                className="flex size-[30px] shrink-0 cursor-pointer items-center justify-center rounded-lg border border-border bg-background text-fg2 hover:bg-hover"
+              >
+                <ChevronLeft className="size-4" />
+              </button>
+            )}
             <span
-              className="flex size-[34px] items-center justify-center rounded-[9px] shadow-[0_2px_5px_rgba(0,0,0,0.2)]"
+              className="flex size-[34px] shrink-0 items-center justify-center rounded-[9px] shadow-[0_2px_5px_rgba(0,0,0,0.2)]"
               style={{ background: provider.color }}
             >
               <provider.icon className="size-5 text-white" />
             </span>
-            <div className="flex-1">
-              <div className="text-[15px] font-bold">
-                {provider.nameKey ? t(provider.nameKey) : provider.name}
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[15px] font-bold">
+                {isEdit ? t("conn.editTitle") : provider.nameKey ? t(provider.nameKey) : provider.name}
               </div>
-              <div className="text-xs text-muted-foreground">{t("addConn.fillCreds")}</div>
+              <div className="truncate text-xs text-muted-foreground">
+                {isEdit
+                  ? provider.nameKey
+                    ? t(provider.nameKey)
+                    : provider.name
+                  : t("addConn.fillCreds")}
+              </div>
             </div>
             <button
               type="button"
-              onClick={closeAdd}
-              className="flex size-[30px] cursor-pointer items-center justify-center rounded-lg text-muted-foreground hover:bg-hover hover:text-fg2"
+              onClick={handleClose}
+              className="flex size-[30px] shrink-0 cursor-pointer items-center justify-center rounded-lg text-muted-foreground hover:bg-hover hover:text-fg2"
             >
               <X className="size-[17px]" />
             </button>
@@ -322,10 +385,15 @@ export function AddConnectionModal() {
                   type="password"
                   value={form.secret_access_key}
                   onChange={(e) => updateField("secret_access_key", e.target.value)}
-                  placeholder="••••••••••••••••••••"
+                  placeholder={isEdit ? t("addConn.secretKeep") : "••••••••••••••••••••"}
                   className="flex-1 border-none bg-transparent font-mono text-[13px] text-foreground outline-none"
                 />
               </div>
+              {isEdit && (
+                <p className="mt-1 text-[11.5px] text-muted-foreground">
+                  {t("addConn.secretKeep")}
+                </p>
+              )}
             </Field>
             <div className="mb-1.5">
               <label className="mb-1.5 block text-xs font-medium text-fg2">
@@ -344,7 +412,8 @@ export function AddConnectionModal() {
             <button
               type="button"
               onClick={handleTest}
-              disabled={testStatus.kind === "pending" || addMutation.isPending}
+              disabled={testStatus.kind === "pending" || mutation.isPending || secretBlockedForTest}
+              title={secretBlockedForTest ? t("addConn.testNeedsSecret") : undefined}
               className="inline-flex h-9 shrink-0 cursor-pointer items-center gap-[7px] rounded-[9px] border border-border bg-background px-3.5 text-[13px] font-medium text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
             >
               {testStatus.kind === "pending" ? (
@@ -355,6 +424,9 @@ export function AddConnectionModal() {
               {t("addConn.test")}
             </button>
             <div className="min-w-0 flex-1 text-[12.5px]">
+              {testStatus.kind === "idle" && secretBlockedForTest && (
+                <span className="text-muted-foreground">{t("addConn.testNeedsSecret")}</span>
+              )}
               {testStatus.kind === "pending" && (
                 <span className="text-muted-foreground">{t("addConn.testing")}</span>
               )}
@@ -378,7 +450,7 @@ export function AddConnectionModal() {
             </div>
             <button
               type="button"
-              onClick={closeAdd}
+              onClick={handleClose}
               className="h-9 shrink-0 cursor-pointer rounded-[9px] border border-border bg-background px-4 text-[13px] font-medium text-fg2 hover:bg-hover"
             >
               {t("addConn.cancel")}
@@ -386,16 +458,20 @@ export function AddConnectionModal() {
             <button
               type="button"
               onClick={handleSave}
-              disabled={addMutation.isPending || testStatus.kind === "pending"}
+              disabled={mutation.isPending || testStatus.kind === "pending"}
               className="inline-flex h-9 shrink-0 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-[18px] text-[13px] font-semibold text-primary-foreground hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-70"
             >
-              {addMutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
-              {addMutation.isPending ? t("addConn.saving") : t("addConn.save")}
+              {mutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
+              {mutation.isPending
+                ? t("addConn.saving")
+                : isEdit
+                  ? t("conn.saveEdit")
+                  : t("addConn.save")}
             </button>
           </div>
-          {addMutation.isError && (
+          {mutation.isError && (
             <div className="px-[22px] pb-4 text-[12.5px] text-destructive">
-              {errorText(addMutation.error)}
+              {errorText(mutation.error)}
             </div>
           )}
         </>
