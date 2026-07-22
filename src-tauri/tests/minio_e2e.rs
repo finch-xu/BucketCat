@@ -49,19 +49,25 @@
 //! Credentials are always the documented MinIO defaults
 //! (`minioadmin`/`minioadmin`) -- nothing here is a real secret.
 //!
-//! ## A known error-family mismatch
+//! ## A fixed error-family mismatch
 //!
-//! [`wrong_secret_surfaces_expected_error_family`] documents (rather than
-//! papers over) a real finding from running this suite against actual
-//! MinIO: a wrong secret key does **not** land in `AppError`'s `auth/*`
-//! family. It surfaces as `internal` (message `"unhandled error
+//! [`wrong_secret_surfaces_expected_error_family`] used to document (rather
+//! than paper over) a real finding from running this suite against actual
+//! MinIO: a wrong secret key did **not** land in `AppError`'s `auth/*`
+//! family. It surfaced as `internal` (message `"unhandled error
 //! (SignatureDoesNotMatch)"`) instead, because `aws-sdk-s3`'s generated
 //! `ListBuckets` error enum doesn't model `SignatureDoesNotMatch` as one of
-//! its own variants, so it collapses to `aws_sdk_s3::Error::Unhandled`
+//! its own variants, so it collapsed to `aws_sdk_s3::Error::Unhandled`
 //! before `crate::error`'s keyword sniff -- which doesn't recognize that
-//! phrase either -- ever gets a chance at an `auth/*` classification. See
-//! that test's doc comment for the full chain and why this is a real,
-//! reportable UX gap rather than a test-authoring artifact.
+//! phrase either -- ever got a chance at an `auth/*` classification.
+//!
+//! `provider::s3`'s `normalize_s3_error` now has a third tier for exactly
+//! this: when the existing modeled-variant/keyword-sniff conversion would
+//! otherwise land on `AppError::Internal`, it reads the raw S3 error code
+//! off the pre-erasure operation error (`SignatureDoesNotMatch`,
+//! `InvalidAccessKeyId`, `AccessDenied*`, `NoSuchBucket`, ...) via
+//! `ProvideErrorMetadata` and maps known codes directly. This test now
+//! asserts the fixed, correct behavior -- see its doc comment.
 
 use bucketcat_lib::provider::{from_connection, Provider};
 use bucketcat_lib::store::{Connection, SecureStore};
@@ -153,38 +159,33 @@ async fn create_list_delete_bucket_round_trip() {
 
 /// Wrong secret key against a real server.
 ///
-/// **Finding from running this against live MinIO (RELEASE.2025-09-07,
-/// `minio/minio:latest` at time of writing):** a wrong `SecretAccessKey`
-/// does **not** surface as `AppError`'s `auth/*` family, which is what the
-/// original task brief expected. The actual code observed is
-/// `internal`, with `params.message` equal to
-/// `"unhandled error (SignatureDoesNotMatch)"`.
+/// **Originally found running this against live MinIO (RELEASE.2025-09-07,
+/// `minio/minio:latest`):** a wrong `SecretAccessKey` did **not** surface
+/// as `AppError`'s `auth/*` family -- it surfaced as `internal`, with
+/// `params.message` equal to `"unhandled error (SignatureDoesNotMatch)"`.
 ///
-/// Why: MinIO returns a 403 whose S3 error code is `SignatureDoesNotMatch`.
-/// `aws-sdk-s3`'s generated per-operation error enum for `ListBuckets`
-/// doesn't model that error code as one of its own variants (unlike
-/// `NoSuchBucket`/`BucketAlreadyExists`/`AccessDenied`, which *are*
-/// modeled and explicitly matched in `crate::error`'s
-/// `From<aws_sdk_s3::Error>` impl), so the SDK collapses it into the
-/// catch-all `aws_sdk_s3::Error::Unhandled` variant even though a real,
-/// parseable response came back. That lands in `crate::error`'s wildcard
-/// `_` arm, whose keyword sniff over the rendered message (`"timed
-/// out"`/`"timeout"` => `Timeout`, `"dispatch failure"`/`"dns"`/
-/// `"connect"`/`"unreachable"`/`"tls"` => `Unreachable`) finds no match in
-/// `"unhandled error (SignatureDoesNotMatch)"`, so it falls through to
-/// `AppError::Internal`.
+/// Why that happened: MinIO returns a 403 whose S3 error code is
+/// `SignatureDoesNotMatch`. `aws-sdk-s3`'s generated per-operation error
+/// enum for `ListBuckets` doesn't model that error code as one of its own
+/// variants (unlike `NoSuchBucket`/`BucketAlreadyExists`/`AccessDenied`,
+/// which *are* modeled for operations that do model them, and are
+/// explicitly matched in `crate::error`'s `From<aws_sdk_s3::Error>` impl),
+/// so the SDK collapses it into the catch-all `aws_sdk_s3::Error::Unhandled`
+/// variant even though a real, parseable response came back. That used to
+/// land in `crate::error`'s wildcard `_` arm, whose keyword sniff over the
+/// rendered message doesn't recognize `"SignatureDoesNotMatch"`, so it fell
+/// through to `AppError::Internal`.
 ///
-/// This is a real, reportable gap, not a test-authoring quirk: a MinIO
-/// user who mistypes their secret key currently gets an `internal` /
-/// "something went wrong" message instead of the `auth/*` family that
-/// condition actually deserves. Fixing it -- e.g. adding a
-/// `SignatureDoesNotMatch`/`InvalidAccessKeyId` keyword to the sniff, or a
-/// dedicated match arm keyed on the S3 error code rather than the message
-/// text -- is follow-up work outside this task's scope; this test's job is
-/// to assert the code that *actually* surfaces today (per the task
-/// instruction to record a real mismatch rather than paper over it) so a
-/// future fix shows up here as an intentional, visible test change instead
-/// of a silent behavior drift.
+/// **Fixed:** `provider::s3::normalize_s3_error` now has a third tier,
+/// consulted only when the existing modeled-variant/keyword-sniff
+/// conversion would otherwise produce `AppError::Internal`: it reads the
+/// raw S3 error code directly off the pre-erasure operation error via
+/// `ProvideErrorMetadata` and maps known auth codes
+/// (`SignatureDoesNotMatch`, `InvalidAccessKeyId`, `AccessDenied`,
+/// `AccessDeniedException`) to `AppError::InvalidCredentials` /
+/// `AppError::AccessDenied`. This test asserts that fixed behavior against
+/// a live MinIO server, so a regression here means the real wire response
+/// (or the SDK's error modeling) changed, not just a unit assumption.
 #[tokio::test]
 #[ignore]
 async fn wrong_secret_surfaces_expected_error_family() {
@@ -198,19 +199,12 @@ async fn wrong_secret_surfaces_expected_error_family() {
 
     let code = err.code();
     assert_eq!(
-        code, "internal",
-        "expected the `internal` code this MinIO build's unmodeled \
-         `SignatureDoesNotMatch` response actually maps to today (see this test's doc \
-         comment for why, and the known auth/* UX gap this represents) -- got `{code}` \
-         instead, which means the error mapping chain (or MinIO's behavior) changed and \
-         this assertion should be revisited"
-    );
-    assert!(
-        err.params()
-            .get("message")
-            .is_some_and(|m| m.contains("SignatureDoesNotMatch")),
-        "expected the internal error's message to mention SignatureDoesNotMatch, got: {:?}",
-        err.params()
+        code, "auth/invalid-credentials",
+        "expected a wrong secret key against live MinIO to surface \
+         `auth/invalid-credentials` (recovered from the raw `SignatureDoesNotMatch` S3 \
+         error code -- see this test's doc comment) -- got `{code}` instead, which means \
+         the error mapping chain (or MinIO's behavior) changed and this assertion should \
+         be revisited"
     );
 }
 

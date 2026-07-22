@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use aws_sdk_s3::config::{Credentials, Region};
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::DateTimeFormat;
 
 use crate::error::{AppError, AppResult};
@@ -145,16 +145,87 @@ fn classify_sdk_error<E, R>(err: &SdkError<E, R>) -> Option<AppError> {
     }
 }
 
+/// Maps a raw S3 error *code* (as read off [`ProvideErrorMetadata::code`])
+/// to an [`AppError`], recovering detail for codes the SDK's generated
+/// per-operation error enum doesn't model as a distinct variant for some
+/// operations. `ListBucketsError` and `DeleteBucketError` model *nothing*
+/// but `Unhandled` (unlike e.g. `CreateBucketError`, which models
+/// `BucketAlreadyExists`/`BucketAlreadyOwnedByYou`) -- so a wrong secret
+/// key (`SignatureDoesNotMatch`) on `test_connection`/`list_buckets`, or a
+/// delete against a bucket that's already gone (`NoSuchBucket`) on
+/// `delete_bucket`, both erase to `aws_sdk_s3::Error::Unhandled` and, with
+/// nothing to recover them, to `AppError::Internal` -- even though the
+/// server's raw response said exactly what went wrong. Confirmed against
+/// live MinIO by `tests/minio_e2e.rs`'s `wrong_secret_...` test, which
+/// previously had to pin `internal` as a documented gap.
+///
+/// Only consulted from [`normalize_s3_error`] as the last fallback tier,
+/// *after* the existing modeled-variant/`aws_sdk_s3::Error` mapping has had
+/// its turn -- i.e. only for cases that would otherwise become
+/// `AppError::Internal`. A real modeled variant (already a non-`Internal`
+/// `AppError`) is never second-guessed by this.
+///
+/// Pure string -> variant mapping, deliberately factored out (rather than
+/// threaded through `SdkError`'s generics) so it's directly testable with
+/// plain string literals, no SDK error construction required.
+fn classify_error_code(code: &str, message: Option<&str>) -> Option<AppError> {
+    match code {
+        "SignatureDoesNotMatch" | "InvalidAccessKeyId" => Some(AppError::InvalidCredentials),
+        "AccessDenied" | "AccessDeniedException" => Some(AppError::AccessDenied),
+        "NoSuchBucket" => Some(AppError::BucketNotFound {
+            bucket: message.unwrap_or("unknown").to_string(),
+        }),
+        _ => None,
+    }
+}
+
 /// Normalizes any of the three bucket-operation `SdkError`s into an
-/// [`AppError`]: [`classify_sdk_error`] first, falling back to
-/// `aws_sdk_s3::Error`'s own `From` impl (see `crate::error`) -- which
-/// still owns modeled-service-error mapping and the last-resort keyword
-/// sniff for anything neither layer recognizes -- for everything else.
+/// [`AppError`] in three tiers:
+///
+/// 1. [`classify_sdk_error`] -- network-cause fidelity for anything that
+///    isn't a real, parsed service response.
+/// 2. `aws_sdk_s3::Error`'s own `From` impl (see `crate::error`) -- modeled
+///    per-operation variants (e.g. `BucketAlreadyExists`) first preference,
+///    its own keyword sniff second.
+/// 3. If (2) still lands on `AppError::Internal`, [`classify_error_code`]
+///    gets one more attempt using the *raw* error code/message read off
+///    the pre-erasure operation error (`SdkError::ServiceError`'s `E`, via
+///    [`ProvideErrorMetadata`], captured before `err` is consumed by the
+///    tier-2 conversion) -- this is what recovers e.g.
+///    `SignatureDoesNotMatch` on `ListBuckets`/`DeleteBucket`, whose
+///    generated error enums don't model anything but `Unhandled` and so
+///    never reach tier 2's modeled-variant arms.
 fn normalize_s3_error<E, R>(err: SdkError<E, R>) -> AppError
 where
+    E: ProvideErrorMetadata,
     aws_sdk_s3::Error: From<SdkError<E, R>>,
 {
-    classify_sdk_error(&err).unwrap_or_else(|| AppError::from(aws_sdk_s3::Error::from(err)))
+    if let Some(app_err) = classify_sdk_error(&err) {
+        return app_err;
+    }
+
+    // At this point `err` is `SdkError::ServiceError` (the only case
+    // `classify_sdk_error` returns `None` for, aside from a hypothetical
+    // future `#[non_exhaustive]` variant it also can't classify -- for
+    // which `code`/`message` below are simply `None`, a no-op for tier 3).
+    let (code, message) = match &err {
+        SdkError::ServiceError(ctx) => (
+            ctx.err().code().map(str::to_string),
+            ctx.err().message().map(str::to_string),
+        ),
+        _ => (None, None),
+    };
+
+    let mapped = AppError::from(aws_sdk_s3::Error::from(err));
+    if matches!(mapped, AppError::Internal { .. }) {
+        if let Some(app_err) = code
+            .as_deref()
+            .and_then(|c| classify_error_code(c, message.as_deref()))
+        {
+            return app_err;
+        }
+    }
+    mapped
 }
 
 #[async_trait]
@@ -207,6 +278,7 @@ impl Provider for S3Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_s3::error::ErrorMetadata;
 
     fn aws_connection() -> Connection {
         Connection {
@@ -418,5 +490,120 @@ mod tests {
         let app_err = normalize_s3_error(err);
 
         assert_eq!(app_err.code(), "network/timeout");
+    }
+
+    // --- classify_error_code (pure) -----------------------------------------
+
+    #[test]
+    fn classify_error_code_maps_signature_does_not_match_to_invalid_credentials() {
+        assert!(matches!(
+            classify_error_code("SignatureDoesNotMatch", None),
+            Some(AppError::InvalidCredentials)
+        ));
+    }
+
+    #[test]
+    fn classify_error_code_maps_invalid_access_key_id_to_invalid_credentials() {
+        assert!(matches!(
+            classify_error_code("InvalidAccessKeyId", None),
+            Some(AppError::InvalidCredentials)
+        ));
+    }
+
+    #[test]
+    fn classify_error_code_maps_access_denied_variants_to_access_denied() {
+        assert!(matches!(
+            classify_error_code("AccessDenied", None),
+            Some(AppError::AccessDenied)
+        ));
+        assert!(matches!(
+            classify_error_code("AccessDeniedException", None),
+            Some(AppError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn classify_error_code_maps_no_such_bucket_using_message_as_bucket_name() {
+        let app_err = classify_error_code("NoSuchBucket", Some("my-bucket"));
+        assert!(matches!(
+            app_err,
+            Some(AppError::BucketNotFound { ref bucket }) if bucket == "my-bucket"
+        ));
+    }
+
+    #[test]
+    fn classify_error_code_no_such_bucket_falls_back_to_unknown_without_message() {
+        let app_err = classify_error_code("NoSuchBucket", None);
+        assert!(matches!(
+            app_err,
+            Some(AppError::BucketNotFound { ref bucket }) if bucket == "unknown"
+        ));
+    }
+
+    #[test]
+    fn classify_error_code_returns_none_for_unrecognized_code() {
+        assert!(classify_error_code("SomeOtherCode", None).is_none());
+    }
+
+    // --- normalize_s3_error metadata-code fallback (pure, no network) -------
+
+    #[test]
+    fn normalize_recovers_invalid_credentials_from_unmodeled_list_buckets_error() {
+        // Reproduces the real MinIO wire response from a wrong secret key
+        // (see tests/minio_e2e.rs): a 403 with S3 error code
+        // `SignatureDoesNotMatch`, which `ListBucketsError` doesn't model
+        // as its own variant, so the SDK's own conversion alone would
+        // collapse this to `AppError::Internal`.
+        let meta = ErrorMetadata::builder()
+            .code("SignatureDoesNotMatch")
+            .message("The request signature we calculated does not match")
+            .build();
+        let unhandled = aws_sdk_s3::operation::list_buckets::ListBucketsError::generic(meta);
+        let sdk_err: SdkError<_, ()> = SdkError::service_error(unhandled, ());
+
+        let app_err = normalize_s3_error(sdk_err);
+
+        assert_eq!(app_err.code(), "auth/invalid-credentials");
+    }
+
+    #[test]
+    fn normalize_recovers_bucket_not_found_from_unmodeled_delete_bucket_error() {
+        let meta = ErrorMetadata::builder()
+            .code("NoSuchBucket")
+            .message("no-such-bucket")
+            .build();
+        let unhandled = aws_sdk_s3::operation::delete_bucket::DeleteBucketError::generic(meta);
+        let sdk_err: SdkError<_, ()> = SdkError::service_error(unhandled, ());
+
+        let app_err = normalize_s3_error(sdk_err);
+
+        assert_eq!(app_err.code(), "storage/bucket-not-found");
+    }
+
+    #[test]
+    fn normalize_leaves_modeled_variant_mapping_untouched() {
+        // A modeled variant (tier 2) must win outright -- the metadata-code
+        // fallback (tier 3) must never be consulted, let alone override it.
+        let inner = aws_sdk_s3::types::error::BucketAlreadyExists::builder()
+            .message("taken")
+            .build();
+        let create_err =
+            aws_sdk_s3::operation::create_bucket::CreateBucketError::BucketAlreadyExists(inner);
+        let sdk_err: SdkError<_, ()> = SdkError::service_error(create_err, ());
+
+        let app_err = normalize_s3_error(sdk_err);
+
+        assert_eq!(app_err.code(), "storage/bucket-exists");
+    }
+
+    #[test]
+    fn normalize_unrecognized_service_error_still_falls_through_to_internal() {
+        let meta = ErrorMetadata::builder().code("SomeUnknownCode").build();
+        let unhandled = aws_sdk_s3::operation::list_buckets::ListBucketsError::generic(meta);
+        let sdk_err: SdkError<_, ()> = SdkError::service_error(unhandled, ());
+
+        let app_err = normalize_s3_error(sdk_err);
+
+        assert_eq!(app_err.code(), "internal");
     }
 }
