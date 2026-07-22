@@ -40,5 +40,9 @@ export const PROVIDERS: ProviderMeta[] = [
  * falling back to the generic entry for ids this build doesn't recognize
  * (e.g. saved by a newer/older version). */
 export function providerMeta(id: string): ProviderMeta {
-  return PROVIDERS.find((p) => p.id === id) ?? PROVIDERS[PROVIDERS.length - 1];
+  return (
+    PROVIDERS.find((p) => p.id === id) ??
+    PROVIDERS.find((p) => p.id === "generic") ??
+    PROVIDERS[0]
+  );
 }

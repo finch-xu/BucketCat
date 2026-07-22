@@ -16,7 +16,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /** Provider ids the UI knows about today (see `PROVIDERS` in
- * `src/lib/mock-data.ts`). The Rust side stores `provider` as a plain
+ * `src/lib/providers.ts`). The Rust side stores `provider` as a plain
  * `String` with no enum constraint, so this is a *soft* union: known ids
  * get autocomplete/exhaustiveness, but `(string & {})` keeps arbitrary
  * strings (e.g. from an older/future build) assignable without widening

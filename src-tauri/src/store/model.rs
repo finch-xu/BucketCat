@@ -54,7 +54,11 @@ impl fmt::Debug for Connection {
 
 /// Frontend -> backend payload for creating a connection. Has no `id`;
 /// the backend generates one when persisting the new [`Connection`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// `Debug` is hand-written (not derived), mirroring [`Connection`]'s manual
+/// `impl`, so that logging a `ConnectionInput` can never print
+/// `secret_access_key` in the clear.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct ConnectionInput {
     pub provider: String,
     pub name: String,
@@ -63,6 +67,20 @@ pub struct ConnectionInput {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub default_bucket: Option<String>,
+}
+
+impl fmt::Debug for ConnectionInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionInput")
+            .field("provider", &self.provider)
+            .field("name", &self.name)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("default_bucket", &self.default_bucket)
+            .finish()
+    }
 }
 
 /// Backend -> frontend view of a [`Connection`].
@@ -114,6 +132,26 @@ mod tests {
         };
 
         let debugged = format!("{:?}", conn);
+
+        assert!(!debugged.contains("super-secret-value"));
+        assert!(debugged.contains("<redacted>"));
+        // Sanity: other fields still show up normally.
+        assert!(debugged.contains("AKIAEXAMPLE"));
+    }
+
+    #[test]
+    fn connection_input_debug_redacts_secret_access_key() {
+        let input = ConnectionInput {
+            provider: "aws".to_string(),
+            name: "test bucket".to_string(),
+            endpoint: "https://s3.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "super-secret-value".to_string(),
+            default_bucket: Some("my-bucket".to_string()),
+        };
+
+        let debugged = format!("{:?}", input);
 
         assert!(!debugged.contains("super-secret-value"));
         assert!(debugged.contains("<redacted>"));

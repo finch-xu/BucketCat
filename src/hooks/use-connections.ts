@@ -61,8 +61,9 @@ export function useUpdateConnection(): UseMutationResult<
   return useMutation({
     mutationFn: ({ id, input }: { id: string; input: ConnectionInput }) =>
       updateConnection(id, input),
-    onSuccess: () => {
+    onSuccess: (_data, { id }) => {
       queryClient.invalidateQueries({ queryKey: connectionsKey });
+      queryClient.invalidateQueries({ queryKey: bucketsKey(id) });
     },
   });
 }
@@ -71,8 +72,9 @@ export function useDeleteConnection(): UseMutationResult<void, AppError, string>
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteConnection(id),
-    onSuccess: () => {
+    onSuccess: (_data, id) => {
       queryClient.invalidateQueries({ queryKey: connectionsKey });
+      queryClient.removeQueries({ queryKey: bucketsKey(id) });
     },
   });
 }
