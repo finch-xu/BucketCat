@@ -106,4 +106,9 @@ describe("nameCollides", () => {
   it("treats an empty/blank candidate as non-colliding (isValidObjectName already rejects it)", () => {
     expect(nameCollides(entries, "   ")).toBe(false);
   });
+
+  it("is case-sensitive, matching S3 key semantics", () => {
+    expect(nameCollides([e("A.txt", false)], "a.txt")).toBe(false);
+    expect(nameCollides([e("a.txt", false)], "a.txt")).toBe(true);
+  });
 });

@@ -1,9 +1,8 @@
-import { useState, type FormEvent } from "react";
+import { useMemo, useState, type FormEvent } from "react";
 import { AlertTriangle, FolderPlus, Loader2, Pencil } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
-import { useBrowse } from "@/hooks/use-browse";
-import { useCreateFolder, useDeleteObjects, useRenameObject } from "@/hooks/use-objects";
+import { useCreateFolder, useDeleteObjects, useObjects, useRenameObject } from "@/hooks/use-objects";
 import { useErrorText } from "@/hooks/use-error-text";
 import { isValidObjectName, nameCollides, pathToPrefix, renameKey } from "@/lib/entries";
 import { useApp } from "@/store/app-store";
@@ -25,9 +24,20 @@ function NewFolderDialog() {
   const errorText = useErrorText();
   const { activeConn, activeBucket, path, showNewFolder, closeNewFolder } = useApp();
   const createMutation = useCreateFolder(activeConn, activeBucket);
-  // Same listing the browser renders for the current path -- used only for
-  // the best-effort client-side duplicate-name guard below.
-  const { entries } = useBrowse();
+  // Deliberately the *unfiltered* current-path listing, not `useBrowse`'s
+  // search-scoped one: if the guard used the search-scoped listing, an
+  // active search term could hide a same-named sibling from the check,
+  // letting a collision through unnoticed (the exact bug this guard exists
+  // to prevent). In the common case this is a cache hit -- the folder was
+  // already browsed unfiltered before a search or this dialog narrowed
+  // anything -- otherwise it's one extra list call, which is an acceptable
+  // cost for a destructive-action guard.
+  const pathPrefix = pathToPrefix(path);
+  const pathListingQuery = useObjects(activeConn, activeBucket, pathPrefix);
+  const pathEntries = useMemo(
+    () => (pathListingQuery.data?.pages ?? []).flatMap((p) => p.entries),
+    [pathListingQuery.data],
+  );
   const [name, setName] = useState("");
   const [touched, setTouched] = useState(false);
 
@@ -39,8 +49,9 @@ function NewFolderDialog() {
   // the backend, so a name collision here doesn't overwrite data the way a
   // colliding rename does -- but it would still silently produce two rows
   // with the same displayed name. Checked only against already-loaded
-  // page(s) of the current listing, not the server.
-  const collision = valid && nameCollides(entries, trimmed);
+  // page(s) of the unfiltered current-path listing, not the server (and not
+  // narrowed by whatever search text happens to be active elsewhere).
+  const collision = valid && nameCollides(pathEntries, trimmed);
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -109,11 +120,20 @@ function NewFolderDialog() {
 function RenameObjectDialog() {
   const { t } = useTranslation();
   const errorText = useErrorText();
-  const { activeConn, activeBucket, renameTarget, closeRename, clearSelection } = useApp();
+  const { activeConn, activeBucket, path, renameTarget, closeRename, clearSelection } = useApp();
   const renameMutation = useRenameObject(activeConn, activeBucket);
-  // Same listing the browser renders for the current path -- used only for
-  // the best-effort client-side duplicate-name guard below.
-  const { entries } = useBrowse();
+  // Deliberately the *unfiltered* current-path listing, not `useBrowse`'s
+  // search-scoped one -- see the matching comment in `NewFolderDialog`. This
+  // matters even more here: rename is copy-then-delete, so if an active
+  // search hid a same-named sibling from the check, this dialog would
+  // silently overwrite that sibling instead of just producing a confusing
+  // duplicate row.
+  const pathPrefix = pathToPrefix(path);
+  const pathListingQuery = useObjects(activeConn, activeBucket, pathPrefix);
+  const pathEntries = useMemo(
+    () => (pathListingQuery.data?.pages ?? []).flatMap((p) => p.entries),
+    [pathListingQuery.data],
+  );
   // Safe as the initial value because `ObjectDialogs` keys this component by
   // the target's key -- a different target mounts a fresh instance.
   const [name, setName] = useState(renameTarget?.name ?? "");
@@ -129,9 +149,10 @@ function RenameObjectDialog() {
   // original is deleted. Excludes the target's own current entry so
   // renaming it back to its unchanged name isn't flagged as a "collision"
   // -- that no-op case is already blocked above by `trimmed !== target.name`.
-  // Checked only against already-loaded page(s) of the current listing, not
-  // the server.
-  const collision = valid && nameCollides(entries, trimmed, target.key);
+  // Checked only against already-loaded page(s) of the unfiltered
+  // current-path listing, not the server (and not narrowed by whatever
+  // search text happens to be active elsewhere).
+  const collision = valid && nameCollides(pathEntries, trimmed, target.key);
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
