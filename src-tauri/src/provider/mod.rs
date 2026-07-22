@@ -107,6 +107,21 @@ pub trait Provider {
         token: Option<&str>,
         max_keys: i32,
     ) -> AppResult<ListPage>;
+
+    /// Deletes many objects in server-side batches of up to 1000, never
+    /// aborting the whole batch on per-key failures (design §7). The
+    /// returned [`BatchResult`] carries success count + per-key failures.
+    async fn delete_objects(&self, bucket: &str, keys: &[String]) -> AppResult<BatchResult>;
+
+    /// Renames one object as copy-then-delete (object stores have no
+    /// native rename). A missing `from_key` fails with
+    /// `storage/key-not-found`; the source is only deleted after the copy
+    /// succeeded.
+    async fn rename_object(&self, bucket: &str, from_key: &str, to_key: &str) -> AppResult<()>;
+
+    /// Creates a "folder": a zero-byte object at `prefix` normalized to
+    /// end with exactly one `/`.
+    async fn create_folder(&self, bucket: &str, prefix: &str) -> AppResult<()>;
 }
 
 #[cfg(test)]

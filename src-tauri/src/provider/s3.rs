@@ -9,10 +9,13 @@
 use async_trait::async_trait;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::primitives::DateTimeFormat;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 use crate::error::{AppError, AppResult};
-use crate::provider::{Bucket, ListPage, ObjectEntry, Provider};
+use crate::provider::{BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, Provider};
 use crate::store::Connection;
 
 /// Returns true only for real AWS endpoints (`*.amazonaws.com`, matched on
@@ -175,6 +178,9 @@ fn classify_error_code(code: &str, message: Option<&str>) -> Option<AppError> {
         "NoSuchBucket" => Some(AppError::BucketNotFound {
             bucket: message.unwrap_or("unknown").to_string(),
         }),
+        "NoSuchKey" => Some(AppError::KeyNotFound {
+            key: message.unwrap_or("unknown").to_string(),
+        }),
         _ => None,
     }
 }
@@ -231,6 +237,63 @@ fn to_list_page(
     ListPage {
         entries,
         next_token: output.next_continuation_token().map(str::to_string),
+    }
+}
+
+/// DeleteObjects accepts at most 1000 keys per request (S3 hard limit);
+/// larger batches are split client-side.
+const DELETE_BATCH_MAX: usize = 1000;
+
+/// Characters percent-encoded in an `x-amz-copy-source` value: everything
+/// except RFC 3986 unreserved characters and `/` (the bucket/key
+/// separator). The SDK does NOT encode this header itself, and unencoded
+/// spaces/`+`/non-ASCII (e.g. Chinese object names) break the request
+/// signature.
+const COPY_SOURCE_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
+
+/// `bucket/key` with the key percent-encoded for `x-amz-copy-source`.
+/// Pure, unit-tested below.
+pub(crate) fn encode_copy_source(bucket: &str, key: &str) -> String {
+    format!(
+        "{}/{}",
+        bucket,
+        utf8_percent_encode(key, COPY_SOURCE_ENCODE)
+    )
+}
+
+/// Normalizes a folder prefix to the zero-byte marker-object key
+/// `"<trimmed>/"`. Rejects empty/blank prefixes and empty inner segments
+/// (`a//b`) as `AppError::Internal` — the UI validates names before
+/// calling, so reaching here with one is an upstream bug, mirroring
+/// `from_connection`'s empty-endpoint rationale. Pure, unit-tested below.
+pub(crate) fn folder_marker_key(prefix: &str) -> AppResult<String> {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() || trimmed.split('/').any(|segment| segment.trim().is_empty()) {
+        return Err(AppError::Internal {
+            message: "folder prefix must be non-empty with no empty path segments".to_string(),
+        });
+    }
+    Ok(format!("{trimmed}/"))
+}
+
+/// Maps one per-key DeleteObjects error into a [`FailedKey`], reusing
+/// [`classify_error_code`] so the `code` is an `AppError`-style i18n code
+/// (`auth/access-denied`, `storage/key-not-found`, ...), falling back to
+/// `"internal"` for codes we don't model. Pure, unit-tested below.
+fn failed_key(err: &aws_sdk_s3::types::Error) -> FailedKey {
+    let code = err
+        .code()
+        .and_then(|c| classify_error_code(c, err.message()))
+        .map(|e| e.code().to_string())
+        .unwrap_or_else(|| "internal".to_string());
+    FailedKey {
+        key: err.key().unwrap_or_default().to_string(),
+        code,
     }
 }
 
@@ -350,6 +413,76 @@ impl Provider for S3Provider {
         }
         let output = request.send().await.map_err(normalize_s3_error)?;
         Ok(to_list_page(&output, prefix))
+    }
+
+    async fn delete_objects(&self, bucket: &str, keys: &[String]) -> AppResult<BatchResult> {
+        let mut succeeded: u32 = 0;
+        let mut failed: Vec<FailedKey> = Vec::new();
+        for chunk in keys.chunks(DELETE_BATCH_MAX) {
+            let identifiers = chunk
+                .iter()
+                .map(|key| ObjectIdentifier::builder().key(key).build())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AppError::Internal {
+                    message: format!("invalid delete key: {e}"),
+                })?;
+            let delete = Delete::builder()
+                .set_objects(Some(identifiers))
+                .quiet(true)
+                .build()
+                .map_err(|e| AppError::Internal {
+                    message: format!("failed to build delete request: {e}"),
+                })?;
+            let output = self
+                .client
+                .delete_objects()
+                .bucket(bucket)
+                .delete(delete)
+                .send()
+                .await
+                .map_err(normalize_s3_error)?;
+            let errors = output.errors();
+            succeeded += (chunk.len() - errors.len()) as u32;
+            failed.extend(errors.iter().map(failed_key));
+        }
+        Ok(BatchResult { succeeded, failed })
+    }
+
+    async fn rename_object(&self, bucket: &str, from_key: &str, to_key: &str) -> AppResult<()> {
+        if from_key.is_empty() || to_key.is_empty() || from_key == to_key {
+            return Err(AppError::Internal {
+                message: "rename requires distinct, non-empty source and target keys".to_string(),
+            });
+        }
+        self.client
+            .copy_object()
+            .bucket(bucket)
+            .copy_source(encode_copy_source(bucket, from_key))
+            .key(to_key)
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+        self.client
+            .delete_object()
+            .bucket(bucket)
+            .key(from_key)
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+        Ok(())
+    }
+
+    async fn create_folder(&self, bucket: &str, prefix: &str) -> AppResult<()> {
+        let key = folder_marker_key(prefix)?;
+        self.client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+        Ok(())
     }
 }
 
@@ -789,5 +922,102 @@ mod tests {
             .build();
         let page = to_list_page(&output, "");
         assert_eq!(page.entries[0].size, None);
+    }
+
+    // --- encode_copy_source (pure) ------------------------------------------
+
+    #[test]
+    fn encode_copy_source_plain_ascii_passes_through() {
+        assert_eq!(
+            encode_copy_source("bkt", "docs/readme.md"),
+            "bkt/docs/readme.md"
+        );
+    }
+
+    #[test]
+    fn encode_copy_source_encodes_spaces_and_plus() {
+        assert_eq!(
+            encode_copy_source("bkt", "my file+1.txt"),
+            "bkt/my%20file%2B1.txt"
+        );
+    }
+
+    #[test]
+    fn encode_copy_source_encodes_non_ascii() {
+        assert_eq!(
+            encode_copy_source("bkt", "照片/猫.jpg"),
+            "bkt/%E7%85%A7%E7%89%87/%E7%8C%AB.jpg"
+        );
+    }
+
+    #[test]
+    fn encode_copy_source_keeps_slashes_and_unreserved() {
+        assert_eq!(encode_copy_source("bkt", "a-b_c.d~e/f"), "bkt/a-b_c.d~e/f");
+    }
+
+    // --- folder_marker_key (pure) -------------------------------------------
+
+    #[test]
+    fn folder_marker_key_appends_slash() {
+        assert_eq!(folder_marker_key("docs/newdir").unwrap(), "docs/newdir/");
+    }
+
+    #[test]
+    fn folder_marker_key_normalizes_existing_slashes() {
+        assert_eq!(folder_marker_key("newdir/").unwrap(), "newdir/");
+        assert_eq!(folder_marker_key("/newdir").unwrap(), "newdir/");
+    }
+
+    #[test]
+    fn folder_marker_key_rejects_empty_and_blank() {
+        assert!(folder_marker_key("").is_err());
+        assert!(folder_marker_key("   ").is_err());
+        assert!(folder_marker_key("//").is_err());
+    }
+
+    #[test]
+    fn folder_marker_key_rejects_empty_inner_segment() {
+        assert!(folder_marker_key("a//b").is_err());
+    }
+
+    // --- failed_key mapping (pure) ------------------------------------------
+
+    fn s3_batch_error(key: &str, code: &str) -> aws_sdk_s3::types::Error {
+        aws_sdk_s3::types::Error::builder()
+            .key(key)
+            .code(code)
+            .message("detail")
+            .build()
+    }
+
+    #[test]
+    fn failed_key_maps_known_code_to_app_error_code() {
+        let f = failed_key(&s3_batch_error("locked.txt", "AccessDenied"));
+        assert_eq!(f.key, "locked.txt");
+        assert_eq!(f.code, "auth/access-denied");
+    }
+
+    #[test]
+    fn failed_key_falls_back_to_internal_for_unknown_code() {
+        let f = failed_key(&s3_batch_error("odd.txt", "SomeWeirdCode"));
+        assert_eq!(f.code, "internal");
+    }
+
+    #[test]
+    fn failed_key_tolerates_missing_key_and_code() {
+        let f = failed_key(&aws_sdk_s3::types::Error::builder().build());
+        assert_eq!(f.key, "");
+        assert_eq!(f.code, "internal");
+    }
+
+    // --- classify_error_code: NoSuchKey -------------------------------------
+
+    #[test]
+    fn classify_error_code_maps_no_such_key_to_key_not_found() {
+        let app_err = classify_error_code("NoSuchKey", Some("docs/gone.md"));
+        assert!(matches!(
+            app_err,
+            Some(AppError::KeyNotFound { ref key }) if key == "docs/gone.md"
+        ));
     }
 }

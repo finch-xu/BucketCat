@@ -634,6 +634,7 @@ dependencies = [
  "aws-sdk-s3",
  "hkdf",
  "machine-uid",
+ "percent-encoding",
  "rand",
  "serde",
  "serde_json",
