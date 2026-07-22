@@ -72,6 +72,100 @@
 use bucketcat_lib::provider::{from_connection, Provider};
 use bucketcat_lib::store::{Connection, SecureStore};
 
+// --- M3 object data-plane helpers ------------------------------------------
+
+/// A raw SDK client for test seeding only: M3 has no provider upload path
+/// yet (that's M4), so tests PUT their fixture objects directly. Mirrors
+/// `from_connection`'s MinIO configuration (path-style, static creds).
+fn raw_seed_client() -> aws_sdk_s3::Client {
+    let credentials =
+        aws_sdk_s3::config::Credentials::new("minioadmin", "minioadmin", None, None, "e2e-seed");
+    let config = aws_sdk_s3::Config::builder()
+        .behavior_version_latest()
+        .endpoint_url(endpoint())
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .credentials_provider(credentials)
+        .force_path_style(true)
+        .build();
+    aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Seeds one small text object.
+async fn put_text(client: &aws_sdk_s3::Client, bucket: &str, key: &str) {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"bucketcat-e2e",
+        ))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("seeding put_object {key} should succeed: {e}"));
+}
+
+/// Best-effort teardown: removes every object (non-delimiter raw listing,
+/// fine for test-sized buckets) then the bucket itself, so repeated runs
+/// never collide and the MinIO container stays clean.
+async fn drain_and_delete_bucket(
+    client: &aws_sdk_s3::Client,
+    provider: &bucketcat_lib::provider::S3Provider,
+    bucket: &str,
+) {
+    let listed = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("cleanup listing should succeed");
+    let keys: Vec<String> = listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    if !keys.is_empty() {
+        provider
+            .delete_objects(bucket, &keys)
+            .await
+            .expect("cleanup delete_objects should succeed");
+    }
+    provider
+        .delete_bucket(bucket)
+        .await
+        .expect("cleanup delete_bucket should succeed");
+}
+
+/// Collects every page of a listing under `prefix` with the given page
+/// size, asserting the pager terminates and no page exceeds `max_keys`.
+async fn list_all_pages(
+    provider: &bucketcat_lib::provider::S3Provider,
+    bucket: &str,
+    prefix: &str,
+    max_keys: i32,
+) -> (Vec<bucketcat_lib::provider::ObjectEntry>, usize) {
+    let mut all = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let page = provider
+            .list_objects(bucket, prefix, token.as_deref(), max_keys)
+            .await
+            .expect("list_objects page should succeed");
+        pages += 1;
+        assert!(
+            page.entries.len() <= max_keys as usize,
+            "a page must never exceed max_keys"
+        );
+        all.extend(page.entries);
+        match page.next_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+        assert!(pages < 50, "paging must terminate");
+    }
+    (all, pages)
+}
+
 /// The endpoint these tests target: `BUCKETCAT_E2E_ENDPOINT` if set (for a
 /// MinIO container published on non-default ports), otherwise
 /// `http://localhost:9000`.
@@ -301,4 +395,260 @@ fn secure_store_round_trip_survives_restart_with_real_derive_key() {
         !raw_lossy.contains("top-secret-value-two"),
         "the raw store file must not contain a secret access key in the clear"
     );
+}
+
+// --- M3: paged listing -------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn paged_listing_spans_multiple_pages_without_duplicates() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    for name in [
+        "page-a.txt",
+        "page-b.txt",
+        "page-c.txt",
+        "page-d.txt",
+        "page-e.txt",
+    ] {
+        put_text(&client, &bucket, name).await;
+    }
+    put_text(&client, &bucket, "docs/one.md").await;
+    put_text(&client, &bucket, "media/two.jpg").await;
+
+    // 7 root entries (5 files + 2 common prefixes) at 3 per page = 3 pages.
+    let (all, pages) = list_all_pages(&provider, &bucket, "", 3).await;
+
+    assert!(pages >= 3, "expected at least 3 pages, got {pages}");
+    let mut names: Vec<String> = all.iter().map(|e| e.name.clone()).collect();
+    let unique: std::collections::HashSet<&String> = names.iter().collect();
+    assert_eq!(
+        unique.len(),
+        names.len(),
+        "no duplicates across pages: {names:?}"
+    );
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "docs",
+            "media",
+            "page-a.txt",
+            "page-b.txt",
+            "page-c.txt",
+            "page-d.txt",
+            "page-e.txt"
+        ]
+    );
+
+    drain_and_delete_bucket(&client, &provider, &bucket).await;
+}
+
+// --- M3: folder semantics ----------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn delimiter_listing_surfaces_folders_and_children() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    put_text(&client, &bucket, "root.txt").await;
+    put_text(&client, &bucket, "docs/readme.md").await;
+    put_text(&client, &bucket, "docs/guide.md").await;
+    put_text(&client, &bucket, "docs/img/cat.png").await;
+
+    let (root, _) = list_all_pages(&provider, &bucket, "", 100).await;
+    let folders: Vec<&str> = root
+        .iter()
+        .filter(|e| e.is_prefix)
+        .map(|e| e.name.as_str())
+        .collect();
+    let files: Vec<&str> = root
+        .iter()
+        .filter(|e| !e.is_prefix)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(folders, vec!["docs"]);
+    assert_eq!(files, vec!["root.txt"]);
+    let docs_prefix = root.iter().find(|e| e.is_prefix).unwrap();
+    assert_eq!(docs_prefix.key, "docs/");
+    assert_eq!(docs_prefix.size, None);
+
+    let (docs, _) = list_all_pages(&provider, &bucket, "docs/", 100).await;
+    let mut docs_names: Vec<&str> = docs.iter().map(|e| e.name.as_str()).collect();
+    docs_names.sort();
+    assert_eq!(docs_names, vec!["guide.md", "img", "readme.md"]);
+    let guide = docs.iter().find(|e| e.name == "guide.md").unwrap();
+    assert_eq!(guide.key, "docs/guide.md");
+    assert!(guide.size.is_some(), "a real object must carry its size");
+    assert!(
+        guide.last_modified.is_some(),
+        "a real object must carry mtime"
+    );
+
+    // Prefix *search* semantics: "docs/gu" (path + typed text) matches only guide.md.
+    let (searched, _) = list_all_pages(&provider, &bucket, "docs/gu", 100).await;
+    let searched_names: Vec<&str> = searched.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(searched_names, vec!["guide.md"]);
+
+    drain_and_delete_bucket(&client, &provider, &bucket).await;
+}
+
+// --- M3: batch delete --------------------------------------------------------
+
+/// Batch delete of existing + nonexistent keys. S3/MinIO semantics: deleting
+/// a key that doesn't exist is itself a *success* (idempotent delete), so a
+/// nonexistent key does NOT produce a per-key failure — `succeeded` counts
+/// it. Real per-key failures (auth, object lock) can't be provoked from a
+/// default MinIO container without heavyweight setup, so the
+/// failure-mapping path is covered by the pure `failed_key` unit tests in
+/// `provider::s3` instead; this test pins the wire-level success/count
+/// behavior and that the batch as a whole never aborts.
+#[tokio::test]
+#[ignore]
+async fn batch_delete_counts_missing_keys_as_success_and_removes_the_rest() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    put_text(&client, &bucket, "keep.txt").await;
+    put_text(&client, &bucket, "del-1.txt").await;
+    put_text(&client, &bucket, "del-2.txt").await;
+
+    let result = provider
+        .delete_objects(
+            &bucket,
+            &[
+                "del-1.txt".to_string(),
+                "del-2.txt".to_string(),
+                "never-existed.txt".to_string(),
+            ],
+        )
+        .await
+        .expect("delete_objects should succeed as a batch");
+
+    assert_eq!(
+        result.succeeded, 3,
+        "idempotent delete counts the missing key"
+    );
+    assert!(
+        result.failed.is_empty(),
+        "no per-key failures expected: {:?}",
+        result.failed
+    );
+
+    let (rest, _) = list_all_pages(&provider, &bucket, "", 100).await;
+    let names: Vec<&str> = rest.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["keep.txt"]);
+
+    drain_and_delete_bucket(&client, &provider, &bucket).await;
+}
+
+// --- M3: rename --------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn rename_object_round_trip() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    put_text(&client, &bucket, "docs/old name.md").await;
+
+    provider
+        .rename_object(&bucket, "docs/old name.md", "docs/new-name.md")
+        .await
+        .expect("rename should succeed (copy source must be URL-encoded)");
+
+    let (docs, _) = list_all_pages(&provider, &bucket, "docs/", 100).await;
+    let names: Vec<&str> = docs.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["new-name.md"], "old key gone, new key present");
+
+    drain_and_delete_bucket(&client, &provider, &bucket).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn rename_missing_source_surfaces_key_not_found() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let err = provider
+        .rename_object(&bucket, "ghost.txt", "still-ghost.txt")
+        .await
+        .expect_err("renaming a nonexistent key must fail");
+
+    assert_eq!(
+        err.code(),
+        "storage/key-not-found",
+        "CopyObject's NoSuchKey must be recovered via the tier-3 error-code mapping"
+    );
+
+    drain_and_delete_bucket(&client, &provider, &bucket).await;
+}
+
+// --- M3: create folder -------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn created_folder_is_visible_as_prefix_and_empty_inside() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    provider
+        .create_folder(&bucket, "reports/2026")
+        .await
+        .expect("create_folder should succeed");
+
+    let (root, _) = list_all_pages(&provider, &bucket, "", 100).await;
+    let root_names: Vec<(&str, bool)> = root
+        .iter()
+        .map(|e| (e.name.as_str(), e.is_prefix))
+        .collect();
+    assert_eq!(root_names, vec![("reports", true)]);
+
+    let (reports, _) = list_all_pages(&provider, &bucket, "reports/", 100).await;
+    let report_names: Vec<(&str, bool)> = reports
+        .iter()
+        .map(|e| (e.name.as_str(), e.is_prefix))
+        .collect();
+    assert_eq!(report_names, vec![("2026", true)]);
+
+    // Inside the leaf folder: the marker object itself is filtered out.
+    let (leaf, _) = list_all_pages(&provider, &bucket, "reports/2026/", 100).await;
+    assert!(
+        leaf.is_empty(),
+        "the folder marker must not list as an entry: {leaf:?}"
+    );
+
+    drain_and_delete_bucket(&client, &provider, &bucket).await;
 }
