@@ -372,7 +372,8 @@ mod tests {
 
     // --- Finding 1: the stale-credential repopulation race ------------------
     //
-    // Two tests, deliberately different in kind:
+    // Two tests, deliberately different in kind -- and only one of them
+    // actually pins the race:
     //
     // - `stale_snapshot_insert_is_rejected_after_a_racing_mutate_completes`
     //   deterministically drives the *exact* sequence the finding describes
@@ -380,17 +381,29 @@ mod tests {
     //   `provider()` uses, with a snapshot and `epoch_before` captured
     //   before an intervening `mutate()` actually runs. This is the one that
     //   unconditionally proves the guard: it doesn't depend on scheduling
-    //   luck, so it can't fail to hit the window.
-    // - `concurrent_mutate_and_provider_lookup_never_leave_a_stale_client_cached`
-    //   is a best-effort companion that races the real public `provider()`
-    //   against `mutate()` on a genuine multi-threaded runtime, many rounds.
-    //   It exercises actual OS-thread interleaving rather than a
-    //   hand-constructed one, but -- being real scheduling -- it cannot
-    //   guarantee landing in a multi-microsecond window on any given run.
-    //   Its assertion still holds unconditionally for correct code (so it
-    //   won't flake on a pass), but a pass on its own doesn't prove the race
-    //   was ever actually exercised in that particular run. See the module
-    //   docs' "Lock discipline" section for the mechanism both tests target.
+    //   luck, so it can't fail to hit the window. It is the load-bearing
+    //   proof that the stale-credential race is fixed.
+    // - `concurrent_mutate_and_provider_lookup_stay_live_under_contention`
+    //   races the real public `provider()` against `mutate()` on a genuine
+    //   multi-threaded runtime, many rounds. It does **not** detect the
+    //   stale-credential race and cannot be made to: its only assertion
+    //   compares `Arc` pointer identity, but `from_connection`/`Arc::new`
+    //   allocates a brand-new `Arc` on every build regardless of whether the
+    //   `Connection` data behind it is stale or fresh, and `invalidate_all`'s
+    //   `clear()` unconditionally evicts the previous entry either way -- so
+    //   `!Arc::ptr_eq(previous, after)` holds whether or not the epoch guard
+    //   is present. This was verified empirically: with the guard disabled
+    //   (`if false && self.epoch.load(...) != epoch_before`), this test
+    //   passed on all of 5 runs x 200 rounds = 1000 racing attempts, while
+    //   `stale_snapshot_insert_is_rejected_after_a_racing_mutate_completes`
+    //   failed immediately, as it should. What this test actually covers:
+    //   hammering `provider()`'s bounded retry loop concurrently with a real
+    //   `mutate()` doesn't deadlock, doesn't livelock (exhaust
+    //   `MAX_PROVIDER_ATTEMPTS` and spin or panic), and doesn't panic on the
+    //   `last_built.expect(...)` path -- liveness and crash-freedom under
+    //   contention, not correctness of which credentials ended up cached.
+    //   See the module docs' "Lock discipline" section for the mechanism the
+    //   first test targets.
 
     #[tokio::test]
     async fn stale_snapshot_insert_is_rejected_after_a_racing_mutate_completes() {
@@ -453,8 +466,21 @@ mod tests {
         );
     }
 
+    // What this test does and does not prove (see the block comment above
+    // for the full account): it hammers `provider()`'s bounded retry loop
+    // with real concurrent `mutate()` calls across 200 rounds on a
+    // multi-threaded runtime, and its passing tells you the hub stayed
+    // *live* under that contention -- no deadlock, no livelock (retry
+    // exhaustion spinning), no panic on the `last_built.expect(...)` path.
+    // It cannot, and does not claim to, tell you whether the stale-snapshot
+    // race from Finding 1 was ever actually hit: its assertion is
+    // `Arc::ptr_eq` pointer-identity comparison, and every build allocates a
+    // fresh `Arc` regardless of whether the data behind it is stale or
+    // fresh, so the assertion holds identically with the epoch guard
+    // present or removed. `stale_snapshot_insert_is_rejected_after_a_racing_mutate_completes`
+    // is the test that pins that race; this one only pins liveness.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_mutate_and_provider_lookup_never_leave_a_stale_client_cached() {
+    async fn concurrent_mutate_and_provider_lookup_stay_live_under_contention() {
         let dir = tempfile::tempdir().unwrap();
         let hub = Arc::new(hub_with(&dir));
         hub.mutate(|list| {
@@ -490,16 +516,26 @@ mod tests {
 
             // By the time `join!` resolves, this round's `mutate()` has
             // unconditionally completed (its future only resolves after
-            // `invalidate_all` runs). So a fresh, quiescent lookup now must
-            // never still be serving whatever was cached before this round
-            // started -- if it did, the cache was repopulated with a client
-            // built before this round's credential change, which is exactly
-            // the bug Finding 1 describes.
+            // `invalidate_all` runs), and neither spawned task panicked
+            // (the `.unwrap()`s above would have propagated that) -- so
+            // reaching this line already demonstrates the round finished
+            // without a deadlock, a livelock, or a panic.
+            //
+            // The assertion below is a weak sanity check, not evidence
+            // about the race: `!Arc::ptr_eq(&previous, &after)` is true
+            // because `invalidate_all` unconditionally clears the cache
+            // every round and every build allocates a fresh `Arc`, so it
+            // holds regardless of whether the client `after` was built from
+            // stale or fresh credentials. It duplicates (under contention,
+            // rather than deterministically) what `mutate_invalidates_the_cache`
+            // already covers -- kept here only to confirm the cache is
+            // still actually being cleared each round rather than, say,
+            // silently no-op'ing under load.
             let after = hub.provider("c1").await.unwrap();
             assert!(
                 !Arc::ptr_eq(&previous, &after),
-                "round {round}: cache still serves a client cached before this \
-                 round's mutate() completed -- stale-credential repopulation"
+                "round {round}: cache still serves the exact same Arc allocation as \
+                 before this round's mutate() -- invalidate_all did not clear it"
             );
             previous = after;
         }
