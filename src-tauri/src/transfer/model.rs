@@ -36,8 +36,13 @@ impl TransferStatus {
         matches!(self, TransferStatus::Completed | TransferStatus::Canceled)
     }
 
-    /// True while the engine still owns work for this task -- used by
-    /// `clear_finished` to decide what may be dropped from the task list.
+    /// True while the engine still owns work for this task -- i.e. while a
+    /// driver task is live for it. Used by
+    /// [`crate::transfer::TransferEngine::cancel`] to tell apart the two
+    /// cases: an *active* task's driver will observe the cancellation and
+    /// apply the transition itself, whereas a `Paused` / `Failed` task has no
+    /// driver, so `cancel` must apply it. (`clear_finished` uses
+    /// [`TransferStatus::is_terminal`], not this.)
     pub fn is_active(self) -> bool {
         matches!(self, TransferStatus::Queued | TransferStatus::Running)
     }

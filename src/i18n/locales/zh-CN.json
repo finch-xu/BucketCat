@@ -153,6 +153,7 @@
     "storage/bucket-exists": "存储桶名称已被占用",
     "storage/key-not-found": "对象不存在，可能已被删除",
     "storage/connection-not-found": "连接不存在，可能已被删除",
+    "storage/task-not-found": "传输任务不存在",
     "local/store-io": "本地连接存储读写失败",
     "local/decrypt-failed": "本地连接存储解密失败",
     "local/key-derivation-failed": "本地密钥派生失败",

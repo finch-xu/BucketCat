@@ -35,6 +35,9 @@ pub enum AppError {
     #[error("connection not found: {id}")]
     ConnectionNotFound { id: String },
 
+    #[error("transfer task not found: {id}")]
+    TaskNotFound { id: String },
+
     #[error("local store io error: {message}")]
     StoreIo { message: String },
     #[error("failed to decrypt local store")]
@@ -61,6 +64,7 @@ impl AppError {
             AppError::BucketExists { .. } => "storage/bucket-exists",
             AppError::KeyNotFound { .. } => "storage/key-not-found",
             AppError::ConnectionNotFound { .. } => "storage/connection-not-found",
+            AppError::TaskNotFound { .. } => "storage/task-not-found",
             AppError::StoreIo { .. } => "local/store-io",
             AppError::DecryptFailed => "local/decrypt-failed",
             AppError::KeyDerivationFailed => "local/key-derivation-failed",
@@ -79,7 +83,7 @@ impl AppError {
             AppError::KeyNotFound { key } => {
                 p.insert("key".to_string(), key.clone());
             }
-            AppError::ConnectionNotFound { id } => {
+            AppError::ConnectionNotFound { id } | AppError::TaskNotFound { id } => {
                 p.insert("id".to_string(), id.clone());
             }
             AppError::StoreIo { message } | AppError::Internal { message } => {

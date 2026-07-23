@@ -153,6 +153,7 @@
     "storage/bucket-exists": "Bucket name already taken",
     "storage/key-not-found": "Object not found -- it may have been removed",
     "storage/connection-not-found": "Connection not found -- it may have been removed",
+    "storage/task-not-found": "Transfer task not found",
     "local/store-io": "Local connection store read/write failed",
     "local/decrypt-failed": "Failed to decrypt the local connection store",
     "local/key-derivation-failed": "Failed to derive the local store encryption key",

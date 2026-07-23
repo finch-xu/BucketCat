@@ -4,11 +4,16 @@
 //! [`crate::provider::ProviderHub`] -- never on Tauri's `State` -- so it can
 //! run entirely outside the IPC layer (design §3 principle 4).
 
+pub mod engine;
 pub mod model;
 pub mod part;
 pub mod progress;
 pub mod retry;
 
+pub use engine::{
+    EngineConfig, EnqueueSpec, MultipartState, ProgressHandle, StopKind, TaskContext, TaskControl,
+    TransferEngine, TransferRunner, TransferSink,
+};
 pub use model::{next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto};
 pub use part::{plan_upload, PartSpec, UploadPlan};
 pub use progress::{
