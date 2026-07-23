@@ -9,6 +9,7 @@ pub mod model;
 pub mod part;
 pub mod progress;
 pub mod retry;
+pub mod upload;
 
 pub use engine::{
     EngineConfig, EnqueueSpec, MultipartState, ProgressHandle, RunOutcome, StopKind, TaskContext,
@@ -20,3 +21,4 @@ pub use progress::{
     eta_secs, spawn_aggregator, ProgressMsg, ProgressPayload, ProgressSink, PROGRESS_INTERVAL,
 };
 pub use retry::{backoff_delay, is_retryable, MAX_RETRIES};
+pub use upload::UploadRunner;
