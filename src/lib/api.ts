@@ -217,3 +217,97 @@ export function createFolder(
 ): Promise<void> {
   return invokeCommand<void>("create_folder", { connectionId, bucket, prefix });
 }
+
+/** Where the bytes are going. Mirrors `Direction` in
+ * `src-tauri/src/transfer/model.rs`. */
+export type TransferDirection = "upload" | "download";
+
+/** Task lifecycle. Mirrors `TransferStatus`. `completed` and `canceled` are
+ * terminal -- the backend's state machine refuses to leave them. */
+export type TransferStatus =
+  | "queued"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+/** One transfer task. Mirrors `TransferTaskDto` field-for-field. `seq` is a
+ * creation counter used for newest-first ordering, not a timestamp. */
+export interface TransferTask {
+  id: string;
+  seq: number;
+  direction: TransferDirection;
+  connection_id: string;
+  bucket: string;
+  key: string;
+  local_path: string;
+  file_name: string;
+  total: number;
+  transferred: number;
+  status: TransferStatus;
+  /** An `errors.*` i18n key when `status === "failed"`, else null. */
+  error_code: string | null;
+}
+
+/** One task's throttled progress. Mirrors `ProgressPayload`. `speed` is bytes
+ * per second over the last 5 seconds; `eta_secs` is null when the transfer is
+ * stalled or already done. */
+export interface TransferProgress {
+  task_id: string;
+  transferred: number;
+  total: number;
+  speed: number;
+  eta_secs: number | null;
+}
+
+/** Tauri event carrying a *batch* of `TransferProgress`, at most one per
+ * 150ms. Batched so N concurrent tasks cost one IPC crossing, not N. */
+export const TRANSFER_PROGRESS_EVENT = "transfer://progress";
+
+/** Tauri event carrying a single `TransferTask` on every status change. Never
+ * throttled -- a dropped `completed` would strand the panel at 99%. */
+export const TRANSFER_STATE_EVENT = "transfer://state";
+
+/** Queues one upload per local path, into `prefix` of `bucket`. Paths the
+ * backend cannot use (gone, a directory) are skipped rather than failing the
+ * whole batch, so the result may be shorter than `paths`. */
+export function enqueueUploads(
+  connectionId: string,
+  bucket: string,
+  prefix: string,
+  paths: string[],
+): Promise<TransferTask[]> {
+  return invokeCommand<TransferTask[]>("enqueue_uploads", {
+    connectionId,
+    bucket,
+    prefix,
+    paths,
+  });
+}
+
+export function listTransfers(): Promise<TransferTask[]> {
+  return invokeCommand<TransferTask[]>("list_transfers");
+}
+
+export function pauseTransfer(taskId: string): Promise<void> {
+  return invokeCommand<void>("pause_transfer", { taskId });
+}
+
+export function resumeTransfer(taskId: string): Promise<void> {
+  return invokeCommand<void>("resume_transfer", { taskId });
+}
+
+export function cancelTransfer(taskId: string): Promise<void> {
+  return invokeCommand<void>("cancel_transfer", { taskId });
+}
+
+export function retryTransfer(taskId: string): Promise<void> {
+  return invokeCommand<void>("retry_transfer", { taskId });
+}
+
+/** Drops completed and canceled tasks. Paused/failed ones stay -- they are
+ * still resumable/retriable. */
+export function clearFinishedTransfers(): Promise<void> {
+  return invokeCommand<void>("clear_finished_transfers");
+}
