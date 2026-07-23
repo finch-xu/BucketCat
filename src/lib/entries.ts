@@ -107,6 +107,44 @@ export function nameCollides(entries: ObjectEntry[], name: string, excludeKey?: 
   return entries.some((entry) => entry.key !== excludeKey && entry.name === trimmed);
 }
 
+/** The display/key name an upload of `fileName` will land under: its last
+ * path segment (split on BOTH separators, so a Windows-style path is handled
+ * on any host), with leading/trailing whitespace trimmed.
+ *
+ * The single definition of that rule — `uploadKey` builds on it and
+ * `useStartUploads` uses it for the collision check, so the name that is
+ * *checked* and the name that is *written* can never drift apart.
+ *
+ * WHY TRIM (deliberate, load-bearing — the backend's `upload_key` in
+ * `src-tauri/src/commands/transfer.rs` must match):
+ *  - `nameCollides` trims its candidate before comparing against a listing's
+ *    display names. Trimming here keeps the guard and the target key derived
+ *    from exactly the same string. Dropping the trim would open a real
+ *    data-loss hole rather than a cosmetic one: a local file named `"a.txt "`
+ *    would be checked as `"a.txt"` (nameCollides trims) but written to
+ *    `"a.txt "` — so an existing remote object literally named `"a.txt "`
+ *    would be reported as no-collision and then silently destroyed by the
+ *    `PutObject`, while an existing `"a.txt"` would raise a phantom conflict
+ *    prompt for a key nothing was going to touch.
+ *  - Leading/trailing whitespace in an S3 key is invisible in every listing
+ *    UI and awkward in URLs/signatures; normalizing at the boundary is the
+ *    conservative choice.
+ *  - The cost is bounded and visible: a local `"a.txt "` uploads as
+ *    `"a.txt"`, and if that name is taken the conflict dialog shows the full
+ *    target key before anything is overwritten.
+ *
+ * Trim semantics are JS `String.prototype.trim()`. For an exact port, that is
+ * Unicode `White_Space` minus U+0085 (NEL) plus U+FEFF (ZWNBSP) — in Rust,
+ * `trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c ==
+ * '\u{feff}')`, NOT the bare `str::trim()` (which trims NEL and keeps
+ * U+FEFF).
+ *
+ * Returns `""` when nothing survives (`""`, `"   "`, `"docs/"`): there is no
+ * valid upload target for such an input — see `uploadKey`. */
+export function uploadBaseName(fileName: string): string {
+  return (fileName.split(/[\\/]/).pop() ?? fileName).trim();
+}
+
 /** Remote key a local file will land on when uploaded into `prefix`.
  *
  * The backend's `upload_key` (in `src-tauri/src/commands/transfer.rs`) is the
@@ -116,10 +154,53 @@ export function nameCollides(entries: ObjectEntry[], name: string, excludeKey?: 
  * a `PutObject` onto an existing key silently replaces it — so the answer has
  * to be known client-side, in advance.
  *
- * Only the last path segment of `fileName` is used, so a value carrying
- * separators cannot redirect the upload out of the browsed prefix. */
+ * Only the last path segment of `fileName` is used (see `uploadBaseName`,
+ * which also documents the trim), so a value carrying separators cannot
+ * redirect the upload out of the browsed prefix.
+ *
+ * An empty basename has no valid target and yields `""` — never `prefix`
+ * itself. Returning `prefix` would name the browsed folder's own marker
+ * object (`"docs/"`), i.e. a key a `PutObject` could overwrite, which is the
+ * one thing this function exists to prevent. Callers must treat `""` as "not
+ * uploadable" rather than as a key. */
 export function uploadKey(prefix: string, fileName: string): string {
-  const base = (fileName.split(/[\\/]/).pop() ?? fileName).trim();
+  const base = uploadBaseName(fileName);
+  if (base.length === 0) return "";
   if (!prefix) return base;
   return prefix.endsWith("/") ? `${prefix}${base}` : `${prefix}/${base}`;
+}
+
+/** Just enough of `useObjects`'s infinite-query data for a collision guard.
+ * Structural on purpose, so this module stays free of a react-query import
+ * and stays unit-testable without one. */
+export interface ListingPages {
+  pages: { entries: ObjectEntry[] }[];
+}
+
+/** What a collision guard is allowed to conclude from a `useObjects` query.
+ *
+ * `ready` is the ONLY thing a destructive action may gate on, and `entries`
+ * is the only listing it may check against — both are empty/false together,
+ * so a not-yet-trustworthy listing can neither wave an overwrite through nor
+ * invent a phantom collision.
+ *
+ * Both conditions matter, and each has already been the subject of a
+ * silent-data-loss bug in this project:
+ *  - `data === undefined`: the listing has never resolved, so `entries` is
+ *    `[]` and every name looks free — indistinguishable from an actually
+ *    empty folder. Fail CLOSED. (Deliberately not `isFetching`: a background
+ *    refetch of already-usable data must not re-block a guard that is
+ *    already trustworthy.)
+ *  - `isPlaceholderData`: `useObjects` sets `placeholderData:
+ *    keepPreviousData`, so during ANY navigation (folder → folder, or bucket
+ *    → bucket) `data` is defined but belongs to the PREVIOUS location. A
+ *    guard that only checked `data !== undefined` would happily clear an
+ *    upload into `photos/` against `docs/`'s entries — and would report a
+ *    phantom conflict in the other direction. */
+export function listingGuard(
+  data: ListingPages | undefined,
+  isPlaceholderData: boolean,
+): { ready: boolean; entries: ObjectEntry[] } {
+  if (data === undefined || isPlaceholderData) return { ready: false, entries: [] };
+  return { ready: true, entries: data.pages.flatMap((page) => page.entries) };
 }

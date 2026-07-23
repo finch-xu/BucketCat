@@ -32,7 +32,7 @@ export function Toolbar() {
     openNewFolder,
   } = useApp();
   const queryClient = useQueryClient();
-  const { startUploads, guardReady, dialog } = useStartUploads();
+  const { startUploads, guardReady, reportError, dialog } = useStartUploads();
 
   const noBucket = activeBucket === "";
   const crumbs = [activeBucket, ...path];
@@ -147,7 +147,12 @@ export function Toolbar() {
         // legible instead of just inert.
         disabled={noBucket || !guardReady}
         title={!noBucket && !guardReady ? t("objects.checkingNames") : undefined}
-        onClick={() => void handleUpload()}
+        // `.catch` is not optional: `open()` is a plugin IPC call and can
+        // reject (an unregistered dialog plugin rejects every invocation).
+        // Unhandled, that is an console-only rejection and a button that
+        // looks like it did nothing -- `reportError` turns it into a visible
+        // message through the same dialog the upload flow already renders.
+        onClick={() => void handleUpload().catch(reportError)}
         className="inline-flex h-8 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground shadow-[0_2px_6px_-1px_var(--primary-soft)] hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
       >
         {!noBucket && !guardReady ? (

@@ -4,7 +4,14 @@ import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
 import { useCreateFolder, useDeleteObjects, useObjects, useRenameObject } from "@/hooks/use-objects";
 import { useErrorText } from "@/hooks/use-error-text";
-import { isValidObjectName, nameCollides, parentPrefix, pathToPrefix, renameKey } from "@/lib/entries";
+import {
+  isValidObjectName,
+  listingGuard,
+  nameCollides,
+  parentPrefix,
+  pathToPrefix,
+  renameKey,
+} from "@/lib/entries";
 import { useApp } from "@/store/app-store";
 
 const INPUT_CLASS =
@@ -34,19 +41,18 @@ function NewFolderDialog() {
   // cost for a destructive-action guard.
   const pathPrefix = pathToPrefix(path);
   const pathListingQuery = useObjects(activeConn, activeBucket, pathPrefix);
-  const pathEntries = useMemo(
-    () => (pathListingQuery.data?.pages ?? []).flatMap((p) => p.entries),
-    [pathListingQuery.data],
+  // Fail CLOSED on "never resolved" AND on "still showing the previous
+  // location's placeholder" -- `listingGuard` is the single definition of
+  // both conditions and of the entries a guard may check against. Blocking
+  // submission is reachable in practice on both counts: the New Folder
+  // button is enabled the instant a bucket is selected (before any listing
+  // has loaded), and `useObjects`'s `keepPreviousData` keeps the previous
+  // folder's rows in `data` across every navigation.
+  const guard = useMemo(
+    () => listingGuard(pathListingQuery.data, pathListingQuery.isPlaceholderData),
+    [pathListingQuery.data, pathListingQuery.isPlaceholderData],
   );
-  // Fail CLOSED, not open: until this listing has resolved at least once,
-  // `pathEntries` is `[]` and `nameCollides` would trivially report "no
-  // collision" -- indistinguishable from an actually-empty folder. That's
-  // reachable in practice (the New Folder button is enabled the instant a
-  // bucket is selected, before any listing has loaded) so submission is
-  // blocked, not just left to an optimistic "probably fine". Deliberately
-  // `data !== undefined`, not `!isFetching`: a background refetch of
-  // already-loaded data must not re-block a guard that's already usable.
-  const guardReady = pathListingQuery.data !== undefined;
+  const { ready: guardReady, entries: pathEntries } = guard;
   const [name, setName] = useState("");
   const [touched, setTouched] = useState(false);
 
@@ -177,16 +183,19 @@ function RenameObjectDialog() {
   // `guardReady` below still fails closed exactly as before until that
   // target's own parent-prefix listing has loaded.
   const pathListingQuery = useObjects(renameTarget ? activeConn : "", activeBucket, guardPrefix);
-  const pathEntries = useMemo(
-    () => (pathListingQuery.data?.pages ?? []).flatMap((p) => p.entries),
-    [pathListingQuery.data],
+  // Fail CLOSED -- see the matching comment in `NewFolderDialog` and
+  // `listingGuard` itself. Both halves are reachable here: navigate into a
+  // large folder, search fast, and rename before the unfiltered first page
+  // has resolved (never-loaded); or open rename right after switching
+  // folders, while `keepPreviousData` still serves the previous prefix's
+  // rows (placeholder). Rename is copy-then-delete, so a guard checking the
+  // wrong folder's listing destroys the collision target just as thoroughly
+  // as an upload would.
+  const guard = useMemo(
+    () => listingGuard(pathListingQuery.data, pathListingQuery.isPlaceholderData),
+    [pathListingQuery.data, pathListingQuery.isPlaceholderData],
   );
-  // Fail CLOSED, not open -- see the matching comment in `NewFolderDialog`.
-  // Reachable here too: navigate into a large folder, search fast, and
-  // rename before the unfiltered first page has resolved. `data !==
-  // undefined` (not `isFetching`) so an already-usable, merely-refetching
-  // guard doesn't needlessly re-block submission.
-  const guardReady = pathListingQuery.data !== undefined;
+  const { ready: guardReady, entries: pathEntries } = guard;
   // Safe as the initial value because `ObjectDialogs` keys this component by
   // the target's key -- a different target mounts a fresh instance.
   const [name, setName] = useState(renameTarget?.name ?? "");

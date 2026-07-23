@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from "react";
 import {
   AlertTriangle,
   FolderOpen,
@@ -10,7 +18,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import { cn } from "@/lib/utils";
 import type { ObjectEntry } from "@/lib/api";
 import { fileMeta } from "@/lib/file-meta";
@@ -308,6 +316,45 @@ function GridView({
   );
 }
 
+/**
+ * Subscribes to the webview's drag-drop stream and returns an unsubscribe
+ * function that is safe to call at any point -- including while the
+ * registration is still in flight.
+ *
+ * That cancellation flag is the whole point (same discipline as
+ * `useTransferEvents`, which is where the pattern comes from). Registration
+ * is an async IPC round trip, so an effect torn down before it resolves used
+ * to leave `unlisten` undefined: cleanup no-oped and the listener registered
+ * a moment later lived forever. `<React.StrictMode>` (see `src/main.tsx`)
+ * double-invokes effects in dev -- setup, cleanup, setup -- so every dev
+ * session reliably ended up with two live handlers and one drop uploaded
+ * every file twice. Any leaked handler also keeps a stale `prefix` closure,
+ * so the duplicate lands in whatever folder was browsed when it registered.
+ *
+ * Exported so the leak can be regression-tested directly; `FileBrowser` is
+ * its only production caller.
+ */
+export function watchDragDrop(onEvent: (payload: DragDropEvent) => void): () => void {
+  let cancelled = false;
+  let unlisten: (() => void) | undefined;
+
+  void (async () => {
+    const off = await getCurrentWebview().onDragDropEvent((event) => onEvent(event.payload));
+    // Torn down while the round trip was in flight -- undo the registration
+    // immediately instead of leaking it past cleanup.
+    if (cancelled) {
+      off();
+      return;
+    }
+    unlisten = off;
+  })();
+
+  return () => {
+    cancelled = true;
+    unlisten?.();
+  };
+}
+
 export function FileBrowser() {
   const { t } = useTranslation();
   const errorText = useErrorText();
@@ -316,22 +363,30 @@ export function FileBrowser() {
   const { startUploads, guardReady, dialog } = useStartUploads();
   const [dragging, setDragging] = useState(false);
 
+  // `useCallback` so this effect's dependency actually holds still.
+  // `FileBrowser` re-renders on every `useApp()` change (selection, path,
+  // view, search) and every query transition; with an unstable handler the
+  // listener was torn down and re-registered -- an async IPC round trip --
+  // on each of those, and each re-registration racing a cleanup was another
+  // chance to leak a handler.
+  const onDragDrop = useCallback(
+    (payload: DragDropEvent) => {
+      // `enter` fires before the first `over`. Handling only `over` meant
+      // the drop affordance appeared one event late, and (on a fast drag
+      // straight to a drop) sometimes not at all.
+      if (payload.type === "enter" || payload.type === "over") setDragging(true);
+      else if (payload.type === "drop") {
+        setDragging(false);
+        if (activeBucket) startUploads(payload.paths);
+      } else setDragging(false);
+    },
+    [activeBucket, startUploads],
+  );
+
   // Tauri's own drag-drop event, not HTML5 dragover/drop: a `File` handed to
   // the WebView by an HTML5 drop carries no filesystem path, and the Rust
   // side needs a real path to stream the upload from.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    void (async () => {
-      unlisten = await getCurrentWebview().onDragDropEvent((event) => {
-        if (event.payload.type === "over") setDragging(true);
-        else if (event.payload.type === "drop") {
-          setDragging(false);
-          if (activeBucket) startUploads(event.payload.paths);
-        } else setDragging(false);
-      });
-    })();
-    return () => unlisten?.();
-  }, [activeBucket, startUploads]);
+  useEffect(() => watchDragDrop(onDragDrop), [onDragDrop]);
 
   // Computed once here and passed down instead of recomputed identically in
   // both ListView and GridView.

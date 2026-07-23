@@ -3,11 +3,13 @@ import {
   isValidObjectName,
   keyToPath,
   listPrefix,
+  listingGuard,
   nameCollides,
   parentPrefix,
   pathToPrefix,
   renameKey,
   sortEntries,
+  uploadBaseName,
   uploadKey,
 } from "./entries";
 import type { ObjectEntry } from "./api";
@@ -182,5 +184,87 @@ describe("uploadKey", () => {
     expect(uploadKey("docs/", "../secrets/a.txt")).toBe("docs/a.txt");
     expect(uploadKey("docs/", "sub/a.txt")).toBe("docs/a.txt");
     expect(uploadKey("docs/", "sub\\a.txt")).toBe("docs/a.txt");
+  });
+
+  // Pinned deliberately, not incidentally: the backend's `upload_key` is
+  // written to match, and the collision guard checks the *trimmed* name via
+  // `nameCollides`. See `uploadBaseName`'s doc comment for the full
+  // rationale -- dropping this trim silently destroys a remote object whose
+  // name really does carry trailing whitespace.
+  it("trims whitespace around the basename", () => {
+    expect(uploadKey("docs/", " a.txt ")).toBe("docs/a.txt");
+    expect(uploadKey("", "\ta.txt\n")).toBe("a.txt");
+    expect(uploadKey("docs/", "sub/ a.txt ")).toBe("docs/a.txt");
+  });
+
+  it("keeps whitespace that is INSIDE the name", () => {
+    expect(uploadKey("docs/", "my file.txt")).toBe("docs/my file.txt");
+  });
+
+  // Never `prefix` itself: that is the browsed folder's own marker key, and
+  // handing it back as an upload target is exactly the silent overwrite this
+  // module exists to prevent.
+  it("has no target for an empty basename", () => {
+    expect(uploadKey("docs/", "")).toBe("");
+    expect(uploadKey("docs/", "   ")).toBe("");
+    expect(uploadKey("docs/", "sub/")).toBe("");
+    expect(uploadKey("", "")).toBe("");
+  });
+});
+
+describe("uploadBaseName", () => {
+  it("keeps only the final path segment, on either separator", () => {
+    expect(uploadBaseName("a.txt")).toBe("a.txt");
+    expect(uploadBaseName("/Users/me/docs/a.txt")).toBe("a.txt");
+    expect(uploadBaseName("C:\\Users\\me\\a.txt")).toBe("a.txt");
+    expect(uploadBaseName("../secrets/a.txt")).toBe("a.txt");
+  });
+
+  it("trims leading/trailing whitespace, matching nameCollides' candidate", () => {
+    expect(uploadBaseName(" a.txt ")).toBe("a.txt");
+    expect(uploadBaseName("/tmp/ a.txt\t")).toBe("a.txt");
+    expect(nameCollides([e("a.txt", false)], uploadBaseName("/tmp/ a.txt "))).toBe(true);
+  });
+
+  it("returns empty for a name that is only whitespace or a bare directory path", () => {
+    expect(uploadBaseName("")).toBe("");
+    expect(uploadBaseName("   ")).toBe("");
+    expect(uploadBaseName("/tmp/dir/")).toBe("");
+  });
+});
+
+describe("listingGuard", () => {
+  const page = (...names: string[]) => ({ entries: names.map((n) => e(n, false)) });
+
+  it("is ready and flattens every loaded page once real data has resolved", () => {
+    const guard = listingGuard({ pages: [page("a.txt"), page("b.txt")] }, false);
+    expect(guard.ready).toBe(true);
+    expect(guard.entries.map((x) => x.name)).toEqual(["a.txt", "b.txt"]);
+  });
+
+  it("fails closed while the listing has never resolved", () => {
+    const guard = listingGuard(undefined, false);
+    expect(guard.ready).toBe(false);
+    expect(guard.entries).toEqual([]);
+  });
+
+  // The C1 regression: `keepPreviousData` leaves `data` defined but holding
+  // the PREVIOUS location's listing during every folder/bucket navigation. A
+  // guard that only checked `data !== undefined` would clear an upload into
+  // `photos/` against `docs/`'s entries.
+  it("fails closed while data is the previous location's placeholder", () => {
+    const guard = listingGuard({ pages: [page("hero.png")] }, true);
+    expect(guard.ready).toBe(false);
+    expect(guard.entries).toEqual([]);
+  });
+
+  it("cannot report a phantom collision from a stale listing", () => {
+    const stale = listingGuard({ pages: [page("hero.png")] }, true);
+    expect(nameCollides(stale.entries, "hero.png")).toBe(false);
+  });
+
+  it("still reports a real collision once the listing is trustworthy", () => {
+    const fresh = listingGuard({ pages: [page("hero.png")] }, false);
+    expect(nameCollides(fresh.entries, "hero.png")).toBe(true);
   });
 });
