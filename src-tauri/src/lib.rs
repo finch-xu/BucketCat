@@ -3,6 +3,7 @@ pub mod error;
 pub mod logging;
 pub mod provider;
 pub mod store;
+pub mod transfer;
 
 use commands::{
     add_connection, create_folder, delete_connection, delete_objects, list_buckets,
