@@ -6,8 +6,12 @@
 
 pub mod model;
 pub mod part;
+pub mod progress;
 pub mod retry;
 
 pub use model::{next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto};
 pub use part::{plan_upload, PartSpec, UploadPlan};
+pub use progress::{
+    eta_secs, spawn_aggregator, ProgressMsg, ProgressPayload, ProgressSink, PROGRESS_INTERVAL,
+};
 pub use retry::{backoff_delay, is_retryable, MAX_RETRIES};
