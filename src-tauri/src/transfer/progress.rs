@@ -41,6 +41,12 @@ impl SpeedWindow {
     /// `now`, not the full 5s: right after a transfer starts there is only
     /// half a second of history, and dividing by 5 would under-report the
     /// speed by 10x for the first few seconds.
+    ///
+    /// The trim below drops samples strictly older than the cutoff, so a
+    /// sample landing exactly on the `SPEED_WINDOW` boundary is retained for
+    /// one extra round. That is deliberate, not an off-by-one: an inclusive
+    /// boundary keeps the estimate marginally smoother and can never cause a
+    /// divide-by-zero.
     pub fn speed(&mut self, now: Instant) -> f64 {
         let cutoff = now.checked_sub(SPEED_WINDOW);
         if let Some(cutoff) = cutoff {
@@ -65,8 +71,19 @@ impl SpeedWindow {
 /// stalled transfer (speed 0) would divide by zero, and an already-complete
 /// one has nothing to wait for. Rounded up so a nearly-finished transfer
 /// shows "1s" rather than "0s" while still running.
+///
+/// The `speed.is_nan()` check is deliberate and not redundant: IEEE-754
+/// makes every ordered comparison against NaN `false`, so a bare
+/// `speed <= 0.0` guard would let a NaN speed slip through and produce a
+/// nonsensical `Some(0)`. (Clippy's `neg_cmp_op_on_partial_ord` lint also
+/// rejects the equivalent `!(speed > 0.0)` form, so the explicit `is_nan`
+/// check is both the clearer and the lint-clean spelling.)
+///
+/// The final `as u64` cast is a saturating conversion (Rust's `f64 as u64`
+/// semantics, not UB), so an absurdly small speed yields `u64::MAX` rather
+/// than wrapping or panicking -- no redundant range check is needed here.
 pub fn eta_secs(total: u64, transferred: u64, speed: f64) -> Option<u64> {
-    if speed <= 0.0 || transferred >= total {
+    if speed.is_nan() || speed <= 0.0 || transferred >= total {
         return None;
     }
     Some((((total - transferred) as f64) / speed).ceil() as u64)
@@ -94,6 +111,13 @@ pub enum ProgressMsg {
     },
     /// Stop tracking this task -- it reached a terminal state and its final
     /// numbers now travel on the (unthrottled) state event instead.
+    ///
+    /// Caller contract: a `Delta` for the same `task_id` arriving after this
+    /// `Forget` is *not* rejected or merged into the old history -- it
+    /// silently starts a brand-new `TaskProgress`, so `transferred` restarts
+    /// from zero (that new delta's byte count, not the pre-`Forget` total).
+    /// The engine must therefore send `Forget` only once a task is genuinely
+    /// finished, never speculatively.
     Forget { task_id: String },
 }
 
@@ -268,6 +292,14 @@ mod tests {
         assert_eq!(eta_secs(0, 0, 100.0), None); // empty file
     }
 
+    #[test]
+    fn eta_is_absent_for_nan_speed() {
+        // IEEE-754: every ordered comparison against NaN is false, so a
+        // naive `speed <= 0.0` guard would let this slip through and return
+        // Some(0). The guard must be written to catch NaN explicitly.
+        assert_eq!(eta_secs(1000, 0, f64::NAN), None);
+    }
+
     // ---- aggregator ----
 
     #[derive(Default)]
@@ -367,9 +399,35 @@ mod tests {
         tokio::time::advance(PROGRESS_INTERVAL * 4).await;
         tokio::task::yield_now().await;
 
-        // The one flush from before Forget, and nothing after: a completed
-        // task must not keep occupying the progress stream.
+        // The one flush from before Forget, and nothing in between: a
+        // completed task must not keep occupying the progress stream.
         assert_eq!(sink.batches.lock().unwrap().len(), 1);
+
+        // The above alone cannot tell "removed" apart from "merely
+        // quiescent": by this point the task's `dirty` flag is already
+        // false, so no further flush happens either way. Discriminate by
+        // sending a Delta for the *same* task_id after the Forget: if the
+        // entry was truly removed, this starts a fresh TaskProgress and
+        // `transferred` is just this delta's 5 bytes; if Forget was a
+        // no-op, the old entry (transferred = 10) survived and this delta
+        // would land on top of it, reporting 15.
+        tx.send(ProgressMsg::Delta {
+            task_id: "t1".to_string(),
+            bytes: 5,
+            total: 10,
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(PROGRESS_INTERVAL * 2).await;
+        tokio::task::yield_now().await;
+
+        let batches = sink.batches.lock().unwrap();
+        assert_eq!(batches.len(), 2, "the post-Forget delta must flush again");
+        assert_eq!(
+            batches[1][0].transferred, 5,
+            "Forget must have removed the entry so the post-Forget delta \
+             starts a fresh TaskProgress, not resume the old total"
+        );
     }
 
     #[tokio::test(start_paused = true)]
