@@ -109,9 +109,11 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> AppResult<Vec<u8>> {
     let nonce_bytes: [u8; NONCE_LEN] = rand::random();
     let nonce = AeadNonce::<Aes256Gcm>::from(nonce_bytes);
 
-    let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|_| AppError::Internal {
-        message: "failed to encrypt local connection store".to_string(),
-    })?;
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|_| AppError::Internal {
+            message: "failed to encrypt local connection store".to_string(),
+        })?;
 
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);

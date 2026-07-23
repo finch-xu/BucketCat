@@ -191,10 +191,7 @@ mod tests {
         );
         assert_eq!(AppError::Timeout.code(), "network/timeout");
         assert_eq!(
-            AppError::BucketNotFound {
-                bucket: "x".into()
-            }
-            .code(),
+            AppError::BucketNotFound { bucket: "x".into() }.code(),
             "storage/bucket-not-found"
         );
         assert_eq!(AppError::DecryptFailed.code(), "local/decrypt-failed");
