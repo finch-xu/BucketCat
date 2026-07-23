@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extFromName, formatDate, formatSize } from "./format";
+import { extFromName, formatDate, formatEta, formatSize, formatSpeed } from "./format";
 
 describe("formatSize", () => {
   it("renders null/invalid as an em dash", () => {
@@ -58,5 +58,30 @@ describe("extFromName", () => {
     expect(extFromName("Makefile")).toBe("");
     expect(extFromName(".gitignore")).toBe("");
     expect(extFromName("weird.")).toBe("");
+  });
+});
+
+describe("formatSpeed", () => {
+  it("renders per-second units", () => {
+    expect(formatSpeed(0)).toBe("0 B/s");
+    expect(formatSpeed(2_200_000)).toBe("2.1 MB/s");
+  });
+
+  it("never renders a negative or fractional byte count", () => {
+    expect(formatSpeed(-5)).toBe("0 B/s");
+    expect(formatSpeed(1.6)).toBe("2 B/s");
+  });
+});
+
+describe("formatEta", () => {
+  it("renders seconds, minutes and hours", () => {
+    expect(formatEta(45)).toBe("45s");
+    expect(formatEta(125)).toBe("2m 5s");
+    expect(formatEta(3_700)).toBe("1h 1m");
+  });
+
+  it("renders nothing when the eta is unknown", () => {
+    expect(formatEta(null)).toBe("");
+    expect(formatEta(-1)).toBe("");
   });
 });

@@ -8,6 +8,7 @@ import {
   pathToPrefix,
   renameKey,
   sortEntries,
+  uploadKey,
 } from "./entries";
 import type { ObjectEntry } from "./api";
 
@@ -160,5 +161,26 @@ describe("nameCollides", () => {
   it("is case-sensitive, matching S3 key semantics", () => {
     expect(nameCollides([e("A.txt", false)], "a.txt")).toBe(false);
     expect(nameCollides([e("a.txt", false)], "a.txt")).toBe(true);
+  });
+});
+
+describe("uploadKey", () => {
+  it("joins the browsed prefix with the file name", () => {
+    expect(uploadKey("docs/", "a.txt")).toBe("docs/a.txt");
+    expect(uploadKey("docs/sub/", "a.txt")).toBe("docs/sub/a.txt");
+  });
+
+  it("uploads to the bucket root without a leading slash", () => {
+    expect(uploadKey("", "a.txt")).toBe("a.txt");
+  });
+
+  it("adds a missing separator", () => {
+    expect(uploadKey("docs", "a.txt")).toBe("docs/a.txt");
+  });
+
+  it("keeps only the basename so a name cannot escape the prefix", () => {
+    expect(uploadKey("docs/", "../secrets/a.txt")).toBe("docs/a.txt");
+    expect(uploadKey("docs/", "sub/a.txt")).toBe("docs/a.txt");
+    expect(uploadKey("docs/", "sub\\a.txt")).toBe("docs/a.txt");
   });
 });

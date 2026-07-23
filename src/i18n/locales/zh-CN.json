@@ -76,6 +76,14 @@
     "selectedCount": "已选择 {{count}} 项",
     "clearSelection": "取消选择"
   },
+  "upload": {
+    "choose": "选择要上传的文件",
+    "conflictTitle": "目标位置已存在同名文件",
+    "conflictBody": "以下 {{count}} 个文件会覆盖当前目录中的同名对象。对象存储的覆盖不可撤销。",
+    "overwrite": "覆盖",
+    "skip": "跳过这些文件",
+    "dropHint": "松开即可上传到当前目录"
+  },
   "transfer": {
     "title": "传输任务",
     "idle": "暂无传输任务",
@@ -83,7 +91,17 @@
     "done": "已完成",
     "uploading": "上传中",
     "downloading": "下载中",
-    "toggle": "传输"
+    "toggle": "传输",
+    "queued": "排队中",
+    "paused": "已暂停",
+    "failed": "失败",
+    "canceled": "已取消",
+    "pause": "暂停",
+    "resume": "继续",
+    "cancel": "取消",
+    "retry": "重试",
+    "clearFinished": "清除已完成",
+    "remaining": "剩余 {{eta}}"
   },
   "addConn": {
     "title": "添加连接",

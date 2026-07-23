@@ -106,3 +106,20 @@ export function nameCollides(entries: ObjectEntry[], name: string, excludeKey?: 
   if (trimmed.length === 0) return false;
   return entries.some((entry) => entry.key !== excludeKey && entry.name === trimmed);
 }
+
+/** Remote key a local file will land on when uploaded into `prefix`.
+ *
+ * The backend's `upload_key` (in `src-tauri/src/commands/transfer.rs`) is the
+ * authoritative implementation and will be written to the same cases; this
+ * copy exists so the upload flow can ask "what will this overwrite?" *before*
+ * anything is queued. Object storage has no rename and no overwrite warning —
+ * a `PutObject` onto an existing key silently replaces it — so the answer has
+ * to be known client-side, in advance.
+ *
+ * Only the last path segment of `fileName` is used, so a value carrying
+ * separators cannot redirect the upload out of the browsed prefix. */
+export function uploadKey(prefix: string, fileName: string): string {
+  const base = (fileName.split(/[\\/]/).pop() ?? fileName).trim();
+  if (!prefix) return base;
+  return prefix.endsWith("/") ? `${prefix}${base}` : `${prefix}/${base}`;
+}

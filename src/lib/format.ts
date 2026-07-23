@@ -44,3 +44,21 @@ export function extFromName(name: string): string {
   if (idx <= 0 || idx === name.length - 1) return "";
   return name.slice(idx + 1).toLowerCase();
 }
+
+/** Throughput, e.g. "2.1 MB/s". Clamped at zero and rounded to whole bytes so
+ * a jittery estimate never renders as a negative or a fraction. */
+export function formatSpeed(bytesPerSecond: number): string {
+  return `${formatSize(Math.max(0, Math.round(bytesPerSecond)))}/s`;
+}
+
+/** Coarse remaining time. Deliberately two units at most — "1h 1m 3s" is more
+ * precision than an estimate this noisy deserves. `null` (the backend's
+ * "unknown", sent while a transfer is stalled or already done) renders as
+ * nothing rather than as "0s". */
+export function formatEta(seconds: number | null): string {
+  if (seconds === null || seconds < 0) return "";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  const hours = Math.floor(seconds / 3600);
+  return `${hours}h ${Math.floor((seconds % 3600) / 60)}m`;
+}

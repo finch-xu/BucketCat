@@ -76,6 +76,14 @@
     "selectedCount": "{{count}} selected",
     "clearSelection": "Clear selection"
   },
+  "upload": {
+    "choose": "Choose files to upload",
+    "conflictTitle": "Files with the same name already exist",
+    "conflictBody": "These {{count}} file(s) will overwrite objects in the current folder. Overwriting cannot be undone.",
+    "overwrite": "Overwrite",
+    "skip": "Skip these files",
+    "dropHint": "Drop to upload into this folder"
+  },
   "transfer": {
     "title": "Transfers",
     "idle": "No active transfers",
@@ -83,7 +91,17 @@
     "done": "Done",
     "uploading": "Uploading",
     "downloading": "Downloading",
-    "toggle": "Transfers"
+    "toggle": "Transfers",
+    "queued": "Queued",
+    "paused": "Paused",
+    "failed": "Failed",
+    "canceled": "Canceled",
+    "pause": "Pause",
+    "resume": "Resume",
+    "cancel": "Cancel",
+    "retry": "Retry",
+    "clearFinished": "Clear finished",
+    "remaining": "{{eta}} left"
   },
   "addConn": {
     "title": "Add Connection",
