@@ -19,6 +19,33 @@
 //! The one visible consequence: pausing a running task takes as long as the
 //! runner needs to notice its token (milliseconds), instead of flipping the
 //! UI instantly and hoping the runner catches up.
+//!
+//! `pause` and `cancel` read the status **and** fire the token under a single
+//! lock. Doing it in two steps used to let a stale `Pause` intent reach a
+//! driver whose task had already gone back to `Queued`, where `Pause` is not a
+//! legal transition: the driver applied nothing and exited, leaving a `Queued`
+//! task with no driver -- and `resume`, `retry` and `pause` are all illegal
+//! from `Queued`, so the row was unrecoverable. [`EngineInner::apply_stop`]
+//! now reports whether it applied anything and the driver warns when it did
+//! not, because the silent no-op is what made that bug invisible.
+//!
+//! ## Admission order is not enqueue order
+//!
+//! Tasks are admitted in whatever order the scheduler happens to poll their
+//! drivers, **not** in enqueue order: each [`TransferEngine::enqueue`] spawns
+//! an independent driver, and those drivers race each other for the semaphore
+//! permit. Enqueueing `a` then `b` with one free slot may well start `b`.
+//!
+//! What *is* guaranteed: tokio's semaphore is FIFO among already-*registered*
+//! waiters, so once the permits are exhausted the order of everyone already
+//! queued is fixed and no task can starve behind a stream of newcomers. Only
+//! the initial race -- between drivers that have not yet reached the
+//! semaphore -- is unordered.
+//!
+//! An ordered admission queue (a single scheduler loop handing out permits in
+//! `seq` order) is deliberately deferred: it buys a nicety the UI does not
+//! currently promise, at the cost of a second coordination point in the one
+//! part of the engine whose invariants are hardest to keep.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -154,13 +181,35 @@ pub struct TaskContext {
     pub resume: Arc<Mutex<Option<MultipartState>>>,
 }
 
-/// Performs one transfer. `Ok(())` means "the runner is done"; whether that
-/// is a completion, a pause or a cancellation is decided by the engine from
-/// [`TaskControl::requested`], so runners never have to invent a
-/// "stopped early" error.
+/// What a runner actually did. The engine cannot infer this from a stop
+/// request alone: a stop can be requested while the transfer is already
+/// committing, and recording "canceled" for an object that exists on the
+/// server would be a lie the user cannot act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The transfer finished; the bytes are on the server.
+    Completed,
+    /// The runner observed a stop request and unwound early.
+    Stopped,
+}
+
+/// Performs one transfer.
+///
+/// The runner -- not the engine -- decides whether the transfer happened: it
+/// is the only party that knows whether the bytes landed. Return
+/// [`RunOutcome::Completed`] once the transfer is committed and
+/// [`RunOutcome::Stopped`] only when a stop request from
+/// [`TaskControl::requested`] was observed *and* honoured by unwinding
+/// without finishing.
+///
+/// A `Completed` outcome wins even over a stop that was requested while the
+/// runner was committing; the engine will record `Completed` and the pending
+/// pause/cancel is dropped. Reporting `Stopped` with no stop actually
+/// requested is a runner bug, and the engine treats it as one (the task
+/// fails with an `internal` code rather than being stranded in `Running`).
 #[async_trait]
 pub trait TransferRunner: Send + Sync + 'static {
-    async fn run(&self, ctx: TaskContext) -> AppResult<()>;
+    async fn run(&self, ctx: TaskContext) -> AppResult<RunOutcome>;
 }
 
 /// Where status changes go. Unlike progress, these are never throttled or
@@ -294,9 +343,17 @@ impl EngineInner {
         // Wait for a global slot -- but stay cancellable while queued, so a
         // user can cancel a task that never got to run.
         let permit = tokio::select! {
+            // `biased;` is load-bearing, not a micro-optimisation. When a task
+            // is cancelled before it is ever polled, both branches are ready at
+            // the first poll: the token is already cancelled *and* a permit is
+            // free. Unbiased `select!` picks a branch at random, so half the
+            // time a task the user already cancelled would still be started.
+            // Biased polling makes the cancellation win every time.
             biased;
             _ = token.cancelled() => {
-                self.apply_stop(&task_id, &control).await;
+                if !self.apply_stop(&task_id, &control).await {
+                    Self::warn_stranded(&task_id, &control);
+                }
                 return;
             }
             permit = Arc::clone(&self.task_sem).acquire_owned() => match permit {
@@ -308,7 +365,9 @@ impl EngineInner {
 
         if !self.apply(&task_id, TransferCommand::Start, None).await {
             drop(permit);
-            self.apply_stop(&task_id, &control).await;
+            if control.requested().is_some() && !self.apply_stop(&task_id, &control).await {
+                Self::warn_stranded(&task_id, &control);
+            }
             return;
         }
 
@@ -329,28 +388,76 @@ impl EngineInner {
             resume,
         };
 
-        let result = self.runner.run(ctx).await;
+        // The runner gets its own task so that a panic inside it cannot take
+        // the driver down with it. A dead driver leaves the task in `Running`
+        // forever: `cancel` only *requests* a stop that nobody is left to
+        // observe, and `clear_finished` skips non-terminal rows, so the row
+        // would be immortal. (Throughput is unaffected either way -- unwinding
+        // releases the permit -- so this is purely about the stuck row.)
+        //
+        // `AssertUnwindSafe(fut).catch_unwind()` would be the tidier spelling,
+        // but `FutureExt` lives in `futures-util`, which is only a transitive
+        // dependency here. `JoinHandle` gives exactly the same guarantee using
+        // nothing but tokio, which this crate already depends on directly.
+        let runner = Arc::clone(&self.runner);
+        let joined = tokio::spawn(async move { runner.run(ctx).await }).await;
         // Release the slot before any state bookkeeping so the next queued
         // task starts as early as possible.
         drop(permit);
 
-        let _ = self.progress.send(ProgressMsg::Forget {
-            task_id: task_id.clone(),
-        });
-
-        if control.requested().is_some() {
-            self.apply_stop(&task_id, &control).await;
-            return;
-        }
+        let result = match joined {
+            Ok(result) => result,
+            Err(join_err) => {
+                let err = AppError::Internal {
+                    message: format!("transfer runner panicked for task {task_id}"),
+                };
+                tracing::error!(task = %task_id, "{err} ({join_err})");
+                self.forget_progress(&task_id);
+                self.apply(
+                    &task_id,
+                    TransferCommand::Fail,
+                    Some(err.code().to_string()),
+                )
+                .await;
+                return;
+            }
+        };
 
         match result {
-            Ok(()) => {
+            // A genuine completion wins over a stop requested while the runner
+            // was committing: the bytes are on the server, and recording
+            // "canceled" next to an object that exists would be a lie the user
+            // cannot act on.
+            Ok(RunOutcome::Completed) => {
                 if let Some(record) = self.tasks.lock().await.get(&task_id) {
                     record
                         .transferred
                         .store(record.dto.total, Ordering::Relaxed);
                 }
+                self.forget_progress(&task_id);
                 self.apply(&task_id, TransferCommand::Complete, None).await;
+            }
+            Ok(RunOutcome::Stopped) => {
+                if !self.apply_stop(&task_id, &control).await {
+                    // Either nobody asked for a stop (a runner bug) or the
+                    // transition was illegal. Failing the task is wrong-ish but
+                    // recoverable; leaving it in `Running` is not recoverable
+                    // at all.
+                    let err = AppError::Internal {
+                        message: format!(
+                            "runner reported Stopped for task {task_id}, but no stop was \
+                             requested"
+                        ),
+                    };
+                    tracing::warn!(task = %task_id, stop = ?control.requested(), "{err}");
+                    self.forget_progress(&task_id);
+                    self.apply(
+                        &task_id,
+                        TransferCommand::Fail,
+                        Some(err.code().to_string()),
+                    )
+                    .await;
+                }
             }
             Err(err) => {
                 tracing::warn!(
@@ -358,6 +465,7 @@ impl EngineInner {
                     code = err.code(),
                     "transfer failed: {err}"
                 );
+                self.forget_progress(&task_id);
                 self.apply(
                     &task_id,
                     TransferCommand::Fail,
@@ -368,27 +476,42 @@ impl EngineInner {
         }
     }
 
-    async fn apply_stop(self: &Arc<Self>, task_id: &str, control: &TaskControl) {
-        match control.requested() {
-            Some(StopKind::Pause) => {
-                self.apply(task_id, TransferCommand::Pause, None).await;
-            }
-            Some(StopKind::Cancel) => {
-                self.apply(task_id, TransferCommand::Cancel, None).await;
-            }
-            None => {}
-        };
+    /// Tells the aggregator to drop this task's byte accounting. Deliberately
+    /// **not** sent when pausing: the aggregator keeps the task's last known
+    /// figure, so the panel goes on showing the progress the pause froze
+    /// instead of blanking it.
+    fn forget_progress(&self, task_id: &str) {
+        let _ = self.progress.send(ProgressMsg::Forget {
+            task_id: task_id.to_string(),
+        });
     }
 
-    async fn status_of(&self, task_id: &str) -> AppResult<TransferStatus> {
-        self.tasks
-            .lock()
-            .await
-            .get(task_id)
-            .map(|r| r.dto.status)
-            .ok_or_else(|| AppError::TaskNotFound {
-                id: task_id.to_string(),
-            })
+    /// Applies the requested stop, returning whether anything was actually
+    /// written. `false` means either that no stop was requested or that the
+    /// requested one was not a legal transition from the current status.
+    async fn apply_stop(self: &Arc<Self>, task_id: &str, control: &TaskControl) -> bool {
+        match control.requested() {
+            Some(StopKind::Pause) => self.apply(task_id, TransferCommand::Pause, None).await,
+            Some(StopKind::Cancel) => {
+                let applied = self.apply(task_id, TransferCommand::Cancel, None).await;
+                if applied {
+                    self.forget_progress(task_id);
+                }
+                applied
+            }
+            None => false,
+        }
+    }
+
+    /// A stop that applied nothing has left an active task with no live driver,
+    /// which is unrecoverable. The single-lock `pause`/`cancel` should make
+    /// this impossible; say so loudly if it ever happens anyway.
+    fn warn_stranded(task_id: &str, control: &TaskControl) {
+        tracing::warn!(
+            task = %task_id,
+            stop = ?control.requested(),
+            "stop requested but no transition was legal; task may have no live driver"
+        );
     }
 }
 
@@ -463,12 +586,18 @@ impl TransferEngine {
 
     /// Asks a running task to stop and keep its progress. The transition to
     /// `Paused` is applied by the driver once the runner has unwound.
+    ///
+    /// The status check and the token fire happen under **one** lock. Reading
+    /// the status, releasing the lock and re-taking it to fire lets the task
+    /// go back to `Queued` in between, where `Pause` is not a legal
+    /// transition -- the driver would then apply nothing and exit, stranding
+    /// the task with no live driver and no legal command left.
     pub async fn pause(&self, task_id: &str) -> AppResult<()> {
-        let status = self.inner.status_of(task_id).await?;
-        if status != TransferStatus::Running {
-            return Ok(());
-        }
-        if let Some(record) = self.inner.tasks.lock().await.get(task_id) {
+        let tasks = self.inner.tasks.lock().await;
+        let record = tasks.get(task_id).ok_or_else(|| AppError::TaskNotFound {
+            id: task_id.to_string(),
+        })?;
+        if record.dto.status == TransferStatus::Running {
             record.control.request(StopKind::Pause);
         }
         Ok(())
@@ -477,15 +606,26 @@ impl TransferEngine {
     /// Cancels a task from any non-terminal state. When no driver is live
     /// (`Paused` / `Failed`) the transition is applied here, since nobody
     /// else will.
+    ///
+    /// Same single-lock rule as [`TransferEngine::pause`]: the status decides
+    /// who applies the transition, so it must be read at the same instant the
+    /// token fires.
     pub async fn cancel(&self, task_id: &str) -> AppResult<()> {
-        let status = self.inner.status_of(task_id).await?;
-        if let Some(record) = self.inner.tasks.lock().await.get(task_id) {
+        let was_active = {
+            let tasks = self.inner.tasks.lock().await;
+            let record = tasks.get(task_id).ok_or_else(|| AppError::TaskNotFound {
+                id: task_id.to_string(),
+            })?;
             record.control.request(StopKind::Cancel);
-        }
-        if !status.is_active() {
-            self.inner
+            record.dto.status.is_active()
+        };
+        if !was_active
+            && self
+                .inner
                 .apply(task_id, TransferCommand::Cancel, None)
-                .await;
+                .await
+        {
+            self.inner.forget_progress(task_id);
         }
         Ok(())
     }
@@ -515,6 +655,13 @@ impl TransferEngine {
                 return Ok(());
             }
             record.control = TaskControl::new();
+            // Both byte counters must restart from zero at the *same* instant.
+            // A resumed runner re-reports work it already reported in its
+            // previous run (it replays whatever the checkpoint did not cover),
+            // so leaving either side at its old value double-counts: the panel
+            // would show a retried 1024-byte task at 2048/1024 = 200%.
+            record.transferred.store(0, Ordering::Relaxed);
+            self.inner.forget_progress(task_id);
         }
         if self.inner.apply(task_id, cmd, None).await {
             self.inner.spawn_driver(task_id.to_string());
@@ -552,6 +699,22 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
+    /// How the fake runner should misbehave. The engine has to survive runners
+    /// it did not write, so the pathological branches need a way in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FakeMode {
+        /// Park until cancelled or told to finish, then report honestly.
+        Normal,
+        /// Panic instead of returning at all (Finding I-4).
+        Panic,
+        /// Ignore the token entirely, so a stop request that arrives while the
+        /// runner is "committing" cannot be observed (Finding I-3).
+        IgnoreToken,
+        /// Report `Stopped` with nothing to stop -- a runner bug the engine
+        /// must not turn into a stranded `Running` row.
+        BogusStop,
+    }
+
     /// A runner that parks until cancelled (or until `finish` is set), while
     /// tracking how many runs were in flight at once.
     ///
@@ -567,6 +730,13 @@ mod tests {
         started: AtomicUsize,
         finish: AtomicBool,
         fail_with: StdMutex<Option<AppError>>,
+        mode: StdMutex<FakeMode>,
+        /// Bytes to report through [`ProgressHandle::add`] at the start of each
+        /// run, imitating a runner that replays already-transferred work when
+        /// it resumes. Zero means "report nothing".
+        report_bytes: AtomicU64,
+        /// Runs that got as far as reporting `report_bytes`.
+        reported: AtomicUsize,
     }
 
     impl FakeRunner {
@@ -577,35 +747,64 @@ mod tests {
                 started: AtomicUsize::new(0),
                 finish: AtomicBool::new(false),
                 fail_with: StdMutex::new(None),
+                mode: StdMutex::new(FakeMode::Normal),
+                report_bytes: AtomicU64::new(0),
+                reported: AtomicUsize::new(0),
             })
+        }
+
+        fn set_mode(&self, mode: FakeMode) {
+            *self.mode.lock().unwrap() = mode;
         }
     }
 
     #[async_trait::async_trait]
     impl TransferRunner for FakeRunner {
-        async fn run(&self, ctx: TaskContext) -> AppResult<()> {
+        async fn run(&self, ctx: TaskContext) -> AppResult<RunOutcome> {
             self.started.fetch_add(1, Ordering::SeqCst);
+            // Copy the mode out before anything can panic: holding the guard
+            // across the `panic!` would poison the mutex for the next run.
+            let mode = *self.mode.lock().unwrap();
+            if mode == FakeMode::Panic {
+                panic!("fake runner exploded on purpose");
+            }
+
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(live, Ordering::SeqCst);
+
+            let bytes = self.report_bytes.load(Ordering::SeqCst);
+            if bytes > 0 {
+                ctx.progress.add(bytes);
+                self.reported.fetch_add(1, Ordering::SeqCst);
+            }
 
             // Bound outside the loop: `token()` hands back an owned clone, and
             // `cancelled()` borrows it, so calling both inline inside
             // `select!` would borrow a temporary that dies too early.
             let token = ctx.control.token();
-            loop {
+            let stopped = loop {
+                // `finish` is checked first on purpose: a runner that has
+                // already committed reports `Completed` even if its token
+                // fired, which is exactly the race Finding I-3 is about.
                 if self.finish.load(Ordering::SeqCst) {
-                    break;
+                    break false;
+                }
+                if mode == FakeMode::IgnoreToken {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    continue;
                 }
                 tokio::select! {
-                    _ = token.cancelled() => break,
+                    _ = token.cancelled() => break true,
                     _ = tokio::time::sleep(Duration::from_millis(2)) => {}
                 }
-            }
+            };
 
             self.live.fetch_sub(1, Ordering::SeqCst);
             match self.fail_with.lock().unwrap().take() {
                 Some(err) => Err(err),
-                None => Ok(()),
+                None if mode == FakeMode::BogusStop => Ok(RunOutcome::Stopped),
+                None if stopped => Ok(RunOutcome::Stopped),
+                None => Ok(RunOutcome::Completed),
             }
         }
     }
@@ -640,7 +839,46 @@ mod tests {
         engine: TransferEngine,
         runner: Arc<FakeRunner>,
         sink: Arc<RecordingSink>,
+        /// The aggregator end of the progress channel. It has to be *kept*:
+        /// binding it to `_progress_rx` inside `harness()` dropped it the
+        /// moment the function returned, which closed the channel and made
+        /// every `ProgressMsg` the engine sent fail silently -- so no test
+        /// could observe `Forget` at all.
+        progress_rx: StdMutex<mpsc::UnboundedReceiver<ProgressMsg>>,
+        progress_seen: StdMutex<Vec<ProgressMsg>>,
         _dir: tempfile::TempDir,
+    }
+
+    impl Harness {
+        /// Moves whatever the engine has sent so far out of the channel into
+        /// `progress_seen`. Draining is destructive, so tests never touch the
+        /// receiver directly -- they poll the accessors below instead.
+        fn pump_progress(&self) {
+            let mut rx = self.progress_rx.lock().unwrap();
+            let mut seen = self.progress_seen.lock().unwrap();
+            while let Ok(msg) = rx.try_recv() {
+                seen.push(msg);
+            }
+        }
+
+        fn forgets_of(&self, task_id: &str) -> usize {
+            self.pump_progress();
+            self.progress_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|msg| matches!(msg, ProgressMsg::Forget { task_id: id } if id == task_id))
+                .count()
+        }
+
+        async fn task(&self, task_id: &str) -> TransferTaskDto {
+            self.engine
+                .snapshot()
+                .await
+                .into_iter()
+                .find(|t| t.id == task_id)
+                .expect("task missing from snapshot")
+        }
     }
 
     fn harness(max_tasks: usize) -> Harness {
@@ -650,7 +888,7 @@ mod tests {
         }));
         let runner = FakeRunner::new();
         let sink = Arc::new(RecordingSink::default());
-        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let engine = TransferEngine::new(
             hub,
             runner.clone(),
@@ -665,6 +903,8 @@ mod tests {
             engine,
             runner,
             sink,
+            progress_rx: StdMutex::new(progress_rx),
+            progress_seen: StdMutex::new(Vec::new()),
             _dir: dir,
         }
     }
@@ -684,14 +924,18 @@ mod tests {
     /// Polls until `check` holds or the (virtual-clock-free) budget expires.
     /// The engine hands work to spawned tasks, so assertions have to wait for
     /// a scheduling round rather than assuming synchronous effects.
-    async fn eventually(mut check: impl FnMut() -> bool) {
+    ///
+    /// `label` is not decoration: a timeout here is the most common way one of
+    /// these tests fails, and "condition never became true" on its own says
+    /// nothing about *which* of a test's five waits gave up.
+    async fn eventually(mut check: impl FnMut() -> bool, label: &str) {
         for _ in 0..200 {
             if check() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("condition never became true");
+        panic!("timed out waiting for: {label}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -700,7 +944,11 @@ mod tests {
         for i in 0..8 {
             h.engine.enqueue(spec(&format!("k{i}"))).await.unwrap();
         }
-        eventually(|| h.runner.live.load(Ordering::SeqCst) == 3).await;
+        eventually(
+            || h.runner.live.load(Ordering::SeqCst) == 3,
+            "three runners in flight",
+        )
+        .await;
 
         // Give the extra five tasks every chance to sneak past the semaphore.
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -713,25 +961,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn finishing_a_task_admits_the_next_queued_one() {
+    async fn finishing_a_task_admits_another_queued_one() {
+        // "another", not "the next": drivers race each other for the permit, so
+        // which queued task wins is the scheduler's choice rather than enqueue
+        // order. See the module header's "Admission order" section.
         let h = harness(1);
         h.engine.enqueue(spec("a")).await.unwrap();
         h.engine.enqueue(spec("b")).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 1).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "one of the two tasks is admitted",
+        )
+        .await;
 
         h.runner.finish.store(true, Ordering::SeqCst);
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 2).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "the freed permit admits the other task",
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_running_task_completes() {
         let h = harness(1);
         let task = h.engine.enqueue(spec("a")).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 1).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
         h.runner.finish.store(true, Ordering::SeqCst);
 
-        eventually(|| h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Completed))
-            .await;
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Completed),
+            "the task reaches Completed",
+        )
+        .await;
         assert_eq!(
             h.sink.statuses_of(&task.id),
             vec![
@@ -752,12 +1018,19 @@ mod tests {
         // choice. With `a` already parked on the sole permit, `b` provably
         // cannot be admitted.
         let running = h.engine.enqueue(spec("a")).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 1).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a takes the only permit",
+        )
+        .await;
 
         let queued = h.engine.enqueue(spec("b")).await.unwrap();
         h.engine.cancel(&queued.id).await.unwrap();
-        eventually(|| h.sink.statuses_of(&queued.id).last() == Some(&TransferStatus::Canceled))
-            .await;
+        eventually(
+            || h.sink.statuses_of(&queued.id).last() == Some(&TransferStatus::Canceled),
+            "the queued task reaches Canceled",
+        )
+        .await;
 
         // It must have gone straight to Canceled without ever being started --
         // the announcement of its arrival in `Queued` is the only thing
@@ -774,27 +1047,83 @@ mod tests {
     async fn pausing_a_running_task_cancels_its_token_and_parks_it() {
         let h = harness(1);
         let task = h.engine.enqueue(spec("a")).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 1).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
 
         h.engine.pause(&task.id).await.unwrap();
         // The fake runner only returns when its token fires, so reaching
         // Paused proves cancellation actually propagated into the runner.
-        eventually(|| h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Paused)).await;
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Paused),
+            "the task reaches Paused",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pausing_a_queued_task_leaves_it_runnable() {
+        // `Pause` is not a legal transition from `Queued`, so `pause` must not
+        // fire the token of a task that is merely waiting for a permit: a stop
+        // intent nothing can apply would make the driver exit without writing
+        // a status, leaving a `Queued` row with no live driver and no legal
+        // command left (`resume`, `retry` and `pause` are all illegal there).
+        let h = harness(1);
+        let running = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a takes the only permit",
+        )
+        .await;
+
+        let queued = h.engine.enqueue(spec("b")).await.unwrap();
+        h.engine.pause(&queued.id).await.unwrap();
+        assert_eq!(
+            h.sink.statuses_of(&queued.id),
+            vec![TransferStatus::Queued],
+            "pausing a queued task must be a no-op"
+        );
+
+        // Free the permit: the queued task must still be admitted.
+        h.engine.pause(&running.id).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "the task that was pause-poked still gets admitted",
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resuming_a_paused_task_runs_it_again_with_a_fresh_token() {
         let h = harness(1);
         let task = h.engine.enqueue(spec("a")).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 1).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
         h.engine.pause(&task.id).await.unwrap();
-        eventually(|| h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Paused)).await;
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Paused),
+            "the task reaches Paused",
+        )
+        .await;
 
         h.engine.resume(&task.id).await.unwrap();
         // A stale (already-cancelled) token would make the runner return
         // instantly; reaching a second start proves the token was replaced.
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 2).await;
-        eventually(|| h.runner.live.load(Ordering::SeqCst) == 1).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "the resumed task starts a second run",
+        )
+        .await;
+        eventually(
+            || h.runner.live.load(Ordering::SeqCst) == 1,
+            "the resumed run stays in flight instead of returning instantly",
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -802,31 +1131,224 @@ mod tests {
         let h = harness(1);
         *h.runner.fail_with.lock().unwrap() = Some(AppError::AccessDenied);
         let task = h.engine.enqueue(spec("a")).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 1).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
         h.runner.finish.store(true, Ordering::SeqCst);
 
-        eventually(|| h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Failed)).await;
-        let failed = h
-            .engine
-            .snapshot()
-            .await
-            .into_iter()
-            .find(|t| t.id == task.id)
-            .unwrap();
-        assert_eq!(failed.error_code.as_deref(), Some("auth/access-denied"));
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Failed),
+            "the task reaches Failed",
+        )
+        .await;
+        assert_eq!(
+            h.task(&task.id).await.error_code.as_deref(),
+            Some("auth/access-denied")
+        );
 
         h.engine.retry(&task.id).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 2).await;
-        let retried = h
-            .engine
-            .snapshot()
-            .await
-            .into_iter()
-            .find(|t| t.id == task.id)
-            .unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "the retried task starts a second run",
+        )
+        .await;
         assert_eq!(
-            retried.error_code, None,
+            h.task(&task.id).await.error_code,
+            None,
             "a retried task must not keep showing the previous failure"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completion_beats_a_late_stop_request() {
+        let h = harness(1);
+        // A runner that cannot see its token stands in for a real one already
+        // inside `CompleteMultipartUpload`: the bytes are committed and no
+        // abort will be issued, so recording "Canceled" would put that status
+        // next to an object that exists in the bucket.
+        h.runner.set_mode(FakeMode::IgnoreToken);
+        let task = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
+
+        h.engine.cancel(&task.id).await.unwrap();
+        h.runner.finish.store(true, Ordering::SeqCst);
+
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Completed),
+            "a committed transfer is recorded as Completed",
+        )
+        .await;
+        assert_eq!(
+            h.sink.statuses_of(&task.id),
+            vec![
+                TransferStatus::Queued,
+                TransferStatus::Running,
+                TransferStatus::Completed
+            ],
+            "a stop requested while the runner was committing must not overwrite the completion"
+        );
+        assert_eq!(h.task(&task.id).await.transferred, 1024);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runner_reporting_stopped_without_a_stop_request_fails_the_task() {
+        let h = harness(1);
+        h.runner.set_mode(FakeMode::BogusStop);
+        let task = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Failed),
+            "a bogus Stopped fails the task instead of stranding it in Running",
+        )
+        .await;
+        assert_eq!(
+            h.task(&task.id).await.error_code.as_deref(),
+            Some("internal"),
+            "the runner bug must be visible as an internal error, not a plausible stop"
+        );
+        assert_eq!(h.forgets_of(&task.id), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_runner_fails_its_task_and_keeps_the_engine_scheduling() {
+        let h = harness(1);
+        h.runner.set_mode(FakeMode::Panic);
+        let boom = h.engine.enqueue(spec("a")).await.unwrap();
+
+        // Without catching the panic the driver dies with the runner: no
+        // transition is ever applied, the row sits in `Running` forever, and
+        // neither `cancel` (which only requests a stop nobody observes) nor
+        // `clear_finished` (which skips non-terminal rows) can rescue it.
+        eventually(
+            || h.sink.statuses_of(&boom.id).last() == Some(&TransferStatus::Failed),
+            "a panicking runner fails its task instead of stranding it in Running",
+        )
+        .await;
+        assert_eq!(
+            h.task(&boom.id).await.error_code.as_deref(),
+            Some("internal")
+        );
+        assert_eq!(h.forgets_of(&boom.id), 1);
+
+        // ... and the engine must go on scheduling afterwards.
+        h.runner.set_mode(FakeMode::Normal);
+        let next = h.engine.enqueue(spec("b")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "the next task is still admitted after a panic",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&next.id).last() == Some(&TransferStatus::Completed),
+            "the task admitted after the panic runs to completion",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completing_a_task_stops_the_aggregator_tracking_it() {
+        let h = harness(1);
+        let task = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Completed),
+            "the task reaches Completed",
+        )
+        .await;
+
+        eventually(
+            || h.forgets_of(&task.id) == 1,
+            "a completed task sends exactly one Forget so the aggregator drops its entry",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pausing_a_task_keeps_its_progress_in_the_aggregator() {
+        let h = harness(1);
+        h.runner.report_bytes.store(256, Ordering::SeqCst);
+        let task = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.reported.load(Ordering::SeqCst) == 1,
+            "the runner reports its first bytes",
+        )
+        .await;
+
+        h.engine.pause(&task.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Paused),
+            "the task reaches Paused",
+        )
+        .await;
+
+        // Give a stray Forget every chance to arrive before concluding it did
+        // not.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            h.forgets_of(&task.id),
+            0,
+            "pausing must not Forget: the aggregator's last figure is what keeps the paused row \
+             showing the progress it froze instead of blanking it"
+        );
+        assert_eq!(h.task(&task.id).await.transferred, 256);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resuming_restarts_byte_accounting_from_zero() {
+        let h = harness(1);
+        // A resumed runner re-reports work it already reported, so 256 bytes
+        // reported twice must still read 256/1024 rather than 512/1024 -- and
+        // both counters have to be zeroed at the same instant, or whichever one
+        // was missed keeps double-counting.
+        h.runner.report_bytes.store(256, Ordering::SeqCst);
+        let task = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.reported.load(Ordering::SeqCst) == 1,
+            "the first run reports its bytes",
+        )
+        .await;
+        h.engine.pause(&task.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Paused),
+            "the task reaches Paused",
+        )
+        .await;
+        assert_eq!(h.task(&task.id).await.transferred, 256);
+
+        h.engine.resume(&task.id).await.unwrap();
+        eventually(
+            || h.runner.reported.load(Ordering::SeqCst) == 2,
+            "the resumed run reports its bytes",
+        )
+        .await;
+
+        assert_eq!(
+            h.task(&task.id).await.transferred,
+            256,
+            "restart must zero the engine's counter, or the replayed 256 bytes read as 512/1024"
+        );
+        assert_eq!(
+            h.forgets_of(&task.id),
+            1,
+            "restart must Forget, or the aggregator adds the replayed bytes to the old total"
         );
     }
 
@@ -850,17 +1372,28 @@ mod tests {
     async fn clear_finished_keeps_everything_still_actionable() {
         let h = harness(1);
         let done = h.engine.enqueue(spec("a")).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 1).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a starts",
+        )
+        .await;
         h.runner.finish.store(true, Ordering::SeqCst);
-        eventually(|| h.sink.statuses_of(&done.id).last() == Some(&TransferStatus::Completed))
-            .await;
+        eventually(
+            || h.sink.statuses_of(&done.id).last() == Some(&TransferStatus::Completed),
+            "task a reaches Completed",
+        )
+        .await;
         // The finish flag is sticky, unlike `Notify`'s wake-only-current-waiters
         // semantics: clear it so "b" actually parks instead of completing
         // instantly and being swept away by `clear_finished`.
         h.runner.finish.store(false, Ordering::SeqCst);
 
         let queued = h.engine.enqueue(spec("b")).await.unwrap();
-        eventually(|| h.runner.started.load(Ordering::SeqCst) == 2).await;
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "task b starts",
+        )
+        .await;
 
         h.engine.clear_finished().await;
         let ids: Vec<String> = h
@@ -874,6 +1407,120 @@ mod tests {
             ids,
             vec![queued.id],
             "only Completed/Canceled tasks may be dropped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clear_finished_keeps_paused_and_failed() {
+        // The sibling test above only ever exercises Completed-dropped and
+        // Running-kept, so `retain(!is_terminal)` could become
+        // `retain(is_active)` -- which destroys `Paused` and `Failed` too --
+        // without a single test noticing. Those are exactly the rows whose loss
+        // costs the user work: they are the ones that can still be resumed or
+        // retried.
+        let h = harness(1);
+
+        let paused = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a starts",
+        )
+        .await;
+        h.engine.pause(&paused.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&paused.id).last() == Some(&TransferStatus::Paused),
+            "task a reaches Paused",
+        )
+        .await;
+
+        // Only arm the failure now: the fake takes `fail_with` at the end of
+        // *every* run, and "a" has just finished one.
+        *h.runner.fail_with.lock().unwrap() = Some(AppError::AccessDenied);
+        let failed = h.engine.enqueue(spec("b")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "task b starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&failed.id).last() == Some(&TransferStatus::Failed),
+            "task b reaches Failed",
+        )
+        .await;
+
+        let done = h.engine.enqueue(spec("c")).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&done.id).last() == Some(&TransferStatus::Completed),
+            "task c reaches Completed",
+        )
+        .await;
+
+        h.engine.clear_finished().await;
+        let mut kept: Vec<String> = h
+            .engine
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        kept.sort();
+        let mut expected = vec![paused.id, failed.id];
+        expected.sort();
+        assert_eq!(
+            kept, expected,
+            "clear_finished may drop only terminal tasks; Paused and Failed are still resumable \
+             or retryable, so sweeping them would destroy actionable work"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_on_a_task_with_no_driver_applies_the_transition_itself() {
+        // The third bullet of the module's headline invariant: `Paused` and
+        // `Failed` tasks have no live driver, so nobody but `cancel` itself can
+        // ever write their `Canceled`. Both assertions below are synchronous on
+        // purpose -- there is no driver left to do it later.
+        let h = harness(1);
+
+        let paused = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a starts",
+        )
+        .await;
+        h.engine.pause(&paused.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&paused.id).last() == Some(&TransferStatus::Paused),
+            "task a reaches Paused",
+        )
+        .await;
+
+        h.engine.cancel(&paused.id).await.unwrap();
+        assert_eq!(
+            h.sink.statuses_of(&paused.id).last(),
+            Some(&TransferStatus::Canceled),
+            "cancelling a Paused task must apply the transition inside `cancel`"
+        );
+
+        *h.runner.fail_with.lock().unwrap() = Some(AppError::AccessDenied);
+        let failed = h.engine.enqueue(spec("b")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "task b starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&failed.id).last() == Some(&TransferStatus::Failed),
+            "task b reaches Failed",
+        )
+        .await;
+
+        h.engine.cancel(&failed.id).await.unwrap();
+        assert_eq!(
+            h.sink.statuses_of(&failed.id).last(),
+            Some(&TransferStatus::Canceled),
+            "cancelling a Failed task must apply the transition inside `cancel`"
         );
     }
 

@@ -109,15 +109,24 @@ pub enum ProgressMsg {
         bytes: u64,
         total: u64,
     },
-    /// Stop tracking this task -- it reached a terminal state and its final
-    /// numbers now travel on the (unthrottled) state event instead.
+    /// Stop tracking this task: any later `Delta` for the same `task_id`
+    /// starts its accounting from zero.
     ///
-    /// Caller contract: a `Delta` for the same `task_id` arriving after this
-    /// `Forget` is *not* rejected or merged into the old history -- it
-    /// silently starts a brand-new `TaskProgress`, so `transferred` restarts
-    /// from zero (that new delta's byte count, not the pre-`Forget` total).
-    /// The engine must therefore send `Forget` only once a task is genuinely
-    /// finished, never speculatively.
+    /// A post-`Forget` `Delta` is *not* rejected or merged into the old
+    /// history -- it silently starts a brand-new `TaskProgress`, so
+    /// `transferred` becomes that delta's byte count rather than resuming the
+    /// pre-`Forget` total. Both of the engine's callers rely on exactly that:
+    ///
+    /// - **Finishing** (`Completed` / `Canceled` / `Failed`): the task is over,
+    ///   its final numbers travel on the unthrottled state event instead, and
+    ///   nothing more will ever be reported for it.
+    /// - **Restarting** (`resume` / `retry`): a resumed runner re-reports work
+    ///   it already reported, so the aggregator's counter is zeroed at the same
+    ///   instant as the engine's own, and the replayed bytes land on a fresh
+    ///   entry instead of doubling the total.
+    ///
+    /// The one case that must *not* send it is `Paused`: keeping the entry is
+    /// what lets the panel go on showing the progress the pause froze.
     Forget { task_id: String },
 }
 
