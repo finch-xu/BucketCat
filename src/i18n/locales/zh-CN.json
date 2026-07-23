@@ -89,8 +89,6 @@
     "idle": "暂无传输任务",
     "activeCount": "{{count}} 个传输中",
     "done": "已完成",
-    "uploading": "上传中",
-    "downloading": "下载中",
     "toggle": "传输",
     "queued": "排队中",
     "paused": "已暂停",
@@ -101,7 +99,8 @@
     "cancel": "取消",
     "retry": "重试",
     "clearFinished": "清除已完成",
-    "remaining": "剩余 {{eta}}"
+    "remaining": "剩余 {{eta}}",
+    "dismiss": "移除此记录"
   },
   "addConn": {
     "title": "添加连接",

@@ -1,4 +1,5 @@
 import { ArrowUpDown, ChevronDown, Download, Pause, Play, RotateCcw, Upload, X } from "lucide-react";
+import { memo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { useErrorText } from "@/hooks/use-error-text";
@@ -6,10 +7,10 @@ import { formatEta, formatSize, formatSpeed } from "@/lib/format";
 import {
   cancelTransfer,
   clearFinishedTransfers,
-  listTransfers,
   pauseTransfer,
   resumeTransfer,
   retryTransfer,
+  type AppError,
 } from "@/lib/api";
 import {
   useTransferOrder,
@@ -24,7 +25,8 @@ const DONE_COLOR = "#4bb39a";
 
 function colorFor(status: LiveTransfer["status"]): string {
   if (status === "completed") return DONE_COLOR;
-  if (status === "canceled" || status === "failed") return "var(--muted2)";
+  if (status === "failed") return "var(--destructive)";
+  if (status === "canceled") return "var(--muted2)";
   return "var(--primary)";
 }
 
@@ -60,11 +62,18 @@ function RowButton({
  * `useTransferTask(taskId)` -- nothing else in the store -- so a progress
  * tick on task A never re-renders task B's row (or the panel header, or the
  * rest of the app). Renders nothing if the task has been dropped out from
- * under it (see `useTransferTask`'s doc comment). */
-function TransferRow({ taskId }: { taskId: string }) {
+ * under it (see `useTransferTask`'s doc comment).
+ *
+ * Wrapped in `memo` below: `TransferBar` recreates every `<TransferRow>`
+ * element on each progress tick (it re-renders at ~6.7Hz), and without this
+ * every row would re-render regardless of whether its own `taskId` prop
+ * actually changed. The prop is a single string, so the default shallow
+ * comparison is exactly what's needed. */
+function TransferRowImpl({ taskId }: { taskId: string }) {
   const { t } = useTranslation();
   const errorText = useErrorText();
   const task = useTransferTask(taskId);
+  const [actionError, setActionError] = useState<AppError | null>(null);
   if (!task) return null;
 
   const DirIcon = task.direction === "upload" ? Upload : Download;
@@ -97,14 +106,20 @@ function TransferRow({ taskId }: { taskId: string }) {
       subtitle = `${t("transfer.done")} · ${formatSize(task.total)}`;
   }
 
-  // Imperative IPC calls -- fire and forget. The resulting status change
-  // comes back through `transfer://state` and lands in this same row via
-  // the store, not through any local state here.
+  // Imperative IPC calls. A successful call's status change comes back
+  // through `transfer://state` and lands in this same row via the store, not
+  // through any local state here -- `actionError` only ever holds a
+  // *rejection*, cleared at the start of the next attempt.
+  function runAction(command: (id: string) => Promise<void>) {
+    setActionError(null);
+    command(taskId).catch((error: AppError) => setActionError(error));
+  }
+
   const actions = {
-    pause: () => void pauseTransfer(taskId),
-    resume: () => void resumeTransfer(taskId),
-    cancel: () => void cancelTransfer(taskId),
-    retry: () => void retryTransfer(taskId),
+    pause: () => runAction(pauseTransfer),
+    resume: () => runAction(resumeTransfer),
+    cancel: () => runAction(cancelTransfer),
+    retry: () => runAction(retryTransfer),
     dismiss: () => useTransferStore.getState().drop(taskId),
   };
 
@@ -139,6 +154,11 @@ function TransferRow({ taskId }: { taskId: string }) {
         >
           {subtitle}
         </div>
+        {actionError && (
+          <div role="alert" className="mt-0.5 truncate text-[10.5px] text-destructive">
+            {errorText(actionError)}
+          </div>
+        )}
       </div>
       <span className="flex shrink-0 items-center gap-0.5">
         {task.status === "running" && (
@@ -177,7 +197,7 @@ function TransferRow({ taskId }: { taskId: string }) {
           </>
         )}
         {(task.status === "completed" || task.status === "canceled") && (
-          <RowButton onClick={actions.dismiss} title={t("objects.close")}>
+          <RowButton onClick={actions.dismiss} title={t("transfer.dismiss")}>
             <X className="size-3.5" />
           </RowButton>
         )}
@@ -186,8 +206,11 @@ function TransferRow({ taskId }: { taskId: string }) {
   );
 }
 
+const TransferRow = memo(TransferRowImpl);
+
 export function TransferBar() {
   const { t } = useTranslation();
+  const errorText = useErrorText();
   // The point of this component: it subscribes to the summary, the id
   // order, and the panel's open flag -- never the `tasks` map itself.
   // Progress arrives at ~6.7Hz per running task; if this subscribed
@@ -196,14 +219,32 @@ export function TransferBar() {
   const summary = useTransferSummary();
   const order = useTransferOrder();
   const panelOpen = useTransferPanelOpen();
+  const [clearError, setClearError] = useState<AppError | null>(null);
 
   const summaryLine = summary.activeCount
     ? t("transfer.activeCount", { count: summary.activeCount })
     : t("transfer.idle");
 
-  async function handleClearFinished() {
-    await clearFinishedTransfers();
-    useTransferStore.getState().replaceAll(await listTransfers());
+  // Drops the known-finished tasks locally instead of re-fetching a
+  // `listTransfers()` snapshot and replacing the whole store with it. A
+  // `transfer://state` event can land on some *other* task while that round
+  // trip is in flight; replacing wholesale would clobber it with the older
+  // snapshot, and since `completed`/`canceled` are terminal the backend
+  // never re-emits, so the row would be stuck forever (the same hazard
+  // `useTransferEvents` already guards against for the initial snapshot).
+  // Dropping locally needs no snapshot at all: "finished" here means the
+  // exact same `completed`/`canceled` statuses the backend command clears,
+  // so the store already has everything needed to compute it.
+  function handleClearFinished() {
+    setClearError(null);
+    clearFinishedTransfers()
+      .then(() => {
+        const { tasks, drop } = useTransferStore.getState();
+        for (const [id, task] of Object.entries(tasks)) {
+          if (task.status === "completed" || task.status === "canceled") drop(id);
+        }
+      })
+      .catch((error: AppError) => setClearError(error));
   }
 
   return (
@@ -214,17 +255,28 @@ export function TransferBar() {
             <span className="text-xs font-semibold text-fg2">{t("transfer.title")}</span>
             <button
               type="button"
-              onClick={() => void handleClearFinished()}
+              onClick={handleClearFinished}
               className="cursor-pointer rounded-[7px] px-2 py-1 text-[11px] text-muted-foreground hover:bg-hover hover:text-fg2"
             >
               {t("transfer.clearFinished")}
             </button>
           </div>
-          <div className="px-2 pt-1.5 pb-2">
-            {order.map((id) => (
-              <TransferRow key={id} taskId={id} />
-            ))}
-          </div>
+          {clearError && (
+            <div role="alert" className="border-b border-border2 px-3.5 py-1.5 text-[11px] text-destructive">
+              {errorText(clearError)}
+            </div>
+          )}
+          {order.length === 0 ? (
+            <div className="px-3.5 py-6 text-center text-[12px] text-muted-foreground">
+              {t("transfer.idle")}
+            </div>
+          ) : (
+            <div className="px-2 pt-1.5 pb-2">
+              {order.map((id) => (
+                <TransferRow key={id} taskId={id} />
+              ))}
+            </div>
+          )}
         </div>
       )}
       <footer className="flex h-10 items-center gap-2.5 border-t border-border bg-titlebar px-3.5 text-xs text-muted-foreground">

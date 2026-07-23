@@ -246,7 +246,10 @@ export interface TransferTask {
   total: number;
   transferred: number;
   status: TransferStatus;
-  /** An `errors.*` i18n key when `status === "failed"`, else null. */
+  /** A bare `errors.*` code (e.g. `"network/timeout"`, no `errors.` prefix)
+   * when `status === "failed"`, else null -- `useErrorText` prepends the
+   * `errors.` namespace itself, so sending it pre-prefixed would double up
+   * and never match a dictionary entry. */
   error_code: string | null;
 }
 

@@ -89,8 +89,6 @@
     "idle": "No active transfers",
     "activeCount": "{{count}} transferring",
     "done": "Done",
-    "uploading": "Uploading",
-    "downloading": "Downloading",
     "toggle": "Transfers",
     "queued": "Queued",
     "paused": "Paused",
@@ -101,7 +99,8 @@
     "cancel": "Cancel",
     "retry": "Retry",
     "clearFinished": "Clear finished",
-    "remaining": "{{eta}} left"
+    "remaining": "{{eta}} left",
+    "dismiss": "Remove this entry"
   },
   "addConn": {
     "title": "Add Connection",
