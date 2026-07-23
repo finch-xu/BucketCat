@@ -6,18 +6,22 @@
 //! [`Provider`] trait and [`Bucket`] DTO in [`crate::provider`] keep every
 //! other caller (in particular `crate::commands`) free of an SDK dependency.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use aws_sdk_s3::config::{
     Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::primitives::DateTimeFormat;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use aws_sdk_s3::primitives::{ByteStream, Length};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 use crate::error::{AppError, AppResult};
-use crate::provider::{BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, Provider};
+use crate::provider::{
+    BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, Provider, UploadedPart,
+};
 use crate::store::Connection;
 
 /// Returns true only for real AWS endpoints (`*.amazonaws.com`, matched on
@@ -398,6 +402,44 @@ where
     mapped
 }
 
+/// Builds a [`AppError::FileIo`] naming the offending path. Factored out so
+/// every local-file failure in this module reports the same shape.
+fn file_io_error(path: &Path, message: impl std::fmt::Display) -> AppError {
+    AppError::FileIo {
+        path: path.display().to_string(),
+        message: message.to_string(),
+    }
+}
+
+/// Part numbers in the order `CompleteMultipartUpload` requires (ascending).
+/// Exposed for tests; the real sort happens on the parts themselves in
+/// [`S3Provider::multipart_complete`].
+pub fn sorted_part_numbers(parts: &[UploadedPart]) -> Vec<i32> {
+    let mut numbers: Vec<i32> = parts.iter().map(|p| p.number).collect();
+    numbers.sort_unstable();
+    numbers
+}
+
+/// Opens `path[offset .. offset + length]` as a request body.
+///
+/// `read_from().path(..)` (rather than `.file(..)`) is deliberate: it keeps
+/// the stream **rewindable**, so the SDK can replay the body during its own
+/// internal retries. Handing over an already-open `File` produces a
+/// one-shot stream, and a retried request would send an empty body.
+///
+/// `Length::Exact` also doubles as an integrity check: if the file shrank
+/// since the plan was computed, this fails here rather than silently
+/// uploading a short part.
+async fn body_range(path: &Path, offset: u64, length: u64) -> AppResult<ByteStream> {
+    ByteStream::read_from()
+        .path(path)
+        .offset(offset)
+        .length(Length::Exact(length))
+        .build()
+        .await
+        .map_err(|err| file_io_error(path, err))
+}
+
 #[async_trait]
 impl Provider for S3Provider {
     async fn test_connection(&self) -> AppResult<()> {
@@ -544,6 +586,123 @@ impl Provider for S3Provider {
             .bucket(bucket)
             .key(key)
             .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+        Ok(())
+    }
+
+    async fn put_object_from_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        path: &Path,
+        length: u64,
+    ) -> AppResult<()> {
+        let body = body_range(path, 0, length).await?;
+        self.client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body)
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+        Ok(())
+    }
+
+    async fn multipart_init(&self, bucket: &str, key: &str) -> AppResult<String> {
+        let out = self
+            .client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+
+        out.upload_id()
+            .map(str::to_string)
+            .ok_or_else(|| AppError::Internal {
+                message: "server accepted CreateMultipartUpload but returned no upload id"
+                    .to_string(),
+            })
+    }
+
+    async fn upload_part_from_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        path: &Path,
+        offset: u64,
+        length: u64,
+    ) -> AppResult<String> {
+        let body = body_range(path, offset, length).await?;
+        let out = self
+            .client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(body)
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+
+        out.e_tag()
+            .map(str::to_string)
+            .ok_or_else(|| AppError::Internal {
+                message: format!("server accepted part {part_number} but returned no ETag"),
+            })
+    }
+
+    async fn multipart_complete(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[UploadedPart],
+    ) -> AppResult<()> {
+        // Concurrency finishes parts out of order; S3 answers an unsorted
+        // list with InvalidPartOrder.
+        let mut ordered: Vec<&UploadedPart> = parts.iter().collect();
+        ordered.sort_unstable_by_key(|p| p.number);
+
+        let completed: Vec<CompletedPart> = ordered
+            .iter()
+            .map(|p| {
+                CompletedPart::builder()
+                    .part_number(p.number)
+                    .e_tag(&p.etag)
+                    .build()
+            })
+            .collect();
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+        Ok(())
+    }
+
+    async fn multipart_abort(&self, bucket: &str, key: &str, upload_id: &str) -> AppResult<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
             .send()
             .await
             .map_err(normalize_s3_error)?;
@@ -1191,5 +1350,55 @@ mod tests {
             app_err,
             Some(AppError::KeyNotFound { ref key }) if key == "docs/gone.md"
         ));
+    }
+
+    // --- transfer plane helpers (pure) --------------------------------------
+
+    #[test]
+    fn completed_parts_are_sorted_by_number() {
+        // S3 rejects CompleteMultipartUpload when the part list is not in
+        // ascending order (InvalidPartOrder). Parts finish out of order under
+        // concurrency, so the order must be restored before completing.
+        let parts = vec![
+            UploadedPart {
+                number: 3,
+                etag: "\"c\"".to_string(),
+                size: 10,
+            },
+            UploadedPart {
+                number: 1,
+                etag: "\"a\"".to_string(),
+                size: 10,
+            },
+            UploadedPart {
+                number: 2,
+                etag: "\"b\"".to_string(),
+                size: 10,
+            },
+        ];
+        assert_eq!(sorted_part_numbers(&parts), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn sorting_an_empty_or_single_part_list_is_a_no_op() {
+        assert!(sorted_part_numbers(&[]).is_empty());
+        assert_eq!(
+            sorted_part_numbers(&[UploadedPart {
+                number: 7,
+                etag: "\"g\"".to_string(),
+                size: 1
+            }]),
+            vec![7]
+        );
+    }
+
+    #[test]
+    fn file_io_error_carries_the_offending_path() {
+        let err = file_io_error(std::path::Path::new("/tmp/missing.bin"), "no such file");
+        assert_eq!(err.code(), "local/file-io");
+        assert_eq!(
+            err.params().get("path").map(String::as_str),
+            Some("/tmp/missing.bin")
+        );
     }
 }

@@ -42,6 +42,9 @@ pub enum AppError {
     #[error("failed to derive local store encryption key")]
     KeyDerivationFailed,
 
+    #[error("local file io error at {path}: {message}")]
+    FileIo { path: String, message: String },
+
     #[error("internal error: {message}")]
     Internal { message: String },
 }
@@ -61,6 +64,7 @@ impl AppError {
             AppError::StoreIo { .. } => "local/store-io",
             AppError::DecryptFailed => "local/decrypt-failed",
             AppError::KeyDerivationFailed => "local/key-derivation-failed",
+            AppError::FileIo { .. } => "local/file-io",
             AppError::Internal { .. } => "internal",
         }
     }
@@ -79,6 +83,10 @@ impl AppError {
                 p.insert("id".to_string(), id.clone());
             }
             AppError::StoreIo { message } | AppError::Internal { message } => {
+                p.insert("message".to_string(), message.clone());
+            }
+            AppError::FileIo { path, message } => {
+                p.insert("path".to_string(), path.clone());
                 p.insert("message".to_string(), message.clone());
             }
             _ => {}
@@ -298,5 +306,20 @@ mod tests {
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["code"], "storage/key-not-found");
         assert_eq!(v["params"]["key"], "docs/readme.md");
+    }
+
+    #[test]
+    fn file_io_maps_to_the_local_family_with_both_params() {
+        let err = AppError::FileIo {
+            path: "/tmp/a.bin".to_string(),
+            message: "permission denied".to_string(),
+        };
+        assert_eq!(err.code(), "local/file-io");
+        let p = err.params();
+        assert_eq!(p.get("path").map(String::as_str), Some("/tmp/a.bin"));
+        assert_eq!(
+            p.get("message").map(String::as_str),
+            Some("permission denied")
+        );
     }
 }

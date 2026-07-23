@@ -156,6 +156,7 @@
     "local/store-io": "Local connection store read/write failed",
     "local/decrypt-failed": "Failed to decrypt the local connection store",
     "local/key-derivation-failed": "Failed to derive the local store encryption key",
+    "local/file-io": "Cannot read local file {{path}}: {{message}}",
     "internal": "Something went wrong -- please try again"
   },
   "fileTypes": {

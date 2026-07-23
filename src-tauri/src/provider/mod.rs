@@ -75,6 +75,16 @@ pub struct BatchResult {
     pub failed: Vec<FailedKey>,
 }
 
+/// One part the server has accepted, as needed to complete (or resume) a
+/// multipart upload. `etag` is echoed back verbatim, quotes included -- S3
+/// compares it byte-for-byte on `CompleteMultipartUpload`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UploadedPart {
+    pub number: i32,
+    pub etag: String,
+    pub size: u64,
+}
+
 /// Admin-plane operations against an object storage backend.
 ///
 /// Implementations (currently just [`S3Provider`]) must not leak any
@@ -124,6 +134,56 @@ pub trait Provider {
     /// Creates a "folder": a zero-byte object at `prefix` normalized to
     /// end with exactly one `/`.
     async fn create_folder(&self, bucket: &str, prefix: &str) -> AppResult<()>;
+
+    // ---- Transfer plane (design §5) ----
+    //
+    // These take a local path plus a byte range rather than a request body,
+    // so no `aws_sdk_s3` / `aws_smithy_types` type crosses this boundary
+    // (design §3 principle 3). Building the body inside the implementation
+    // also lets it use a *rewindable* file stream, which the SDK needs in
+    // order to replay a request during its own internal retries.
+
+    /// Uploads the first `length` bytes of `path` as a single `PutObject`.
+    /// Used for files below the multipart threshold.
+    async fn put_object_from_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        path: &std::path::Path,
+        length: u64,
+    ) -> AppResult<()>;
+
+    /// Starts a multipart upload, returning the server's `upload_id`.
+    async fn multipart_init(&self, bucket: &str, key: &str) -> AppResult<String>;
+
+    /// Uploads `path[offset .. offset + length]` as part `part_number`
+    /// (1-based), returning the part's ETag.
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_part_from_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        path: &std::path::Path,
+        offset: u64,
+        length: u64,
+    ) -> AppResult<String>;
+
+    /// Assembles the object from `parts`. The implementation sorts by part
+    /// number before sending -- S3 rejects an out-of-order list.
+    async fn multipart_complete(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[UploadedPart],
+    ) -> AppResult<()>;
+
+    /// Discards a multipart upload and its server-side fragments. Called when
+    /// the user cancels (design §5) -- an abandoned upload otherwise keeps
+    /// billing for storage indefinitely.
+    async fn multipart_abort(&self, bucket: &str, key: &str, upload_id: &str) -> AppResult<()>;
 }
 
 #[cfg(test)]

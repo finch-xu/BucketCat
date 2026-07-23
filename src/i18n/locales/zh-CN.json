@@ -156,6 +156,7 @@
     "local/store-io": "本地连接存储读写失败",
     "local/decrypt-failed": "本地连接存储解密失败",
     "local/key-derivation-failed": "本地密钥派生失败",
+    "local/file-io": "无法读取本地文件 {{path}}：{{message}}",
     "internal": "发生未知错误，请稍后重试"
   },
   "fileTypes": {
