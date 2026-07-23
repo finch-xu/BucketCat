@@ -411,13 +411,17 @@ fn file_io_error(path: &Path, message: impl std::fmt::Display) -> AppError {
     }
 }
 
-/// Part numbers in the order `CompleteMultipartUpload` requires (ascending).
-/// Exposed for tests; the real sort happens on the parts themselves in
-/// [`S3Provider::multipart_complete`].
-pub fn sorted_part_numbers(parts: &[UploadedPart]) -> Vec<i32> {
-    let mut numbers: Vec<i32> = parts.iter().map(|p| p.number).collect();
-    numbers.sort_unstable();
-    numbers
+/// The parts in the order `CompleteMultipartUpload` requires (ascending by
+/// part number). Concurrency finishes parts out of order, and S3 answers an
+/// unsorted list with `InvalidPartOrder`.
+///
+/// Called by [`S3Provider::multipart_complete`] -- deliberately not a
+/// test-only mirror of that sort, so a regression in the ordering shows up
+/// in this module's unit tests rather than only against a live server.
+pub(crate) fn sorted_parts(parts: &[UploadedPart]) -> Vec<&UploadedPart> {
+    let mut ordered: Vec<&UploadedPart> = parts.iter().collect();
+    ordered.sort_unstable_by_key(|p| p.number);
+    ordered
 }
 
 /// Opens `path[offset .. offset + length]` as a request body.
@@ -666,10 +670,7 @@ impl Provider for S3Provider {
         upload_id: &str,
         parts: &[UploadedPart],
     ) -> AppResult<()> {
-        // Concurrency finishes parts out of order; S3 answers an unsorted
-        // list with InvalidPartOrder.
-        let mut ordered: Vec<&UploadedPart> = parts.iter().collect();
-        ordered.sort_unstable_by_key(|p| p.number);
+        let ordered = sorted_parts(parts);
 
         let completed: Vec<CompletedPart> = ordered
             .iter()
@@ -1376,20 +1377,22 @@ mod tests {
                 size: 10,
             },
         ];
-        assert_eq!(sorted_part_numbers(&parts), vec![1, 2, 3]);
+        let sorted = sorted_parts(&parts);
+        let numbers: Vec<i32> = sorted.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, vec![1, 2, 3]);
     }
 
     #[test]
     fn sorting_an_empty_or_single_part_list_is_a_no_op() {
-        assert!(sorted_part_numbers(&[]).is_empty());
-        assert_eq!(
-            sorted_part_numbers(&[UploadedPart {
-                number: 7,
-                etag: "\"g\"".to_string(),
-                size: 1
-            }]),
-            vec![7]
-        );
+        assert!(sorted_parts(&[]).is_empty());
+        let single = vec![UploadedPart {
+            number: 7,
+            etag: "\"g\"".to_string(),
+            size: 1,
+        }];
+        let sorted = sorted_parts(&single);
+        let numbers: Vec<i32> = sorted.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, vec![7]);
     }
 
     #[test]
