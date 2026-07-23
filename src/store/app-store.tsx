@@ -22,16 +22,13 @@ export type ViewMode = "list" | "grid";
  * cmd/ctrl-click toggles, shift-click extends a range from the anchor. */
 export type SelectMode = "single" | "toggle" | "range";
 
-export interface Transfer {
-  id: number;
-  name: string;
-  dir: "up" | "down";
-  pct: number;
-  size: string;
-  speed: string;
-  status: "active" | "done";
-}
-
+/** Transfer engine tuning knobs shown in the settings modal. NOT YET WIRED
+ * to the backend: `enqueue_uploads` and the transfer engine (see
+ * `src/lib/api.ts`) don't currently take a concurrency/part-size/verify/
+ * overwrite input, so changing these has no effect on real transfers yet.
+ * Kept here only so the settings modal has somewhere to read/write them
+ * without inventing a second half-wired store; a later milestone is
+ * expected to thread them through `enqueueUploads` and friends. */
 export interface TransferSettings {
   concurrency: number;
   partSizeMb: number;
@@ -88,12 +85,6 @@ interface AppStore {
   openDeleteObjects: (keys: string[]) => void;
   closeDeleteObjects: () => void;
 
-  transfers: Transfer[];
-  transferOpen: boolean;
-  toggleTransferPanel: () => void;
-  removeTransfer: (id: number) => void;
-  startMockUpload: () => void;
-
   showAdd: boolean;
   openAdd: () => void;
   closeAdd: () => void;
@@ -116,13 +107,6 @@ interface AppStore {
 
 const AppStoreContext = createContext<AppStore | null>(null);
 
-// Mock transfers stay until M4 replaces them with real engine events
-// (accepted residue, per the M2 final review ledger).
-const INITIAL_TRANSFERS: Transfer[] = [
-  { id: 1, name: "hero-banner.png", dir: "up", pct: 63, size: "1.4 MB", speed: "2.1 MB/s", status: "active" },
-  { id: 2, name: "backup-2026-07.tar.gz", dir: "down", pct: 100, size: "318 MB", speed: "", status: "done" },
-];
-
 export function AppStoreProvider({ children }: { children: ReactNode }) {
   const [themeMode, setThemeModeState] = useState<ThemeMode>(getThemeMode);
   const [dark, setDark] = useState(() => resolvesDark(getThemeMode()));
@@ -142,10 +126,6 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
   const [renameTarget, setRenameTarget] = useState<ObjectEntry | null>(null);
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [deleteTargets, setDeleteTargets] = useState<string[] | null>(null);
-
-  const [transfers, setTransfers] = useState<Transfer[]>(INITIAL_TRANSFERS);
-  const [transferOpen, setTransferOpen] = useState(false);
-  const [nextTid, setNextTid] = useState(3);
 
   const [showAdd, setShowAdd] = useState(false);
   const [editingConnection, setEditingConnection] = useState<ConnectionDto | null>(null);
@@ -176,21 +156,6 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
       }),
     [],
   );
-
-  useEffect(() => {
-    const hasActive = transfers.some((t) => t.status === "active");
-    if (!hasActive) return;
-    const iv = setInterval(() => {
-      setTransfers((prev) =>
-        prev.map((t) => {
-          if (t.status !== "active") return t;
-          const pct = t.pct + Math.round(5 + Math.random() * 8);
-          return pct >= 100 ? { ...t, pct: 100, status: "done", speed: "" } : { ...t, pct };
-        }),
-      );
-    }, 750);
-    return () => clearInterval(iv);
-  }, [transfers]);
 
   const clearSelection = useCallback(() => {
     setSelectedKeys([]);
@@ -292,26 +257,6 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
     deleteTargets,
     openDeleteObjects: (keys) => setDeleteTargets(keys),
     closeDeleteObjects: () => setDeleteTargets(null),
-    transfers,
-    transferOpen,
-    toggleTransferPanel: () => setTransferOpen((o) => !o),
-    removeTransfer: (id) => setTransfers((ts) => ts.filter((t) => t.id !== id)),
-    startMockUpload: () => {
-      setTransferOpen(true);
-      setTransfers((ts) => [
-        {
-          id: nextTid,
-          name: `new-upload-${nextTid}.dat`,
-          dir: "up",
-          pct: 2,
-          size: `${Math.floor(4 + Math.random() * 40)} MB`,
-          speed: "1.8 MB/s",
-          status: "active",
-        },
-        ...ts,
-      ]);
-      setNextTid((n) => n + 1);
-    },
     showAdd,
     openAdd: () => setShowAdd(true),
     closeAdd: () => setShowAdd(false),

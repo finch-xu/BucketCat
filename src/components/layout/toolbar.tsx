@@ -4,6 +4,7 @@ import {
   FolderPlus,
   LayoutGrid,
   List,
+  Loader2,
   RefreshCw,
   Search,
   Upload,
@@ -11,8 +12,10 @@ import {
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
+import { open } from "@tauri-apps/plugin-dialog";
 import { cn } from "@/lib/utils";
 import { objectsRootKey } from "@/hooks/use-objects";
+import { useStartUploads } from "@/hooks/use-start-uploads";
 import { useApp } from "@/store/app-store";
 
 export function Toolbar() {
@@ -26,13 +29,19 @@ export function Toolbar() {
     setSearch,
     view,
     setView,
-    startMockUpload,
     openNewFolder,
   } = useApp();
   const queryClient = useQueryClient();
+  const { startUploads, guardReady, dialog } = useStartUploads();
 
   const noBucket = activeBucket === "";
   const crumbs = [activeBucket, ...path];
+
+  async function handleUpload() {
+    const picked = await open({ multiple: true, title: t("upload.choose") });
+    if (!picked) return;
+    startUploads(Array.isArray(picked) ? picked : [picked]);
+  }
 
   return (
     <div className="flex h-[52px] shrink-0 items-center gap-2.5 border-b border-border bg-background px-4">
@@ -130,12 +139,25 @@ export function Toolbar() {
       </button>
       <button
         type="button"
-        onClick={startMockUpload}
-        className="inline-flex h-8 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground shadow-[0_2px_6px_-1px_var(--primary-soft)] hover:bg-primary-strong"
+        // Disabled for no-bucket (required) and additionally while the
+        // current folder's collision guard hasn't loaded yet -- clicking
+        // through that window would otherwise look like the button just
+        // did nothing (`useStartUploads` refuses silently on purpose; see
+        // its `guardReady` doc comment). The title makes the second reason
+        // legible instead of just inert.
+        disabled={noBucket || !guardReady}
+        title={!noBucket && !guardReady ? t("objects.checkingNames") : undefined}
+        onClick={() => void handleUpload()}
+        className="inline-flex h-8 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground shadow-[0_2px_6px_-1px_var(--primary-soft)] hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
       >
-        <Upload className="size-[15px]" />
+        {!noBucket && !guardReady ? (
+          <Loader2 className="size-[15px] animate-spin" />
+        ) : (
+          <Upload className="size-[15px]" />
+        )}
         {t("main.upload")}
       </button>
+      {dialog}
     </div>
   );
 }

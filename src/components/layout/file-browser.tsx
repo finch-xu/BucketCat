@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, type ComponentType, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
 import {
   AlertTriangle,
   FolderOpen,
@@ -6,15 +6,18 @@ import {
   MousePointerClick,
   Pencil,
   Trash2,
+  UploadCloud,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { cn } from "@/lib/utils";
 import type { ObjectEntry } from "@/lib/api";
 import { fileMeta } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
 import { useBrowse, type BrowseQuery } from "@/hooks/use-browse";
 import { useErrorText } from "@/hooks/use-error-text";
+import { useStartUploads } from "@/hooks/use-start-uploads";
 import { useApp, type SelectMode } from "@/store/app-store";
 
 const ROW_HEIGHT = 44;
@@ -310,6 +313,26 @@ export function FileBrowser() {
   const errorText = useErrorText();
   const { activeBucket, path, view } = useApp();
   const { query, entries, searching } = useBrowse();
+  const { startUploads, guardReady, dialog } = useStartUploads();
+  const [dragging, setDragging] = useState(false);
+
+  // Tauri's own drag-drop event, not HTML5 dragover/drop: a `File` handed to
+  // the WebView by an HTML5 drop carries no filesystem path, and the Rust
+  // side needs a real path to stream the upload from.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+        if (event.payload.type === "over") setDragging(true);
+        else if (event.payload.type === "drop") {
+          setDragging(false);
+          if (activeBucket) startUploads(event.payload.paths);
+        } else setDragging(false);
+      });
+    })();
+    return () => unlisten?.();
+  }, [activeBucket, startUploads]);
+
   // Computed once here and passed down instead of recomputed identically in
   // both ListView and GridView.
   const orderedFileKeys = useMemo(
@@ -317,50 +340,37 @@ export function FileBrowser() {
     [entries],
   );
 
+  let body: ReactNode;
   // Empty-state semantics (M2 carried finding): no bucket selected is a
   // *placeholder*, never "this bucket is empty".
   if (!activeBucket) {
-    return (
-      <div className="flex min-w-0 flex-1 flex-col">
-        <CenterState
-          icon={MousePointerClick}
-          title={t("main.selectBucketTitle")}
-          hint={t("main.selectBucketHint")}
-        />
-      </div>
+    body = (
+      <CenterState
+        icon={MousePointerClick}
+        title={t("main.selectBucketTitle")}
+        hint={t("main.selectBucketHint")}
+      />
     );
-  }
-
-  if (query.isPending) {
-    return (
-      <div className="flex min-w-0 flex-1 flex-col">
-        <CenterState icon={Loader2} spin title={t("main.loadingList")} hint="" />
-      </div>
+  } else if (query.isPending) {
+    body = <CenterState icon={Loader2} spin title={t("main.loadingList")} hint="" />;
+  } else if (query.isError) {
+    body = (
+      <CenterState
+        icon={AlertTriangle}
+        title={t("main.loadFailed")}
+        hint={errorText(query.error)}
+        action={
+          <button
+            type="button"
+            onClick={() => query.refetch()}
+            className="mt-2 inline-flex h-8 cursor-pointer items-center rounded-[9px] border border-border bg-background px-3.5 text-[12.5px] font-medium text-fg2 hover:bg-hover"
+          >
+            {t("main.retry")}
+          </button>
+        }
+      />
     );
-  }
-
-  if (query.isError) {
-    return (
-      <div className="flex min-w-0 flex-1 flex-col">
-        <CenterState
-          icon={AlertTriangle}
-          title={t("main.loadFailed")}
-          hint={errorText(query.error)}
-          action={
-            <button
-              type="button"
-              onClick={() => query.refetch()}
-              className="mt-2 inline-flex h-8 cursor-pointer items-center rounded-[9px] border border-border bg-background px-3.5 text-[12.5px] font-medium text-fg2 hover:bg-hover"
-            >
-              {t("main.retry")}
-            </button>
-          }
-        />
-      </div>
-    );
-  }
-
-  if (entries.length === 0) {
+  } else if (entries.length === 0) {
     // `query.isPlaceholderData` (set by `useObjects`'s `keepPreviousData`)
     // means `entries` is still the *previous* location's listing, kept on
     // screen while this one's real page loads. An empty previous listing
@@ -370,35 +380,43 @@ export function FileBrowser() {
     // folder is empty" over whatever the new location actually turns out
     // to hold.
     if (query.isPlaceholderData) {
-      return (
-        <div className="flex min-w-0 flex-1 flex-col">
-          <CenterState icon={Loader2} spin title={t("main.loadingList")} hint="" />
-        </div>
+      body = <CenterState icon={Loader2} spin title={t("main.loadingList")} hint="" />;
+    } else if (searching) {
+      body = <CenterState icon={FolderOpen} title={t("main.noMatchTitle")} hint={t("main.noMatchHint")} />;
+    } else {
+      body = (
+        <CenterState
+          icon={FolderOpen}
+          title={path.length === 0 ? t("main.emptyTitle") : t("main.emptyFolderTitle")}
+          hint={t("main.emptyHint")}
+        />
       );
     }
-    return (
-      <div className="flex min-w-0 flex-1 flex-col">
-        {searching ? (
-          <CenterState icon={FolderOpen} title={t("main.noMatchTitle")} hint={t("main.noMatchHint")} />
+  } else {
+    body = (
+      <>
+        {view === "list" ? (
+          <ListView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
         ) : (
-          <CenterState
-            icon={FolderOpen}
-            title={path.length === 0 ? t("main.emptyTitle") : t("main.emptyFolderTitle")}
-            hint={t("main.emptyHint")}
-          />
+          <GridView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
         )}
-      </div>
+        <SelectionBar />
+      </>
     );
   }
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
-      {view === "list" ? (
-        <ListView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
-      ) : (
-        <GridView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
+    <div className="relative flex min-w-0 flex-1 flex-col">
+      {body}
+      {dragging && activeBucket && (
+        <div className="pointer-events-none absolute inset-2 z-20 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-primary bg-primary-soft text-primary">
+          <UploadCloud className="size-8" />
+          <span className="text-[13.5px] font-semibold">
+            {guardReady ? t("upload.dropHint") : t("objects.checkingNames")}
+          </span>
+        </div>
       )}
-      <SelectionBar />
+      {dialog}
     </div>
   );
 }
