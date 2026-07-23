@@ -69,7 +69,7 @@
 //! `ProvideErrorMetadata` and maps known codes directly. This test now
 //! asserts the fixed, correct behavior -- see its doc comment.
 
-use bucketcat_lib::provider::{from_connection, Provider};
+use bucketcat_lib::provider::{from_connection, Provider, ProviderHub};
 use bucketcat_lib::store::{Connection, SecureStore};
 
 // --- M3 object data-plane helpers ------------------------------------------
@@ -651,4 +651,98 @@ async fn created_folder_is_visible_as_prefix_and_empty_inside() {
     );
 
     drain_and_delete_bucket(&client, &provider, &bucket).await;
+}
+
+// --- ProviderHub against live MinIO (review Finding 2) ----------------------
+//
+// Every test above drives `from_connection`/`Provider` directly, never
+// `ProviderHub` -- so none of them cover "a client obtained through
+// `ProviderHub::provider()` performs a real S3 operation correctly", nor
+// that `ProviderHub::mutate`'s cache invalidation genuinely takes effect
+// against a live server rather than only inside the in-memory map. This
+// test closes that gap: it builds a `ProviderHub` over a `SecureStore` in
+// its own `tempfile::tempdir()` (so it never touches a real config
+// directory or collides with another test's connections), persists a
+// connection via `mutate`, exercises the cached client with a real
+// `list_buckets`, confirms a second lookup is served from cache
+// (`Arc::ptr_eq`) and still works, then rotates the secret to a wrong value
+// and confirms the cache was actually invalidated: the next lookup returns
+// a *different* client, and that client's `list_buckets` fails against the
+// real server with the same `auth/invalid-credentials` family
+// `wrong_secret_surfaces_expected_error_family` documents above.
+#[tokio::test]
+#[ignore]
+async fn provider_hub_round_trip_against_live_minio() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hub = ProviderHub::new(SecureStore {
+        path: dir.path().join("connections.enc"),
+    });
+    let id = "e2e-hub-minio".to_string();
+
+    hub.mutate(|list| {
+        list.push(Connection {
+            id: id.clone(),
+            ..minio_connection("minioadmin")
+        });
+        Ok(())
+    })
+    .await
+    .expect("mutate should persist the connection");
+
+    // First lookup: a cache miss, so this builds a real client. Exercise it
+    // against the live server rather than just checking it was returned.
+    let provider = hub
+        .provider(&id)
+        .await
+        .expect("provider() should build a client for the just-persisted connection");
+    provider
+        .list_buckets()
+        .await
+        .expect("list_buckets through a hub-provided client should succeed against live MinIO");
+
+    // Second lookup: must be served from cache (no rebuild), and the cached
+    // client must still work.
+    let provider_again = hub
+        .provider(&id)
+        .await
+        .expect("second provider() lookup should succeed");
+    assert!(
+        std::sync::Arc::ptr_eq(&provider, &provider_again),
+        "the second provider() lookup must reuse the cached client, not rebuild it"
+    );
+    provider_again
+        .list_buckets()
+        .await
+        .expect("the cached client must still work against live MinIO");
+
+    // Rotate the secret to a wrong value: `mutate` must invalidate the
+    // cache, and the *next* `provider()` call's client must fail against the
+    // real server -- proving invalidation genuinely takes effect, not just
+    // that the map entry changed.
+    hub.mutate(|list| {
+        list[0].secret_access_key = "definitely-the-wrong-secret".to_string();
+        Ok(())
+    })
+    .await
+    .expect("mutate should persist the rotated secret");
+
+    let rotated_provider = hub
+        .provider(&id)
+        .await
+        .expect("provider() should rebuild a client after invalidation");
+    assert!(
+        !std::sync::Arc::ptr_eq(&provider, &rotated_provider),
+        "invalidation must have produced a new client, not reused the pre-rotation one"
+    );
+    let err = rotated_provider
+        .list_buckets()
+        .await
+        .expect_err("list_buckets with a rotated-to-wrong secret must fail against live MinIO");
+    let code = err.code();
+    assert_eq!(
+        code, "auth/invalid-credentials",
+        "expected the rotated-to-wrong secret to surface `auth/invalid-credentials` \
+         against live MinIO (see `wrong_secret_surfaces_expected_error_family` above for \
+         why) -- got `{code}` instead"
+    );
 }

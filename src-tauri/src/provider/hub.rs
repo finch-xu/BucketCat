@@ -28,6 +28,23 @@
 //! hazard for no benefit, and holding either across a network `.await` is
 //! forbidden outright (the discipline M2 Task 5 established).
 //!
+//! That three-phase shape leaves a window with **no lock held** between
+//! "load the connection snapshot" and "take the cache lock to insert". If a
+//! full [`ProviderHub::mutate`] cycle (load -> modify -> save ->
+//! `invalidate_all`) completes entirely inside that window, an unguarded
+//! insert would repopulate the cache `invalidate_all` just cleared with a
+//! client built from the *pre-mutation* snapshot -- and, unlike an in-flight
+//! upload finishing on the client it started with (see below), that stale
+//! client would then sit in the cache serving every *subsequent* caller
+//! until the next mutation. An `epoch: AtomicU64` closes this without ever
+//! holding both locks at once: `invalidate_all` bumps it in the same
+//! critical section as `clear()` (both under the `clients` lock, so
+//! "cleared" and "epoch moved" can never be observed apart), and `provider`
+//! reads the epoch before loading the snapshot and again right before
+//! inserting. A mismatch means a mutation landed mid-lookup, so the freshly
+//! built client is discarded and the lookup retried (bounded -- see
+//! [`ProviderHub::provider`]) rather than ever being cached.
+//!
 //! ## Invalidation is blunt on purpose
 //!
 //! Any successful [`ProviderHub::mutate`] clears the *entire* cache rather
@@ -37,9 +54,13 @@
 //! edit that changes path-style addressing, not just the key). Clients
 //! already handed out stay alive in their callers' `Arc`s -- an in-flight
 //! upload is not interrupted by an unrelated edit, it just finishes on the
-//! client it started with.
+//! client it started with. That is the one and only accepted staleness: the
+//! epoch guard above exists precisely so "blunt invalidation" can't be
+//! quietly undone by a *new* lookup re-caching pre-mutation data moments
+//! after the clear.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -48,9 +69,22 @@ use crate::error::{AppError, AppResult};
 use crate::provider::s3::{from_connection, S3Provider};
 use crate::store::{Connection, SecureStore};
 
+/// Bounds the epoch-guard retry loop in [`ProviderHub::provider`]. A handful
+/// of attempts is plenty in practice -- connection edits happen at human
+/// speed, so losing the race even once, let alone three times running, needs
+/// sustained concurrent mutation pressure that real usage doesn't produce.
+const MAX_PROVIDER_ATTEMPTS: u32 = 3;
+
 pub struct ProviderHub {
     store: Mutex<SecureStore>,
     clients: Mutex<HashMap<String, Arc<S3Provider>>>,
+    /// Bumped under the `clients` lock every time [`ProviderHub::invalidate_all`]
+    /// clears the map. [`ProviderHub::provider`] reads this before loading a
+    /// connection snapshot and again right before caching the client it
+    /// built from that snapshot; a mismatch means a `mutate()` completed in
+    /// between, so the snapshot may be stale and the build is discarded
+    /// instead of cached. See the module docs' "Lock discipline" section.
+    epoch: AtomicU64,
 }
 
 impl ProviderHub {
@@ -58,6 +92,7 @@ impl ProviderHub {
         Self {
             store: Mutex::new(store),
             clients: Mutex::new(HashMap::new()),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -87,44 +122,115 @@ impl ProviderHub {
     }
 
     /// Drops every cached client. See the module docs on why this is blunt.
+    ///
+    /// Bumps `epoch` in the *same* critical section as `clear()` -- both
+    /// under the `clients` lock -- unconditionally, even if the cache
+    /// happened to already be empty. What matters for the epoch guard in
+    /// [`ProviderHub::provider`] is not whether anything was actually
+    /// dropped here, but that a mutation completed between some caller's
+    /// snapshot load and its insert attempt; the guard needs to see that
+    /// every time, not just when there was something to clear.
     pub async fn invalidate_all(&self) {
         let mut clients = self.clients.lock().await;
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         if !clients.is_empty() {
             tracing::debug!(dropped = clients.len(), "provider cache invalidated");
             clients.clear();
         }
     }
 
-    /// Returns the cached client for `connection_id`, building (and caching)
-    /// it on a miss. Fails with `storage/connection-not-found` when no saved
-    /// connection has that id.
-    pub async fn provider(&self, connection_id: &str) -> AppResult<Arc<S3Provider>> {
-        if let Some(hit) = self.clients.lock().await.get(connection_id) {
-            return Ok(Arc::clone(hit));
-        }
-
-        let connections = self.connections().await?;
-        let connection = connections
-            .into_iter()
-            .find(|c| c.id == connection_id)
-            .ok_or_else(|| AppError::ConnectionNotFound {
-                id: connection_id.to_string(),
-            })?;
-
-        // Built *before* taking the cache lock: `from_connection` is pure
-        // configuration work, but keeping it outside the critical section
-        // keeps the lock's held time obviously bounded, and a build failure
-        // (e.g. an empty endpoint) must not leave a poisoned entry behind.
-        let built = Arc::new(from_connection(&connection)?);
-
+    /// Inserts `built` under `connection_id` iff the epoch hasn't moved
+    /// since `epoch_before` was read -- i.e. no [`ProviderHub::mutate`]
+    /// completed its `invalidate_all` in between. Returns `None` when the
+    /// epoch moved, refusing the insert rather than caching a client that
+    /// may have been built from a now-superseded snapshot.
+    ///
+    /// On a match, still re-checks the map itself: a concurrent caller may
+    /// have inserted (at the same, current epoch) while this caller was
+    /// building. Reusing theirs keeps `Arc::ptr_eq` stable for callers.
+    async fn insert_if_epoch_matches(
+        &self,
+        connection_id: &str,
+        epoch_before: u64,
+        built: Arc<S3Provider>,
+    ) -> Option<Arc<S3Provider>> {
         let mut clients = self.clients.lock().await;
-        // Double-check: a concurrent caller may have inserted while we were
-        // loading. Reusing theirs keeps `Arc::ptr_eq` stable for callers.
+        if self.epoch.load(Ordering::SeqCst) != epoch_before {
+            return None;
+        }
         let entry = clients.entry(connection_id.to_string()).or_insert_with(|| {
             tracing::debug!(connection_id, "provider client built");
             built
         });
-        Ok(Arc::clone(entry))
+        Some(Arc::clone(entry))
+    }
+
+    /// Returns the cached client for `connection_id`, building (and caching)
+    /// it on a miss. Fails with `storage/connection-not-found` when no saved
+    /// connection has that id.
+    ///
+    /// Guarded against the race described in the module docs: up to
+    /// [`MAX_PROVIDER_ATTEMPTS`] times, this reads the epoch, loads a
+    /// snapshot, builds a client, then only caches it if the epoch is still
+    /// what it was before the snapshot load. If a concurrent `mutate()`
+    /// completes in between, the epoch moved, the build is discarded, and
+    /// the whole lookup retries against the now-current state. On the rare
+    /// exhaustion of all attempts (sustained concurrent mutation), the last
+    /// freshly built client is returned uncached rather than looping
+    /// forever or ever caching a possibly-stale build.
+    pub async fn provider(&self, connection_id: &str) -> AppResult<Arc<S3Provider>> {
+        let mut last_built: Option<Arc<S3Provider>> = None;
+
+        for _ in 0..MAX_PROVIDER_ATTEMPTS {
+            if let Some(hit) = self.clients.lock().await.get(connection_id) {
+                return Ok(Arc::clone(hit));
+            }
+
+            // Read *before* loading the snapshot below: if `invalidate_all`
+            // bumps this before we reach `insert_if_epoch_matches`, the
+            // snapshot may already be stale by the time we'd otherwise cache
+            // a client built from it.
+            let epoch_before = self.epoch.load(Ordering::SeqCst);
+
+            let connections = self.connections().await?;
+            let connection = connections
+                .into_iter()
+                .find(|c| c.id == connection_id)
+                .ok_or_else(|| AppError::ConnectionNotFound {
+                    id: connection_id.to_string(),
+                })?;
+
+            // Built *before* taking the cache lock: `from_connection` is pure
+            // configuration work, but keeping it outside the critical section
+            // keeps the lock's held time obviously bounded, and a build failure
+            // (e.g. an empty endpoint) must not leave a poisoned entry behind.
+            let built = Arc::new(from_connection(&connection)?);
+
+            match self
+                .insert_if_epoch_matches(connection_id, epoch_before, Arc::clone(&built))
+                .await
+            {
+                Some(cached) => return Ok(cached),
+                None => {
+                    // A mutate() completed its invalidate_all while we were
+                    // loading the snapshot / building the client above:
+                    // `built` may already sign with pre-mutation
+                    // credentials. Don't cache it -- retry the whole lookup
+                    // against the now-current epoch instead.
+                    last_built = Some(built);
+                }
+            }
+        }
+
+        tracing::debug!(
+            connection_id,
+            attempts = MAX_PROVIDER_ATTEMPTS,
+            "provider lookup hit sustained mutation pressure; returning an uncached client"
+        );
+        Ok(last_built.expect(
+            "MAX_PROVIDER_ATTEMPTS >= 1, and every iteration that doesn't return early \
+             (cache hit or epoch match) sets last_built before the next one runs",
+        ))
     }
 }
 
@@ -262,5 +368,140 @@ mod tests {
         .await
         .unwrap();
         assert!(hub.provider("c1").await.is_ok());
+    }
+
+    // --- Finding 1: the stale-credential repopulation race ------------------
+    //
+    // Two tests, deliberately different in kind:
+    //
+    // - `stale_snapshot_insert_is_rejected_after_a_racing_mutate_completes`
+    //   deterministically drives the *exact* sequence the finding describes
+    //   by calling the same private `insert_if_epoch_matches` that
+    //   `provider()` uses, with a snapshot and `epoch_before` captured
+    //   before an intervening `mutate()` actually runs. This is the one that
+    //   unconditionally proves the guard: it doesn't depend on scheduling
+    //   luck, so it can't fail to hit the window.
+    // - `concurrent_mutate_and_provider_lookup_never_leave_a_stale_client_cached`
+    //   is a best-effort companion that races the real public `provider()`
+    //   against `mutate()` on a genuine multi-threaded runtime, many rounds.
+    //   It exercises actual OS-thread interleaving rather than a
+    //   hand-constructed one, but -- being real scheduling -- it cannot
+    //   guarantee landing in a multi-microsecond window on any given run.
+    //   Its assertion still holds unconditionally for correct code (so it
+    //   won't flake on a pass), but a pass on its own doesn't prove the race
+    //   was ever actually exercised in that particular run. See the module
+    //   docs' "Lock discipline" section for the mechanism both tests target.
+
+    #[tokio::test]
+    async fn stale_snapshot_insert_is_rejected_after_a_racing_mutate_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub_with(&dir);
+        hub.mutate(|list| {
+            list.push(sample("c1", "s1"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Phase 1 + 2, exactly as `provider()` performs them: cache miss,
+        // then read the epoch, then load the (soon to be stale) snapshot.
+        assert!(hub.clients.lock().await.get("c1").is_none());
+        let epoch_before = hub.epoch.load(Ordering::SeqCst);
+        let stale_connection = hub
+            .connections()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == "c1")
+            .unwrap();
+        assert_eq!(stale_connection.secret_access_key, "s1");
+
+        // The race window: a full `mutate()` cycle completes entirely here,
+        // rotating the secret and -- inside `invalidate_all` -- bumping the
+        // epoch and clearing the cache under the same lock.
+        hub.mutate(|list| {
+            list[0].secret_access_key = "s2".to_string();
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Phase 3: build from the now-stale snapshot (mirrors `provider()`
+        // building outside the cache lock), then attempt the same guarded
+        // insert `provider()` would.
+        let stale_built = Arc::new(from_connection(&stale_connection).unwrap());
+        let result = hub
+            .insert_if_epoch_matches("c1", epoch_before, Arc::clone(&stale_built))
+            .await;
+
+        assert!(
+            result.is_none(),
+            "a client built from a pre-mutation snapshot must be rejected once \
+             the epoch has moved, not cached"
+        );
+        assert!(
+            hub.clients.lock().await.get("c1").is_none(),
+            "the rejected stale client must not have been inserted into the cache"
+        );
+
+        // The real, public `provider()` must still work afterwards, caching
+        // a fresh client rather than ever surfacing the stale one.
+        let fresh = hub.provider("c1").await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&fresh, &stale_built),
+            "provider() must never return the stale pre-mutation client"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mutate_and_provider_lookup_never_leave_a_stale_client_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Arc::new(hub_with(&dir));
+        hub.mutate(|list| {
+            list.push(sample("c1", "s0"));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let mut previous = hub.provider("c1").await.unwrap();
+
+        for round in 0..200 {
+            let next_secret = format!("s{}", round + 1);
+            let hub_a = Arc::clone(&hub);
+            let hub_b = Arc::clone(&hub);
+
+            // Spawned (not just `.await`ed inline) so the two can genuinely
+            // run on different worker threads at the same time, not merely
+            // interleave cooperatively on one.
+            let lookup = tokio::spawn(async move { hub_a.provider("c1").await.unwrap() });
+            let mutation = tokio::spawn(async move {
+                hub_b
+                    .mutate(move |list| {
+                        list[0].secret_access_key = next_secret;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
+            let (raced, mutated) = tokio::join!(lookup, mutation);
+            raced.unwrap();
+            mutated.unwrap();
+
+            // By the time `join!` resolves, this round's `mutate()` has
+            // unconditionally completed (its future only resolves after
+            // `invalidate_all` runs). So a fresh, quiescent lookup now must
+            // never still be serving whatever was cached before this round
+            // started -- if it did, the cache was repopulated with a client
+            // built before this round's credential change, which is exactly
+            // the bug Finding 1 describes.
+            let after = hub.provider("c1").await.unwrap();
+            assert!(
+                !Arc::ptr_eq(&previous, &after),
+                "round {round}: cache still serves a client cached before this \
+                 round's mutate() completed -- stale-credential repopulation"
+            );
+            previous = after;
+        }
     }
 }

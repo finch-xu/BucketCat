@@ -2,25 +2,31 @@
 //!
 //! ## App state / IO model
 //!
-//! [`AppState`] wraps the single [`SecureStore`] behind a `tokio::sync::Mutex`
-//! and holds no in-memory cache of the connection list: every mutating
-//! command does a full load-modify-save round trip, and every read-only
-//! command does a full load. This is a deliberate simplicity-over-caching
-//! choice -- the connection list is expected to hold at most a few dozen
-//! small records (a saved profile is a few hundred bytes of JSON before
-//! encryption), so re-reading and re-writing the whole file on every call is
-//! a sub-millisecond cost that's imperceptible to a human clicking a button,
-//! and it sidesteps an entire class of cache-invalidation bugs (stale state
-//! across two windows, a crash between "mutate in memory" and "persist",
-//! ...) that a longer-lived cache would have to get right for no real
-//! benefit at this data size.
+//! [`AppState`] holds an `Arc<ProviderHub>` -- see `provider::hub`'s module
+//! docs for the hub's own internals. Every mutating command still does a
+//! full load-modify-save round trip through the hub's `store` lock (no
+//! in-memory cache of the *connection list* exists, or is planned: it's
+//! expected to hold at most a few dozen small records -- a saved profile is
+//! a few hundred bytes of JSON before encryption -- so re-reading and
+//! re-writing the whole file on every call is a sub-millisecond cost that's
+//! imperceptible to a human clicking a button, and it sidesteps an entire
+//! class of cache-invalidation bugs a longer-lived cache would have to get
+//! right for no real benefit at this data size). What the hub *does* cache
+//! is the built `aws_sdk_s3` client per connection id: a command that hits
+//! that cache does zero store I/O and zero client rebuilding, only handing
+//! back a clone of an `Arc`. Any successful mutation invalidates the whole
+//! client cache (see `provider::hub` for why that's deliberately blunt, and
+//! for the epoch guard that keeps a race from repopulating it with a client
+//! built from stale credentials).
 //!
 //! ## Blocking IO inside async commands
 //!
 //! [`SecureStore::load`]/[`SecureStore::save`] are synchronous `std::fs`
-//! calls; this module calls them directly from `async fn` command bodies
-//! instead of routing them through `tokio::task::spawn_blocking`. That's a
-//! deliberate choice, not an oversight: the store file is tiny (see above),
+//! calls. `ProviderHub::connections`/`mutate` call them directly (holding
+//! only the hub's `store` lock, never across a network `.await`), and this
+//! module's `async fn` command bodies call *those* directly in turn --
+//! neither layer routes the file IO through `tokio::task::spawn_blocking`.
+//! That's a deliberate choice, not an oversight: the store file is tiny (see above),
 //! so the *actual* blocking time per call is on the order of tens of
 //! microseconds -- reading/writing a few hundred bytes to a local disk (or
 //! OS page cache) is not in the same universe as the multi-millisecond

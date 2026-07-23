@@ -1,7 +1,11 @@
 //! Object browse/mutate commands: paged listing, batch delete, rename,
 //! folder creation. Thin layers over [`crate::provider::Provider`] — see
 //! `connection.rs`'s module docs for the state/IO model every command here
-//! shares (full store load per call, lock scoped away from network IO).
+//! shares. In particular: every command below goes through
+//! `state.hub().provider(&connection_id)`, so a cache hit costs zero store
+//! IO and zero client rebuilding (just an `Arc` clone) — only a cache miss
+//! (first use of a connection, or the first lookup after an edit
+//! invalidated the cache) pays for a store load and a client build.
 
 use tauri::State;
 
