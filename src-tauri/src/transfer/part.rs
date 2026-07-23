@@ -40,20 +40,29 @@ pub enum UploadPlan {
     },
 }
 
-/// `max(8MB, ceil(total / 1000))`, clamped to S3's 5GB per-part ceiling.
+/// Compute the size of each part in a multipart upload.
 ///
-/// The clamp only ever binds above 5TB-scale objects (5TB/1000 = 5.12GB), i.e.
-/// right at S3's own max object size -- but without it the plan for such a
-/// file would be rejected by the server rather than by us.
-#[allow(clippy::manual_clamp)]
+/// Returns `max(8MB, ceil(total / 1000))`, clamped to S3's 5GB per-part ceiling.
+///
+/// The ceiling only binds above roughly 5TB-scale objects (5TB/1000 ≈ 5.12GB),
+/// right at S3's own 5TB maximum object size. Without it, such a file would be
+/// rejected by the server with EntityTooLarge rather than rejected by us during
+/// planning.
+///
+/// `clamp` is used instead of `.max().min()` because it panics if the two
+/// constants are ever set in the wrong relative order, whereas the chain would
+/// silently misbehave.
 pub fn part_size_for(total: u64) -> u64 {
     total
         .div_ceil(PART_DIVISOR)
-        .max(MIN_PART_SIZE)
-        .min(MAX_PART_SIZE)
+        .clamp(MIN_PART_SIZE, MAX_PART_SIZE)
 }
 
 /// Splits `total` bytes into an upload plan.
+///
+/// The returned plan's part count stays within [`MAX_PARTS`] for `total` up to
+/// approximately 48TB, far beyond S3's 5TB maximum object size. Callers uploading
+/// real files to S3 are always within this range.
 pub fn plan_upload(total: u64) -> UploadPlan {
     if total < MULTIPART_THRESHOLD {
         return UploadPlan::Single { length: total };
