@@ -5,5 +5,9 @@
 //! run entirely outside the IPC layer (design §3 principle 4).
 
 pub mod model;
+pub mod part;
+pub mod retry;
 
 pub use model::{next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto};
+pub use part::{plan_upload, PartSpec, UploadPlan};
+pub use retry::{backoff_delay, is_retryable, MAX_RETRIES};
