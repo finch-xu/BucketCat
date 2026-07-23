@@ -6,28 +6,14 @@
 use tauri::State;
 
 use crate::commands::connection::AppState;
-use crate::error::{AppError, AppResult};
-use crate::provider::{from_connection, BatchResult, ListPage, Provider};
-use crate::store::Connection;
+use crate::error::AppResult;
+use crate::provider::{BatchResult, ListPage, Provider};
 
 /// Objects (files + folders combined) per `list_objects` page. One page is
 /// one ListObjectsV2 request; the frontend's infinite scroll requests the
 /// next page via the returned `next_token`. 200 keeps a page render-light
 /// while needing only ~5 requests per 1000 objects.
 const LIST_PAGE_SIZE: i32 = 200;
-
-/// Finds the saved connection with `connection_id`, or fails with
-/// `storage/connection-not-found`.
-async fn connection_by_id(
-    state: &State<'_, AppState>,
-    connection_id: String,
-) -> AppResult<Connection> {
-    let connections = state.load_connections().await?;
-    connections
-        .into_iter()
-        .find(|c| c.id == connection_id)
-        .ok_or(AppError::ConnectionNotFound { id: connection_id })
-}
 
 /// Lists one page of objects + folders under `prefix` in `bucket`.
 /// `prefix` is the current path plus any prefix-search text; `token`
@@ -40,8 +26,7 @@ pub async fn list_objects(
     prefix: String,
     token: Option<String>,
 ) -> AppResult<ListPage> {
-    let connection = connection_by_id(&state, connection_id).await?;
-    let provider = from_connection(&connection)?;
+    let provider = state.hub().provider(&connection_id).await?;
     provider
         .list_objects(&bucket, &prefix, token.as_deref(), LIST_PAGE_SIZE)
         .await
@@ -63,8 +48,7 @@ pub async fn delete_objects(
             failed: Vec::new(),
         });
     }
-    let connection = connection_by_id(&state, connection_id).await?;
-    let provider = from_connection(&connection)?;
+    let provider = state.hub().provider(&connection_id).await?;
     provider.delete_objects(&bucket, &keys).await
 }
 
@@ -77,8 +61,7 @@ pub async fn rename_object(
     from_key: String,
     to_key: String,
 ) -> AppResult<()> {
-    let connection = connection_by_id(&state, connection_id).await?;
-    let provider = from_connection(&connection)?;
+    let provider = state.hub().provider(&connection_id).await?;
     provider.rename_object(&bucket, &from_key, &to_key).await
 }
 
@@ -90,7 +73,6 @@ pub async fn create_folder(
     bucket: String,
     prefix: String,
 ) -> AppResult<()> {
-    let connection = connection_by_id(&state, connection_id).await?;
-    let provider = from_connection(&connection)?;
+    let provider = state.hub().provider(&connection_id).await?;
     provider.create_folder(&bucket, &prefix).await
 }

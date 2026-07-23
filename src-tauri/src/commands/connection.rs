@@ -36,20 +36,21 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tauri::State;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::provider::{from_connection, Bucket, Provider};
+use crate::provider::{from_connection, Bucket, Provider, ProviderHub};
 use crate::store::{Connection, ConnectionDto, ConnectionInput, SecureStore};
 
-/// Shared, Tauri-managed application state: just the encrypted connection
-/// store, guarded by an async mutex so concurrent command invocations
-/// serialize their load-modify-save cycles instead of racing each other.
+/// Shared, Tauri-managed application state: the [`ProviderHub`], which owns
+/// both the encrypted connection store and the cache of built provider
+/// clients. Held behind an `Arc` so the transfer engine -- which has no
+/// access to Tauri's `State` -- can hold the same hub.
 pub struct AppState {
-    store: Mutex<SecureStore>,
+    hub: Arc<ProviderHub>,
 }
 
 impl AppState {
@@ -57,8 +58,8 @@ impl AppState {
     /// with owner-only `0700` permissions on unix -- see [`ensure_config_dir`])
     /// and returns an `AppState` backed by `<config_dir>/connections.enc`.
     ///
-    /// This must run before the first [`SecureStore::save`]: `save` itself
-    /// only ever creates the leaf *file* (via its own atomic tmp-then-rename
+    /// This must run before the first `SecureStore::save`: `save` itself only
+    /// ever creates the leaf *file* (via its own atomic tmp-then-rename
     /// write), never the containing directory, so on a fresh install with no
     /// config directory yet, saving without this step would fail with an
     /// `ENOENT`-flavored `AppError::StoreIo`.
@@ -66,17 +67,14 @@ impl AppState {
         ensure_config_dir(&config_dir)?;
         let path = config_dir.join("connections.enc");
         Ok(Self {
-            store: Mutex::new(SecureStore { path }),
+            hub: Arc::new(ProviderHub::new(SecureStore { path })),
         })
     }
 
-    /// Loads the full decrypted connection list. The store lock is scoped
-    /// to just this call, so no network-bound work ever holds it — the
-    /// same locking discipline `list_buckets` pioneered, now shared by the
-    /// object commands in `super::object`.
-    pub(crate) async fn load_connections(&self) -> AppResult<Vec<Connection>> {
-        let store = self.store.lock().await;
-        store.load()
+    /// The hub, for callers that live outside a `State<'_, AppState>` --
+    /// notably the transfer engine, wired up in `lib.rs`'s `setup`.
+    pub fn hub(&self) -> Arc<ProviderHub> {
+        Arc::clone(&self.hub)
     }
 }
 
@@ -149,8 +147,7 @@ pub fn merge_update(existing: &Connection, input: ConnectionInput) -> Connection
 /// access key).
 #[tauri::command]
 pub async fn list_connections(state: State<'_, AppState>) -> AppResult<Vec<ConnectionDto>> {
-    let store = state.store.lock().await;
-    let connections = store.load()?;
+    let connections = state.hub.connections().await?;
     Ok(connections.iter().map(ConnectionDto::from).collect())
 }
 
@@ -160,15 +157,15 @@ pub async fn add_connection(
     state: State<'_, AppState>,
     input: ConnectionInput,
 ) -> AppResult<ConnectionDto> {
-    let store = state.store.lock().await;
-    let mut connections = store.load()?;
-
-    let connection = new_connection(input);
-    let dto = ConnectionDto::from(&connection);
-    connections.push(connection);
-
-    store.save(&connections)?;
-    Ok(dto)
+    state
+        .hub
+        .mutate(|connections| {
+            let connection = new_connection(input);
+            let dto = ConnectionDto::from(&connection);
+            connections.push(connection);
+            Ok(dto)
+        })
+        .await
 }
 
 /// Updates the connection with the given `id` from `input` (empty
@@ -180,20 +177,19 @@ pub async fn update_connection(
     id: String,
     input: ConnectionInput,
 ) -> AppResult<ConnectionDto> {
-    let store = state.store.lock().await;
-    let mut connections = store.load()?;
-
-    let idx = connections
-        .iter()
-        .position(|c| c.id == id)
-        .ok_or(AppError::ConnectionNotFound { id })?;
-
-    let updated = merge_update(&connections[idx], input);
-    let dto = ConnectionDto::from(&updated);
-    connections[idx] = updated;
-
-    store.save(&connections)?;
-    Ok(dto)
+    state
+        .hub
+        .mutate(move |connections| {
+            let idx = connections
+                .iter()
+                .position(|c| c.id == id)
+                .ok_or(AppError::ConnectionNotFound { id })?;
+            let updated = merge_update(&connections[idx], input);
+            let dto = ConnectionDto::from(&updated);
+            connections[idx] = updated;
+            Ok(dto)
+        })
+        .await
 }
 
 /// Removes any connection with the given `id` from `connections`, in place.
@@ -211,13 +207,13 @@ fn remove_by_id(connections: &mut Vec<Connection>, id: &str) {
 /// postcondition ("this id is not in the store") already holds either way.
 #[tauri::command]
 pub async fn delete_connection(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    let store = state.store.lock().await;
-    let mut connections = store.load()?;
-
-    remove_by_id(&mut connections, &id);
-
-    store.save(&connections)?;
-    Ok(())
+    state
+        .hub
+        .mutate(move |connections| {
+            remove_by_id(connections, &id);
+            Ok(())
+        })
+        .await
 }
 
 /// Tests connectivity for an as-yet-unsaved connection profile: builds a
@@ -231,25 +227,14 @@ pub async fn test_connection(input: ConnectionInput) -> AppResult<()> {
 }
 
 /// Lists every bucket visible to the saved connection `connection_id`'s
-/// credentials.
-///
-/// The store lock is scoped to just the `load()` -- it's released before
-/// the network-bound `provider.list_buckets().await`, so a slow/hanging S3
-/// call never blocks other commands (e.g. `list_connections` from a second
-/// window) out of the store for its duration.
+/// credentials. The hub hands back a cached client, so repeat calls reuse the
+/// same connection pool instead of rebuilding one per invocation.
 #[tauri::command]
 pub async fn list_buckets(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> AppResult<Vec<Bucket>> {
-    let connections = state.load_connections().await?;
-
-    let connection = connections
-        .iter()
-        .find(|c| c.id == connection_id)
-        .ok_or(AppError::ConnectionNotFound { id: connection_id })?;
-
-    let provider = from_connection(connection)?;
+    let provider = state.hub.provider(&connection_id).await?;
     provider.list_buckets().await
 }
 

@@ -4,8 +4,10 @@
 //! providers) behind a small trait so [`crate::commands`] can talk to
 //! "a bucket store" without depending on `aws-sdk-s3` types directly.
 
+pub mod hub;
 pub mod s3;
 
+pub use hub::ProviderHub;
 pub use s3::{from_connection, is_aws_endpoint, S3Provider};
 
 use async_trait::async_trait;
