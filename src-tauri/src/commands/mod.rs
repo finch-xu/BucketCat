@@ -8,9 +8,14 @@
 
 pub mod connection;
 pub mod object;
+pub mod transfer;
 
 pub use connection::{
     add_connection, delete_connection, list_buckets, list_connections, test_connection,
     update_connection, AppState,
 };
 pub use object::{create_folder, delete_objects, list_objects, rename_object};
+pub use transfer::{
+    cancel_transfer, clear_finished_transfers, enqueue_uploads, list_transfers, pause_transfer,
+    resume_transfer, retry_transfer,
+};
