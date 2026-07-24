@@ -69,7 +69,7 @@
 //! `ProvideErrorMetadata` and maps known codes directly. This test now
 //! asserts the fixed, correct behavior -- see its doc comment.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,8 +81,9 @@ use bucketcat_lib::provider::{from_connection, Provider, ProviderHub, S3Provider
 use bucketcat_lib::store::{Connection, SecureStore};
 use bucketcat_lib::transfer::part::MULTIPART_THRESHOLD;
 use bucketcat_lib::transfer::{
-    plan_upload, spawn_aggregator, EngineConfig, EnqueueSpec, ProgressPayload, ProgressSink,
-    TransferEngine, TransferSink, TransferStatus, TransferTaskDto, UploadPlan, UploadRunner,
+    bcpart_path, plan_upload, spawn_aggregator, DispatchRunner, DownloadRunner, EngineConfig,
+    EnqueueSpec, ProgressPayload, ProgressSink, TransferEngine, TransferSink, TransferStatus,
+    TransferTaskDto, UploadPlan, UploadRunner,
 };
 
 // --- M3 object data-plane helpers ------------------------------------------
@@ -1391,10 +1392,15 @@ impl ProgressSink for NullProgressSink {
     fn flush(&self, _batch: Vec<ProgressPayload>) {}
 }
 
-/// Builds a real `TransferEngine` with a real `UploadRunner` and a real
-/// aggregator. `max_parts` is a knob: the pause/cancel tests set it to 1 to
-/// serialize parts, which widens the mid-flight window and makes the timing
-/// deterministic without changing any of the abort/resume semantics under test.
+/// Builds a real `TransferEngine` over a real `DispatchRunner` (so the one
+/// engine routes upload-direction tasks to `UploadRunner` and
+/// download-direction tasks to `DownloadRunner`, exactly as production wires it)
+/// and a real aggregator. Routing by `Direction` is why the upload tests above
+/// keep passing unchanged while the download tests below exercise the same
+/// engine. `max_parts` is a knob: the pause/cancel tests set it to 1 to
+/// serialize parts/chunks, which widens the mid-flight window and makes the
+/// timing deterministic without changing any of the abort/resume semantics
+/// under test.
 fn build_engine(
     hub: Arc<ProviderHub>,
     sink: Arc<dyn TransferSink>,
@@ -1403,7 +1409,10 @@ fn build_engine(
     let progress_tx = spawn_aggregator(Arc::new(NullProgressSink));
     TransferEngine::new(
         hub,
-        Arc::new(UploadRunner),
+        Arc::new(DispatchRunner {
+            upload: Arc::new(UploadRunner),
+            download: Arc::new(DownloadRunner),
+        }),
         sink,
         progress_tx,
         EngineConfig {
@@ -1895,4 +1904,857 @@ async fn cancelling_a_paused_upload_reaps_fragments() {
          pending upload(s) remain for {key} -- the engine's self-apply cancel branch must abort \
          the orphaned upload when a task has multipart state and no live runner"
     );
+}
+
+// ===========================================================================
+// Group D: the download engine + recursive ops, end to end against MinIO
+// (M4b Task 10).
+//
+// These mirror the upload engine tests above: the same real `TransferEngine`
+// (now a `DispatchRunner`, so it routes by `Direction`), the same `live_hub`,
+// `CollectingSink`, `wait_for_status`/`wait_for_mid_flight` timing, and the
+// same 60MB / `max_parts = 1` recipe for a deterministic mid-flight window.
+// A download stages into `<final>.bcpart` and renames to `<final>` only on
+// completion, so `bcpart_path` + "the final path must not exist mid-flight" is
+// how the no-half-file contract is asserted. Every test is `#[ignore]`d.
+// ===========================================================================
+
+/// Seeds `key` in `bucket` with `size` bytes of deterministic pseudo-random
+/// content (the same non-compressible fill the upload fixtures use, so a
+/// per-chunk offset bug can never hide behind a repeating pattern) via the
+/// provider's own upload primitives, then returns the local source path so a
+/// downloaded copy can be hash-compared against it. `dir` keeps the source
+/// alive for the caller.
+async fn seed_random_object(
+    provider: &S3Provider,
+    bucket: &str,
+    key: &str,
+    dir: &Path,
+    size: u64,
+    seed: u64,
+) -> PathBuf {
+    let src = dir.join(format!("src-{}.bin", key.replace('/', "_")));
+    write_pseudo_random_file(&src, size, seed);
+    upload_via_primitives(provider, bucket, key, &src, size).await;
+    src
+}
+
+/// The object's size via the provider's `head_object`, panicking rather than
+/// swallowing the error: a download can't be planned without it.
+async fn download_total(provider: &S3Provider, bucket: &str, key: &str) -> u64 {
+    provider
+        .head_object(bucket, key)
+        .await
+        .unwrap_or_else(|e| panic!("head_object {key} for download size should succeed: {e}"))
+        .size
+}
+
+/// Drives a folder download at the engine level exactly as the
+/// `enqueue_folder_download` command does internally -- the command itself
+/// needs a Tauri `State`, so its logic is replicated here against the raw
+/// engine: walk `prefix` with the delimiter-less `list_objects_flat` (paging
+/// like `delete_prefix`), skip every key ending in `/` (folder markers, incl.
+/// nested empty-folder markers), and enqueue one download per real object into
+/// `local_dir` under its path relative to `prefix`. The size comes straight
+/// from the listing -- a `None` size is a hard failure here, which is what
+/// asserts "no per-object HeadObject beyond what's needed" (the listing already
+/// carries it). Returns the enqueued task ids.
+async fn folder_download_via_engine(
+    engine: &TransferEngine,
+    provider: &S3Provider,
+    connection_id: &str,
+    bucket: &str,
+    prefix: &str,
+    local_dir: &Path,
+) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = provider
+            .list_objects_flat(bucket, prefix, token.as_deref(), 1000)
+            .await
+            .expect("list_objects_flat page should succeed");
+        entries.extend(page.entries);
+        match page.next_token {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+
+    let mut ids = Vec::new();
+    for entry in entries {
+        // A key ending in `/` is a 0-byte folder placeholder (the `prefix/`
+        // marker or a nested empty-folder marker), never a file: downloading
+        // one would write a spurious empty file named after the folder.
+        if entry.key.ends_with('/') {
+            continue;
+        }
+        // Rebuild the relative path from only its Normal components, exactly as
+        // the command's `local_target` does, so a crafted key can't escape.
+        let relative = entry.key.strip_prefix(prefix).unwrap_or(&entry.key);
+        let mut sanitized = PathBuf::new();
+        for component in Path::new(relative).components() {
+            if let std::path::Component::Normal(part) = component {
+                sanitized.push(part);
+            }
+        }
+        if sanitized.as_os_str().is_empty() {
+            continue;
+        }
+        let target = local_dir.join(&sanitized);
+        let file_name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let total = entry.size.unwrap_or_else(|| {
+            panic!(
+                "the flat listing must carry {}'s size so no per-object head is needed",
+                entry.key
+            )
+        });
+        let spec = EnqueueSpec::for_download(
+            connection_id.to_string(),
+            bucket.to_string(),
+            entry.key.clone(),
+            target,
+            total,
+            file_name,
+        );
+        let task = engine
+            .enqueue(spec)
+            .await
+            .expect("enqueuing a folder object should succeed");
+        ids.push(task.id);
+    }
+    ids
+}
+
+/// Test 1: a small (single-stream, below the 16MB threshold) file downloads
+/// byte-for-byte, and the degenerate 0-byte object downloads to a correct
+/// empty local file (the live mirror of the `a_zero_byte_object...` unit test).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn download_small_file_round_trips() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-download-1";
+    let hub = live_hub(connection_id, &hub_dir).await;
+    let sink = Arc::new(CollectingSink::default());
+    let engine = build_engine(Arc::clone(&hub), sink.clone(), 4);
+
+    // --- a 1MB single-stream file round-trips by hash -----------------------
+    let key = "downloads/small.bin";
+    let size = MB;
+    let src = seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1001).await;
+
+    let target = dl_dir.path().join("small.bin");
+    let total = download_total(&provider, &bucket, key).await;
+    assert_eq!(total, size, "the head size must match what was seeded");
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "small.bin".to_string(),
+    );
+    let task = engine.enqueue(spec).await.expect("enqueue");
+    wait_for_status(
+        &engine,
+        &task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert!(target.exists(), "a completed download must leave the file");
+    assert!(
+        !bcpart_path(&target).exists(),
+        "finish renames the .bcpart into place, leaving no staging file"
+    );
+    assert_eq!(
+        hex(&sha256_file(&target)),
+        hex(&sha256_file(&src)),
+        "the downloaded bytes must be byte-identical to the source object"
+    );
+
+    // --- a 0-byte object downloads to an empty file -------------------------
+    let empty_key = "downloads/empty.bin";
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(empty_key)
+        .body(ByteStream::from_static(b""))
+        .send()
+        .await
+        .expect("seeding a 0-byte object should succeed");
+    let empty_target = dl_dir.path().join("empty.bin");
+    let empty_total = download_total(&provider, &bucket, empty_key).await;
+    assert_eq!(empty_total, 0, "the seeded object is empty");
+    let empty_spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        empty_key.to_string(),
+        empty_target.clone(),
+        empty_total,
+        "empty.bin".to_string(),
+    );
+    let empty_task = engine.enqueue(empty_spec).await.expect("enqueue empty");
+    wait_for_status(
+        &engine,
+        &empty_task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        empty_target.exists(),
+        "a 0-byte download must still create the empty file"
+    );
+    assert_eq!(
+        std::fs::metadata(&empty_target).unwrap().len(),
+        0,
+        "a 0-byte object must download to a 0-byte file"
+    );
+    assert!(!bcpart_path(&empty_target).exists());
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 2: a ~40MB multipart (Range-chunked) download hash-matches the source.
+/// This is the ONLY proof each chunk's `(offset, length)` landed at the right
+/// LOCAL offset: a per-chunk offset bug is invisible to the unit tests' fake
+/// provider but corrupts this SHA-256. 40MB is exactly five 8MB chunks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn download_multipart_file_matches_hash() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-download-2";
+    let hub = live_hub(connection_id, &hub_dir).await;
+    let sink = Arc::new(CollectingSink::default());
+    let engine = build_engine(Arc::clone(&hub), sink.clone(), 4);
+
+    let key = "downloads/multipart.bin";
+    let size = 40 * MB;
+    let src = seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1002).await;
+    // Sanity: this must genuinely exercise the chunked path, not a single GET.
+    assert!(
+        matches!(plan_upload(size), UploadPlan::Multipart { .. }),
+        "40MB must plan as multipart or this test proves nothing about chunk offsets"
+    );
+
+    let target = dl_dir.path().join("multipart.bin");
+    let total = download_total(&provider, &bucket, key).await;
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "multipart.bin".to_string(),
+    );
+    let task = engine.enqueue(spec).await.expect("enqueue");
+    wait_for_status(
+        &engine,
+        &task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    assert!(
+        !bcpart_path(&target).exists(),
+        "no staging file after finish"
+    );
+    assert_eq!(
+        hex(&sha256_file(&target)),
+        hex(&sha256_file(&src)),
+        "every 8MB chunk must land at its own local offset: a mismatch here is a real \
+         offset/length bug, not a flake"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 3: chunk offsets land correctly, verified segment-by-segment. The
+/// source is built so each 8MB segment holds a distinct constant byte (segment
+/// `i` is all `i`), so two swapped chunks -- which a whole-file hash would also
+/// catch but not localize -- are pinned to the exact offending segment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn download_chunks_land_at_correct_offsets() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-download-3";
+    let hub = live_hub(connection_id, &hub_dir).await;
+    let sink = Arc::new(CollectingSink::default());
+    let engine = build_engine(Arc::clone(&hub), sink.clone(), 4);
+
+    // Five 8MB segments, aligned to the 8MB chunk plan, each a distinct byte.
+    let segment = 8 * MB as usize;
+    let segments = 5usize;
+    let mut object = Vec::with_capacity(segment * segments);
+    for i in 0..segments {
+        object.extend(std::iter::repeat_n(i as u8, segment));
+    }
+    let key = "downloads/segmented.bin";
+    let src = src_dir.path().join("segmented.bin");
+    std::fs::write(&src, &object).expect("write segmented source");
+    upload_via_primitives(&provider, &bucket, key, &src, object.len() as u64).await;
+
+    let target = dl_dir.path().join("segmented.bin");
+    let total = download_total(&provider, &bucket, key).await;
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "segmented.bin".to_string(),
+    );
+    let task = engine.enqueue(spec).await.expect("enqueue");
+    wait_for_status(
+        &engine,
+        &task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let got = std::fs::read(&target).expect("read downloaded segmented file");
+    assert_eq!(got.len(), object.len(), "downloaded length must match");
+    for i in 0..segments {
+        let start = i * segment;
+        let end = start + segment;
+        assert!(
+            got[start..end].iter().all(|&b| b == i as u8),
+            "segment {i} (bytes {start}..{end}) must be entirely {i}: a chunk written at the \
+             wrong local offset lands here"
+        );
+    }
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 4: pausing a download mid-flight then resuming finishes it byte-exact.
+/// While paused the `.bcpart` exists and the final path does NOT (no half
+/// file); after resume the file hash-matches and the final `transferred` never
+/// exceeds `total` (resume's byte accounting stays exact -- it neither loses
+/// nor double-counts). The precise "finished chunks are skipped, not re-fetched
+/// over the wire" discriminator lives in the `download.rs` unit test
+/// `resuming_reuses_the_bcpart_and_skips_completed_chunks`, which can count
+/// `get_range` calls; the engine here hands the runner a concrete `S3Provider`
+/// with no call-counting seam, so this test proves everything reachable at the
+/// engine level (mid-flight residue, hash, exact accounting) instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn pausing_then_resuming_download_matches_hash() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-download-4";
+    let hub = live_hub(connection_id, &hub_dir).await;
+    let sink = Arc::new(CollectingSink::default());
+    // One chunk at a time widens the pause window between chunks.
+    let engine = build_engine(Arc::clone(&hub), sink.clone(), 1);
+
+    let key = "downloads/pause-resume.bin";
+    let size = 60 * MB;
+    let src = seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1004).await;
+
+    let target = dl_dir.path().join("pause-resume.bin");
+    let total = download_total(&provider, &bucket, key).await;
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "pause-resume.bin".to_string(),
+    );
+    let task = engine.enqueue(spec).await.expect("enqueue");
+
+    wait_for_mid_flight(&engine, &task.id, Duration::from_secs(120)).await;
+    engine.pause(&task.id).await.expect("pause");
+    wait_for_status(
+        &engine,
+        &task.id,
+        TransferStatus::Paused,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Mid-flight residue: the staging file holds what landed, the final path
+    // does not exist yet (no half file the user could mistake for a download).
+    assert!(
+        bcpart_path(&target).exists(),
+        "a paused download keeps its .bcpart so the resume can reopen it"
+    );
+    assert!(
+        !target.exists(),
+        "a paused download must not have produced the final file yet"
+    );
+    let paused = snapshot_of(&engine, &task.id)
+        .await
+        .expect("paused task snapshot");
+    assert!(
+        paused.transferred > 0 && paused.transferred < total,
+        "the pause must land genuinely mid-flight: 0 < {} < {total}",
+        paused.transferred
+    );
+
+    engine.resume(&task.id).await.expect("resume");
+    wait_for_status(
+        &engine,
+        &task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(180),
+    )
+    .await;
+
+    assert!(target.exists(), "resume must produce the final file");
+    assert!(
+        !bcpart_path(&target).exists(),
+        "no staging file after finish"
+    );
+    assert_eq!(
+        hex(&sha256_file(&target)),
+        hex(&sha256_file(&src)),
+        "resume must neither lose nor duplicate a byte: the file must hash-match the source"
+    );
+    let done = snapshot_of(&engine, &task.id)
+        .await
+        .expect("completed task snapshot");
+    assert!(
+        done.transferred <= total,
+        "resume must not re-count finished chunks: transferred {} must not exceed total {total}",
+        done.transferred
+    );
+    assert!(
+        sink.statuses_of(&task.id).contains(&TransferStatus::Paused),
+        "the task must have actually passed through Paused"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 5: cancelling a download mid-flight deletes the `.bcpart` and never
+/// produces the final file -- both are absent afterwards. The cancel is issued
+/// only after `wait_for_mid_flight` observes real progress, so the `.bcpart`
+/// provably existed and was genuinely reaped (a test that cancelled the instant
+/// after enqueue would pass even with the cleanup removed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn cancelling_a_download_deletes_the_bcpart() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-download-5";
+    let hub = live_hub(connection_id, &hub_dir).await;
+    let sink = Arc::new(CollectingSink::default());
+    let engine = build_engine(Arc::clone(&hub), sink.clone(), 1);
+
+    let key = "downloads/cancel.bin";
+    let size = 60 * MB;
+    seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1005).await;
+
+    let target = dl_dir.path().join("cancel.bin");
+    let total = download_total(&provider, &bucket, key).await;
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "cancel.bin".to_string(),
+    );
+    let task = engine.enqueue(spec).await.expect("enqueue");
+
+    wait_for_mid_flight(&engine, &task.id, Duration::from_secs(120)).await;
+    assert!(
+        bcpart_path(&target).exists(),
+        "a running download must have staged a .bcpart to leak"
+    );
+
+    engine.cancel(&task.id).await.expect("cancel");
+    wait_for_status(
+        &engine,
+        &task.id,
+        TransferStatus::Canceled,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert!(
+        !bcpart_path(&target).exists(),
+        "cancelling a running download must delete its .bcpart -- there is nothing to continue"
+    );
+    assert!(
+        !target.exists(),
+        "a cancelled download must never produce the final file"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 6: cancelling a PAUSED download (paused, never resumed) still deletes
+/// its orphaned `.bcpart`. This is the download-side I-2 symmetric check: with
+/// no live runner, the engine's self-apply `cancel` branch must run the
+/// `ResumeState::Download` arm of `cleanup_orphaned_transfer` and remove the
+/// staging file. The live mirror of the `cancelling_a_paused_download_removes_
+/// its_orphaned_bcpart` unit test; if that download arm were missing the
+/// `.bcpart` would leak here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn cancelling_a_paused_download_deletes_the_bcpart() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-download-6";
+    let hub = live_hub(connection_id, &hub_dir).await;
+    let sink = Arc::new(CollectingSink::default());
+    let engine = build_engine(Arc::clone(&hub), sink.clone(), 1);
+
+    let key = "downloads/paused-cancel.bin";
+    let size = 60 * MB;
+    seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1006).await;
+
+    let target = dl_dir.path().join("paused-cancel.bin");
+    let total = download_total(&provider, &bucket, key).await;
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "paused-cancel.bin".to_string(),
+    );
+    let task = engine.enqueue(spec).await.expect("enqueue");
+
+    wait_for_mid_flight(&engine, &task.id, Duration::from_secs(120)).await;
+    engine.pause(&task.id).await.expect("pause");
+    wait_for_status(
+        &engine,
+        &task.id,
+        TransferStatus::Paused,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        bcpart_path(&target).exists(),
+        "a paused download must keep its .bcpart before the cancel"
+    );
+
+    // Cancel while Paused: no live runner observes it, so the engine's
+    // self-apply cancel branch must delete the orphaned .bcpart itself.
+    engine.cancel(&task.id).await.expect("cancel");
+    wait_for_status(
+        &engine,
+        &task.id,
+        TransferStatus::Canceled,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert!(
+        !bcpart_path(&target).exists(),
+        "cancelling a Paused download must reap its orphaned .bcpart (download-side I-2)"
+    );
+    assert!(
+        !target.exists(),
+        "a cancelled download must never produce the final file"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 7: `head_object` reports the object's size and a non-empty ETag for a
+/// known object, and a head against a missing key surfaces the
+/// `storage/key-not-found` error family (design §7 human-friendly mapping).
+#[tokio::test]
+#[ignore]
+async fn head_object_reports_size_and_etag() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let key = "meta/known.bin";
+    let size = 3 * MB;
+    seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1007).await;
+
+    let head = provider
+        .head_object(&bucket, key)
+        .await
+        .expect("head_object on a known object should succeed");
+    assert_eq!(head.size, size, "head must report the object's real size");
+    let etag = head.etag.expect("a real object must carry an ETag");
+    assert!(!etag.is_empty(), "the ETag must not be empty");
+
+    let missing = provider
+        .head_object(&bucket, "meta/ghost.bin")
+        .await
+        .expect_err("heading a missing key must fail");
+    assert!(
+        missing.code().starts_with("storage/"),
+        "a missing key must surface the storage/* family (got {:?})",
+        missing.code()
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+}
+
+/// Test 8: `delete_prefix` removes an entire subtree INCLUDING the `folder/`
+/// marker object -- `list_objects_flat` returns empty afterwards (closes M3
+/// I4: the empty-folder marker `list_objects`' delimiter listing hides is a
+/// real key here). A sibling prefix that merely shares a textual head
+/// (`docs2/` next to `docs/`) is untouched, proving the delete is scoped to the
+/// slash-terminated prefix and cannot bleed into siblings.
+#[tokio::test]
+#[ignore]
+async fn delete_prefix_removes_everything_including_the_marker() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    // A multi-level `docs/` subtree: its own marker, files at two levels, and a
+    // nested EMPTY-folder marker (`docs/empty/`) that only a flat listing sees.
+    provider
+        .create_folder(&bucket, "docs")
+        .await
+        .expect("create docs/ marker");
+    provider
+        .create_folder(&bucket, "docs/empty")
+        .await
+        .expect("create nested empty-folder marker");
+    put_text(&client, &bucket, "docs/a.txt").await;
+    put_text(&client, &bucket, "docs/sub/b.txt").await;
+    // A sibling sharing the textual head `docs`: it must survive.
+    provider
+        .create_folder(&bucket, "docs2")
+        .await
+        .expect("create sibling docs2/ marker");
+    put_text(&client, &bucket, "docs2/keep.txt").await;
+
+    // Precondition: the flat listing sees the marker + the nested empty marker.
+    let before = provider
+        .list_objects_flat(&bucket, "docs/", None, 1000)
+        .await
+        .expect("flat list docs/ before delete");
+    let before_keys: Vec<&str> = before.entries.iter().map(|e| e.key.as_str()).collect();
+    assert!(
+        before_keys.contains(&"docs/") && before_keys.contains(&"docs/empty/"),
+        "the flat listing must surface both markers before delete: {before_keys:?}"
+    );
+
+    let result = provider
+        .delete_prefix(&bucket, "docs/")
+        .await
+        .expect("delete_prefix should succeed");
+    assert!(
+        result.failed.is_empty(),
+        "no key should have failed to delete: {:?}",
+        result.failed
+    );
+
+    let after = provider
+        .list_objects_flat(&bucket, "docs/", None, 1000)
+        .await
+        .expect("flat list docs/ after delete");
+    assert!(
+        after.entries.is_empty(),
+        "delete_prefix must remove everything under docs/ including the marker: {:?}",
+        after.entries
+    );
+
+    // The sibling that only shares a textual head must be fully intact.
+    let sibling = provider
+        .list_objects_flat(&bucket, "docs2/", None, 1000)
+        .await
+        .expect("flat list docs2/ after delete");
+    let sibling_keys: Vec<&str> = sibling.entries.iter().map(|e| e.key.as_str()).collect();
+    assert!(
+        sibling_keys.contains(&"docs2/") && sibling_keys.contains(&"docs2/keep.txt"),
+        "deleting docs/ must not touch the sibling docs2/: {sibling_keys:?}"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+}
+
+/// Test 9: a folder download reconstructs the remote subtree on disk. Uploading
+/// `p/a.txt` and `p/sub/b.txt` (plus the `p/` and a nested empty `p/empty/`
+/// marker) and folder-downloading `p/` yields local `a.txt` and `sub/b.txt`
+/// with matching contents, while the folder markers are skipped -- no bogus
+/// `empty` file, no file named after the folder. Sizes come from the listing,
+/// so no per-object HeadObject is issued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn folder_download_reconstructs_the_tree() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-download-9";
+    let hub = live_hub(connection_id, &hub_dir).await;
+    let sink = Arc::new(CollectingSink::default());
+    let engine = build_engine(Arc::clone(&hub), sink.clone(), 4);
+
+    // A two-level tree plus markers a real folder accumulates.
+    provider
+        .create_folder(&bucket, "p")
+        .await
+        .expect("p/ marker");
+    provider
+        .create_folder(&bucket, "p/empty")
+        .await
+        .expect("nested empty marker");
+    let a_src = seed_random_object(
+        &provider,
+        &bucket,
+        "p/a.txt",
+        src_dir.path(),
+        2 * MB,
+        0x5EED_1091,
+    )
+    .await;
+    let b_src = seed_random_object(
+        &provider,
+        &bucket,
+        "p/sub/b.txt",
+        src_dir.path(),
+        3 * MB,
+        0x5EED_1092,
+    )
+    .await;
+
+    let ids = folder_download_via_engine(
+        &engine,
+        &provider,
+        connection_id,
+        &bucket,
+        "p/",
+        dl_dir.path(),
+    )
+    .await;
+    assert_eq!(
+        ids.len(),
+        2,
+        "exactly the two real files must be enqueued; the p/ and p/empty/ markers are skipped"
+    );
+    for id in &ids {
+        wait_for_status(
+            &engine,
+            id,
+            TransferStatus::Completed,
+            Duration::from_secs(120),
+        )
+        .await;
+    }
+
+    let a_dst = dl_dir.path().join("a.txt");
+    let b_dst = dl_dir.path().join("sub").join("b.txt");
+    assert!(a_dst.exists(), "p/a.txt must land at <dir>/a.txt");
+    assert!(
+        b_dst.exists(),
+        "p/sub/b.txt must reconstruct the nested <dir>/sub/b.txt"
+    );
+    assert!(
+        dl_dir.path().join("sub").is_dir(),
+        "the intermediate folder must exist as a real directory"
+    );
+    assert_eq!(
+        hex(&sha256_file(&a_dst)),
+        hex(&sha256_file(&a_src)),
+        "a.txt contents must match the source"
+    );
+    assert_eq!(
+        hex(&sha256_file(&b_dst)),
+        hex(&sha256_file(&b_src)),
+        "sub/b.txt contents must match the source"
+    );
+    // The folder markers must NOT have been written as files.
+    assert!(
+        !dl_dir.path().join("empty").exists(),
+        "the nested empty-folder marker must be skipped, not written as an 'empty' file"
+    );
+    assert!(
+        !dl_dir.path().join("p").exists(),
+        "the folder's own marker must never appear as a local file"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
 }
