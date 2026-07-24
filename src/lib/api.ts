@@ -231,6 +231,42 @@ export function createFolder(
   return invokeCommand<void>("create_folder", { connectionId, bucket, prefix });
 }
 
+/** Generates a time-limited, unauthenticated GET URL for `key` (the Share
+ * feature). `expiresSecs` is clamped server-side into S3's valid range
+ * (1s..7d), so an out-of-range value here is never rejected -- it's just
+ * silently bounded. The resolved URL carries a live signature: callers must
+ * not log it. */
+export function presignGet(
+  connectionId: string,
+  bucket: string,
+  key: string,
+  expiresSecs: number,
+): Promise<string> {
+  return invokeCommand<string>("presign_get", {
+    connectionId,
+    bucket,
+    key,
+    expiresSecs,
+  });
+}
+
+/** An object's metadata (size, ETag, content type) for the details panel.
+ * Mirrors `ObjectHead` in `src-tauri/src/provider/mod.rs`. */
+export interface ObjectHead {
+  size: number;
+  etag: string | null;
+  content_type: string | null;
+}
+
+/** Reads an object's metadata via a cheap `HeadObject` call. */
+export function headObject(
+  connectionId: string,
+  bucket: string,
+  key: string,
+): Promise<ObjectHead> {
+  return invokeCommand<ObjectHead>("head_object", { connectionId, bucket, key });
+}
+
 /** Where the bytes are going. Mirrors `Direction` in
  * `src-tauri/src/transfer/model.rs`. */
 export type TransferDirection = "upload" | "download";

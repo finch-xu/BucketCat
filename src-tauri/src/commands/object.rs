@@ -11,7 +11,7 @@ use tauri::State;
 
 use crate::commands::connection::AppState;
 use crate::error::AppResult;
-use crate::provider::{BatchResult, ListPage, Provider};
+use crate::provider::{BatchResult, ListPage, ObjectHead, Provider};
 
 /// Objects (files + folders combined) per `list_objects` page. One page is
 /// one ListObjectsV2 request; the frontend's infinite scroll requests the
@@ -96,4 +96,35 @@ pub async fn create_folder(
 ) -> AppResult<()> {
     let provider = state.hub().provider(&connection_id).await?;
     provider.create_folder(&bucket, &prefix).await
+}
+
+/// Generates a time-limited, unauthenticated GET URL for `key` -- the Share
+/// feature. The provider clamps `expires_secs` into S3's valid range; this
+/// command just delegates. The returned URL carries a live signature and
+/// must NEVER be logged (unlike every other command here, which may log its
+/// arguments freely).
+#[tauri::command]
+pub async fn presign_get(
+    state: State<'_, AppState>,
+    connection_id: String,
+    bucket: String,
+    key: String,
+    expires_secs: u64,
+) -> AppResult<String> {
+    let provider = state.hub().provider(&connection_id).await?;
+    provider.presign_get(&bucket, &key, expires_secs).await
+}
+
+/// Reads an object's metadata (size, ETag, content type) for the details
+/// panel -- the same cheap `HeadObject` call the transfer engine uses to
+/// plan a download.
+#[tauri::command]
+pub async fn head_object(
+    state: State<'_, AppState>,
+    connection_id: String,
+    bucket: String,
+    key: String,
+) -> AppResult<ObjectHead> {
+    let provider = state.hub().provider(&connection_id).await?;
+    provider.head_object(&bucket, &key).await
 }

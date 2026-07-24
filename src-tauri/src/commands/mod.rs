@@ -15,7 +15,10 @@ pub use connection::{
     add_connection, delete_connection, list_buckets, list_connections, test_connection,
     update_connection, AppState,
 };
-pub use object::{create_folder, delete_objects, delete_prefix, list_objects, rename_object};
+pub use object::{
+    create_folder, delete_objects, delete_prefix, head_object, list_objects, presign_get,
+    rename_object,
+};
 pub use settings::{get_resume_enabled, set_resume_enabled, ResumeFlag};
 pub use transfer::{
     cancel_transfer, clear_finished_transfers, enqueue_download, enqueue_folder_download,
