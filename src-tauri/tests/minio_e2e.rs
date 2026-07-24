@@ -70,6 +70,7 @@
 //! asserts the fixed, correct behavior -- see its doc comment.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,9 +83,10 @@ use bucketcat_lib::provider::{from_connection, Provider, ProviderHub, S3Provider
 use bucketcat_lib::store::{Connection, SecureStore};
 use bucketcat_lib::transfer::part::MULTIPART_THRESHOLD;
 use bucketcat_lib::transfer::{
-    bcpart_path, plan_upload, spawn_aggregator, DispatchRunner, DownloadRunner, EngineConfig,
-    EnqueueSpec, ProgressPayload, ProgressSink, TransferEngine, TransferSink, TransferStatus,
-    TransferTaskDto, UploadPlan, UploadRunner,
+    bcpart_path, checkpoint, plan_upload, spawn_aggregator, Direction, DispatchRunner,
+    DownloadRunner, EngineConfig, EnqueueSpec, MultipartState, ProgressPayload, ProgressSink,
+    ResumeState, TransferEngine, TransferSink, TransferStatus, TransferTaskDto, UploadPlan,
+    UploadRunner,
 };
 
 // --- M3 object data-plane helpers ------------------------------------------
@@ -1448,6 +1450,25 @@ fn build_engine(
     sink: Arc<dyn TransferSink>,
     max_parts: usize,
 ) -> TransferEngine {
+    // The M4a/M4b e2e tests here assert transfer semantics, not checkpoint
+    // persistence; no checkpoint dir + resume-on keeps every existing call site
+    // behaving exactly as before Task 5 added the two extra `new` parameters.
+    build_engine_cp(hub, sink, max_parts, None, Arc::new(AtomicBool::new(true)))
+}
+
+/// Like [`build_engine`] but with an explicit checkpoint dir + runtime resume
+/// flag, so the M4c cross-restart tests can build an engine (E1) that writes
+/// checkpoints into a dir, drop it, then build a *fresh* engine (E2) over the
+/// SAME dir + hub and run the startup scan -- the simulated-restart harness the
+/// milestone hinges on. Everything else (the real `DispatchRunner` routing by
+/// `Direction`, a fresh aggregator) is identical to `build_engine`.
+fn build_engine_cp(
+    hub: Arc<ProviderHub>,
+    sink: Arc<dyn TransferSink>,
+    max_parts: usize,
+    checkpoint_dir: Option<PathBuf>,
+    resume_enabled: Arc<AtomicBool>,
+) -> TransferEngine {
     let progress_tx = spawn_aggregator(Arc::new(NullProgressSink));
     TransferEngine::new(
         hub,
@@ -1461,10 +1482,8 @@ fn build_engine(
             max_tasks: 3,
             max_parts,
         },
-        // The e2e tests here assert transfer semantics, not checkpoint
-        // persistence; disable checkpointing to keep them unchanged.
-        None,
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        checkpoint_dir,
+        resume_enabled,
     )
 }
 
@@ -2797,6 +2816,863 @@ async fn folder_download_reconstructs_the_tree() {
     assert!(
         !dl_dir.path().join("p").is_file(),
         "the folder's own marker must never appear as a local file -- only the recreated directory"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+// ===========================================================================
+// Group E: cross-restart resume, reconciliation, orphan discard, and the
+// resume toggle -- against live MinIO (M4c Task 11, milestone acceptance).
+//
+// These are the one place the whole M4c checkpoint/resume story is proven end
+// to end against a real server: a transfer lands real work, its checkpoint is
+// written to disk, the engine is *dropped*, a brand-new engine is built over
+// the SAME checkpoint dir + hub, and the exact startup scan `lib.rs` runs is
+// replayed -- so the task comes back `Paused` (or is discarded as an orphan)
+// with no OS-process restart needed. The narrow "accepted parts are not
+// re-uploaded / finished chunks are not re-fetched" counting guards are already
+// unit-proven (Task 7 via `multipart_list`, Task 8 via the download runner's
+// `get_range` count); what only a live restart can prove -- and what these add
+// -- is that the object/file assembled ACROSS the restart is byte-correct, that
+// a changed source/ETag forces a from-scratch redo (a matching NEW hash is
+// itself the proof the stale work was discarded, since a splice of old+new
+// bytes would hash-match neither side), and that the orphan/toggle guards fire.
+//
+// Every test drives `wait_for_mid_flight` + `wait_for_status(Paused)` before it
+// asserts anything about resume/discard, so a green run always observed a
+// genuine mid-flight/Paused state with landed work on disk -- never the
+// instant-after-enqueue no-op a faked test would settle for. All `#[ignore]`d.
+// ===========================================================================
+
+/// The simulated-restart startup scan: a faithful, self-contained replica of
+/// the loop `lib.rs`'s `setup` runs (it cannot be called directly -- it is an
+/// inline block behind a Tauri `App`), so this exercises the exact policy the
+/// shipped app applies on launch. For every checkpoint in `cp_dir`: if its
+/// connection is gone from the hub it is an orphan -- drop the checkpoint (and,
+/// for a download, the staging `.bcpart` nobody will ever resume); otherwise
+/// rebuild it as a `Paused` row via the engine's real `restore_paused`.
+async fn restore_from_checkpoints(engine: &TransferEngine, hub: &ProviderHub, cp_dir: &Path) {
+    let known: std::collections::HashSet<String> = hub
+        .connection_ids()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    for (id, cp) in checkpoint::scan(cp_dir) {
+        if !known.contains(&cp.connection_id) {
+            if cp.direction == Direction::Download {
+                let _ = std::fs::remove_file(bcpart_path(Path::new(&cp.local_path)));
+            }
+            checkpoint::remove(cp_dir, &id);
+        } else {
+            engine.restore_paused(id, cp).await;
+        }
+    }
+}
+
+/// Test 1: a large multipart upload paused mid-flight survives an engine drop
+/// and resumes to a byte-correct object. The checkpoint written by E1 (upload
+/// id + accepted parts + source fingerprint) is all that crosses the restart;
+/// E2 rebuilds the task as `Paused` with `transferred` preset from those parts
+/// (proving landed work carried across the boundary, not a fresh 0/total), then
+/// resume continues the SAME still-open server-side upload to completion. The
+/// object's SHA-256 == the source is the end-to-end proof; the pending-upload
+/// count going 1 -> 0 confirms the very upload E1 opened was the one completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn upload_survives_a_restart_and_resumes_without_reuploading() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    let path = dir.path().join("restart-upload.bin");
+    let size = 60 * MB;
+    write_pseudo_random_file(&path, size, 0x5EED_4001);
+
+    let cp_base = tempfile::tempdir().expect("checkpoint tempdir");
+    let cp_dir = cp_base.path().to_path_buf();
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-restart-upload";
+    let hub = live_hub(connection_id, &hub_dir).await;
+
+    // --- E1: run mid-flight, pause, land a checkpoint, then drop the engine --
+    let engine1 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        1,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let key = "uploads/restart-upload.bin".to_string();
+    let spec = EnqueueSpec::for_upload(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.clone(),
+        path.clone(),
+    )
+    .expect("for_upload");
+    let task = engine1.enqueue(spec).await.expect("enqueue");
+
+    wait_for_mid_flight(&engine1, &task.id, Duration::from_secs(120)).await;
+    engine1.pause(&task.id).await.expect("pause");
+    wait_for_status(
+        &engine1,
+        &task.id,
+        TransferStatus::Paused,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // The pause forced a checkpoint with the upload id and the parts that
+    // actually landed. Capture it before the drop: this is the entire state
+    // that has to cross the restart.
+    let before = checkpoint::scan(&cp_dir);
+    assert_eq!(
+        before.len(),
+        1,
+        "exactly one checkpoint must exist after a mid-flight pause, saw {before:?}"
+    );
+    let (cp_id, cp) = &before[0];
+    assert_eq!(cp_id, &task.id, "the checkpoint is keyed by the task id");
+    let landed = match &cp.resume {
+        ResumeState::Upload(ms) => ms.clone(),
+        other => panic!("an upload checkpoint must hold an Upload resume state, got {other:?}"),
+    };
+    assert!(
+        !landed.upload_id.is_empty(),
+        "the checkpoint must carry the server upload id to continue"
+    );
+    assert!(
+        !landed.completed.is_empty(),
+        "at least one part must have landed before the pause for this to prove resume"
+    );
+    assert!(
+        pending_uploads_for_key(&client, &bucket, &key).await >= 1,
+        "the paused multipart upload must still be open on the server for resume to continue it"
+    );
+
+    drop(engine1);
+
+    // --- E2: fresh engine over the SAME checkpoint dir + hub; run the scan ---
+    let engine2 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        4,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    restore_from_checkpoints(&engine2, &hub, &cp_dir).await;
+
+    let restored = snapshot_of(&engine2, &task.id)
+        .await
+        .expect("the checkpoint must be rebuilt as a task after the restart scan");
+    assert_eq!(
+        restored.status,
+        TransferStatus::Paused,
+        "a survived transfer must come back Paused, offline, until the user resumes"
+    );
+    assert!(
+        restored.transferred > 0 && restored.transferred < size,
+        "the restored row must show the landed bytes (0 < {} < {size}), not a fresh 0/total",
+        restored.transferred
+    );
+
+    engine2.resume(&task.id).await.expect("resume");
+    wait_for_status(
+        &engine2,
+        &task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(180),
+    )
+    .await;
+
+    assert_eq!(
+        head_object_size(&client, &bucket, &key).await,
+        Some(size),
+        "after the restart-resume completes, the full object must exist"
+    );
+    let downloaded = get_object_bytes(&client, &bucket, &key).await;
+    assert_eq!(
+        hex(&sha256_bytes(&downloaded)),
+        hex(&sha256_file(&path)),
+        "the object assembled across the restart must be byte-identical to the source"
+    );
+    assert_eq!(
+        pending_uploads_for_key(&client, &bucket, &key).await,
+        0,
+        "completing the resumed upload must close the very multipart upload E1 opened"
+    );
+    assert!(
+        checkpoint::scan(&cp_dir).is_empty(),
+        "the checkpoint must be removed once the transfer reaches a terminal state"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 2: a large multipart download paused mid-flight survives an engine drop
+/// and resumes to a byte-correct file. The `.bcpart` staging file and the
+/// checkpoint (ETag baseline + finished chunk numbers) are what cross the
+/// restart; E2 rebuilds the task `Paused` with `transferred` preset from the
+/// finished chunks, and resume re-heads, confirms the unchanged ETag, reopens
+/// the SAME `.bcpart`, and fetches only the remainder. The file's SHA-256 ==
+/// the source object is the end-to-end proof the surviving partial was correct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn download_survives_a_restart_and_resumes_without_refetching() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let cp_base = tempfile::tempdir().expect("checkpoint tempdir");
+    let cp_dir = cp_base.path().to_path_buf();
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-restart-download";
+    let hub = live_hub(connection_id, &hub_dir).await;
+
+    let key = "downloads/restart-download.bin";
+    let size = 60 * MB;
+    let src = seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_4002).await;
+    let target = dl_dir.path().join("restart-download.bin");
+    let total = download_total(&provider, &bucket, key).await;
+
+    // --- E1: run mid-flight, pause, land a checkpoint + .bcpart, then drop ---
+    let engine1 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        1,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "restart-download.bin".to_string(),
+    );
+    let task = engine1.enqueue(spec).await.expect("enqueue");
+
+    wait_for_mid_flight(&engine1, &task.id, Duration::from_secs(120)).await;
+    engine1.pause(&task.id).await.expect("pause");
+    wait_for_status(
+        &engine1,
+        &task.id,
+        TransferStatus::Paused,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    let before = checkpoint::scan(&cp_dir);
+    assert_eq!(before.len(), 1, "one download checkpoint after the pause");
+    let done_chunks = match &before[0].1.resume {
+        ResumeState::Download(ds) => ds.completed_parts.clone(),
+        other => panic!("a download checkpoint must hold a Download resume state, got {other:?}"),
+    };
+    assert!(
+        !done_chunks.is_empty(),
+        "at least one chunk must have finished before the pause for this to prove resume"
+    );
+    assert!(
+        bcpart_path(&target).exists(),
+        "the paused download's .bcpart must exist on disk to be reopened after the restart"
+    );
+    assert!(
+        !target.exists(),
+        "a paused download must not have produced the final file yet"
+    );
+
+    drop(engine1);
+
+    // --- E2: fresh engine over the SAME checkpoint dir + hub; run the scan ---
+    let engine2 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        4,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    restore_from_checkpoints(&engine2, &hub, &cp_dir).await;
+
+    let restored = snapshot_of(&engine2, &task.id)
+        .await
+        .expect("the download checkpoint must be rebuilt as a task after the restart scan");
+    assert_eq!(restored.status, TransferStatus::Paused);
+    assert!(
+        restored.transferred > 0 && restored.transferred < size,
+        "the restored row must show the finished chunks' bytes (0 < {} < {size})",
+        restored.transferred
+    );
+    assert!(
+        bcpart_path(&target).exists(),
+        "the restart scan must keep a live connection's .bcpart (only orphans lose it)"
+    );
+
+    engine2.resume(&task.id).await.expect("resume");
+    wait_for_status(
+        &engine2,
+        &task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(180),
+    )
+    .await;
+
+    assert!(target.exists(), "resume must produce the final file");
+    assert!(
+        !bcpart_path(&target).exists(),
+        "finish renames the .bcpart into place, leaving no staging file"
+    );
+    assert_eq!(
+        hex(&sha256_file(&target)),
+        hex(&sha256_file(&src)),
+        "the file assembled across the restart must be byte-identical to the source object"
+    );
+    assert!(
+        checkpoint::scan(&cp_dir).is_empty(),
+        "the checkpoint must be removed once the download completes"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 3: pausing mid-upload, then rewriting the LOCAL source with different
+/// content (same size, bumped mtime -> a changed fingerprint) before resuming,
+/// must restart the upload from scratch under a fresh upload id -- never splice
+/// new parts onto the stale ones. The resumed runner detects the fingerprint
+/// mismatch, aborts the stale upload, and re-uploads the current file. A green
+/// run is the object's hash matching the NEW source: a spliced object (old
+/// parts + new parts) would hash-match NEITHER source, so equality with the new
+/// one is itself proof every byte came from a fresh upload of the new content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn upload_restarts_from_scratch_when_the_source_changed() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    let path = dir.path().join("source-changed.bin");
+    let size = 60 * MB;
+    write_pseudo_random_file(&path, size, 0x5EED_4003);
+    let original_hash = sha256_file(&path);
+
+    let cp_base = tempfile::tempdir().expect("checkpoint tempdir");
+    let cp_dir = cp_base.path().to_path_buf();
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-restart-source-changed";
+    let hub = live_hub(connection_id, &hub_dir).await;
+
+    let engine1 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        1,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let key = "uploads/source-changed.bin".to_string();
+    let spec = EnqueueSpec::for_upload(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.clone(),
+        path.clone(),
+    )
+    .expect("for_upload");
+    let task = engine1.enqueue(spec).await.expect("enqueue");
+
+    wait_for_mid_flight(&engine1, &task.id, Duration::from_secs(120)).await;
+    engine1.pause(&task.id).await.expect("pause");
+    wait_for_status(
+        &engine1,
+        &task.id,
+        TransferStatus::Paused,
+        Duration::from_secs(60),
+    )
+    .await;
+    let stale_upload_id = match &checkpoint::scan(&cp_dir)[0].1.resume {
+        ResumeState::Upload(ms) => ms.upload_id.clone(),
+        other => panic!("expected an Upload resume state, got {other:?}"),
+    };
+    assert!(
+        pending_uploads_for_key(&client, &bucket, &key).await >= 1,
+        "the stale upload must be open before the source changes"
+    );
+
+    drop(engine1);
+
+    // Rewrite the source underneath the paused upload: same size (so the fixed
+    // task total still plans correctly) but different bytes, and an explicitly
+    // bumped mtime so the (size, mtime) fingerprint provably differs.
+    write_pseudo_random_file(&path, size, 0x5EED_9003);
+    let new_hash = sha256_file(&path);
+    assert_ne!(
+        hex(&original_hash),
+        hex(&new_hash),
+        "the rewrite must actually change the content"
+    );
+    let bumped = std::time::SystemTime::now() + Duration::from_secs(30);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("reopen source to bump mtime")
+        .set_modified(bumped)
+        .expect("bump the source mtime so the fingerprint changes");
+
+    let engine2 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        4,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    restore_from_checkpoints(&engine2, &hub, &cp_dir).await;
+    assert_eq!(
+        snapshot_of(&engine2, &task.id).await.unwrap().status,
+        TransferStatus::Paused,
+        "the task must be restored as Paused before the resume decides to restart it"
+    );
+
+    engine2.resume(&task.id).await.expect("resume");
+    wait_for_status(
+        &engine2,
+        &task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(180),
+    )
+    .await;
+
+    let downloaded = get_object_bytes(&client, &bucket, &key).await;
+    assert_eq!(
+        hex(&sha256_bytes(&downloaded)),
+        hex(&new_hash),
+        "a changed source must re-upload from scratch: the object must hash-match the NEW content \
+         (a splice of old + new parts would match neither)"
+    );
+    assert_ne!(
+        hex(&sha256_bytes(&downloaded)),
+        hex(&original_hash),
+        "the object must not be the pre-change content"
+    );
+    // The stale upload id E1 opened must have been aborted (not continued), so no
+    // pending upload lingers for the key.
+    assert_eq!(
+        pending_uploads_for_key(&client, &bucket, &key).await,
+        0,
+        "the stale upload {stale_upload_id} must be aborted, not left open, when the source changes"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 4: pausing mid-download, then overwriting the REMOTE object (same size,
+/// new content -> a new ETag) before resuming, must discard the stale `.bcpart`
+/// and re-download the current object from scratch. The resumed runner re-heads,
+/// sees the ETag no longer matches the checkpoint's baseline, deletes the stale
+/// staging file, and fetches the new object clean. A green run is the local
+/// file hash-matching the NEW object: keeping the stale partial would leave the
+/// already-"finished" chunks holding OLD bytes, so a match with the new content
+/// is itself proof the partial was thrown away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn download_restarts_from_scratch_when_the_etag_changed() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let cp_base = tempfile::tempdir().expect("checkpoint tempdir");
+    let cp_dir = cp_base.path().to_path_buf();
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-restart-etag-changed";
+    let hub = live_hub(connection_id, &hub_dir).await;
+
+    let key = "downloads/etag-changed.bin";
+    let size = 60 * MB;
+    let old_src =
+        seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_4004).await;
+    let old_hash = sha256_file(&old_src);
+    let target = dl_dir.path().join("etag-changed.bin");
+    let total = download_total(&provider, &bucket, key).await;
+    let old_etag = provider
+        .head_object(&bucket, key)
+        .await
+        .expect("head")
+        .etag
+        .expect("MinIO returns an ETag");
+
+    let engine1 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        1,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "etag-changed.bin".to_string(),
+    );
+    let task = engine1.enqueue(spec).await.expect("enqueue");
+
+    wait_for_mid_flight(&engine1, &task.id, Duration::from_secs(120)).await;
+    engine1.pause(&task.id).await.expect("pause");
+    wait_for_status(
+        &engine1,
+        &task.id,
+        TransferStatus::Paused,
+        Duration::from_secs(60),
+    )
+    .await;
+    // The checkpoint's baseline ETag is the OLD object's; the resume compares
+    // against it after the overwrite below.
+    match &checkpoint::scan(&cp_dir)[0].1.resume {
+        ResumeState::Download(ds) => assert_eq!(
+            ds.etag.as_deref(),
+            Some(old_etag.as_str()),
+            "the checkpoint must record the object's ETag baseline"
+        ),
+        other => panic!("expected a Download resume state, got {other:?}"),
+    }
+    assert!(
+        bcpart_path(&target).exists(),
+        "the paused .bcpart must exist"
+    );
+
+    drop(engine1);
+
+    // Overwrite the remote object with new content of the same size: a new ETag,
+    // a plan that still matches the fixed task total.
+    let new_src = dl_dir.path().join("new-remote.bin");
+    write_pseudo_random_file(&new_src, size, 0x5EED_9004);
+    let new_hash = sha256_file(&new_src);
+    assert_ne!(
+        hex(&old_hash),
+        hex(&new_hash),
+        "the overwrite must change the bytes"
+    );
+    upload_via_primitives(&provider, &bucket, key, &new_src, size).await;
+    let new_etag = provider
+        .head_object(&bucket, key)
+        .await
+        .expect("head after overwrite")
+        .etag
+        .expect("ETag");
+    assert_ne!(old_etag, new_etag, "overwriting must change the ETag");
+
+    let engine2 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        4,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    restore_from_checkpoints(&engine2, &hub, &cp_dir).await;
+    assert_eq!(
+        snapshot_of(&engine2, &task.id).await.unwrap().status,
+        TransferStatus::Paused,
+        "the task must be restored as Paused before the resume discards the stale partial"
+    );
+
+    engine2.resume(&task.id).await.expect("resume");
+    wait_for_status(
+        &engine2,
+        &task.id,
+        TransferStatus::Completed,
+        Duration::from_secs(180),
+    )
+    .await;
+
+    assert!(
+        !bcpart_path(&target).exists(),
+        "no staging file after finish"
+    );
+    assert_eq!(
+        hex(&sha256_file(&target)),
+        hex(&new_hash),
+        "a changed ETag must discard the stale .bcpart and re-download: the file must hash-match \
+         the NEW object (keeping the old partial would leave old bytes in the finished chunks)"
+    );
+    assert_ne!(
+        hex(&sha256_file(&target)),
+        hex(&old_hash),
+        "the file must not be the pre-overwrite content"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+}
+
+/// Test 5: a checkpoint whose connection is no longer in the store is an orphan
+/// -- the startup scan must drop it (and a download's staging `.bcpart`) and
+/// rebuild NO task. This reaches a genuine Paused state first: a real download
+/// runs mid-flight under a live connection, pauses (real checkpoint + real
+/// `.bcpart` on disk), the engine is dropped, and only THEN is the restart
+/// simulated with a hub that no longer knows the connection -- exactly the
+/// "connection deleted between sessions" case. The discard is asserted on the
+/// real files the paused transfer left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn orphan_checkpoint_of_a_deleted_connection_is_discarded_on_startup() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let src_dir = tempfile::tempdir().expect("source tempdir");
+    let dl_dir = tempfile::tempdir().expect("download tempdir");
+    let cp_base = tempfile::tempdir().expect("checkpoint tempdir");
+    let cp_dir = cp_base.path().to_path_buf();
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-orphan-conn";
+    let hub = live_hub(connection_id, &hub_dir).await;
+
+    let key = "downloads/orphan.bin";
+    let size = 60 * MB;
+    seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_4005).await;
+    let target = dl_dir.path().join("orphan.bin");
+    let total = download_total(&provider, &bucket, key).await;
+
+    let engine1 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        1,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    let spec = EnqueueSpec::for_download(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.to_string(),
+        target.clone(),
+        total,
+        "orphan.bin".to_string(),
+    );
+    let task = engine1.enqueue(spec).await.expect("enqueue");
+
+    wait_for_mid_flight(&engine1, &task.id, Duration::from_secs(120)).await;
+    engine1.pause(&task.id).await.expect("pause");
+    wait_for_status(
+        &engine1,
+        &task.id,
+        TransferStatus::Paused,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        checkpoint::scan(&cp_dir).len(),
+        1,
+        "a real checkpoint exists"
+    );
+    assert!(bcpart_path(&target).exists(), "a real .bcpart exists");
+
+    drop(engine1);
+
+    // Simulate the restart with a hub whose store has NO connections (the
+    // connection was deleted): `connection_ids()` is empty, so the checkpoint's
+    // connection is unknown -> orphan.
+    let empty_hub_dir = tempfile::tempdir().expect("empty hub tempdir");
+    let empty_hub = Arc::new(ProviderHub::new(SecureStore {
+        path: empty_hub_dir.path().join("connections.enc"),
+    }));
+    assert!(
+        empty_hub.connection_ids().await.unwrap().is_empty(),
+        "the restart hub must know no connections for this to test the orphan path"
+    );
+    let engine2 = build_engine_cp(
+        Arc::clone(&empty_hub),
+        Arc::new(CollectingSink::default()),
+        4,
+        Some(cp_dir.clone()),
+        Arc::new(AtomicBool::new(true)),
+    );
+    restore_from_checkpoints(&engine2, &empty_hub, &cp_dir).await;
+
+    assert!(
+        checkpoint::scan(&cp_dir).is_empty(),
+        "the orphan checkpoint must be discarded on startup"
+    );
+    assert!(
+        !bcpart_path(&target).exists(),
+        "the orphan download's .bcpart must be deleted -- nobody will ever resume it"
+    );
+    assert!(
+        snapshot_of(&engine2, &task.id).await.is_none(),
+        "no task may be rebuilt for a checkpoint whose connection is gone"
+    );
+    assert!(
+        engine2.snapshot().await.is_empty(),
+        "the orphan scan must rebuild nothing at all"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+    drop(hub);
+    drop(empty_hub);
+}
+
+/// Test 6: the resume toggle, both halves. With `resume_enabled = false`, a
+/// transfer that genuinely runs mid-flight and pauses writes NO checkpoint (the
+/// gate suppresses even the forced pause-point write) -- so nothing could ever
+/// cross a restart. And a pre-existing checkpoint left on disk is neither
+/// restored nor deleted when the disabled startup path (which, like `lib.rs`,
+/// skips the scan entirely while the flag is off) runs -- turning resume off is
+/// non-destructive, not a silent purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn resume_disabled_writes_no_checkpoint_and_skips_restore() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider
+        .create_bucket(&bucket)
+        .await
+        .expect("create bucket");
+
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    let path = dir.path().join("resume-disabled.bin");
+    let size = 60 * MB;
+    write_pseudo_random_file(&path, size, 0x5EED_4006);
+
+    let cp_base = tempfile::tempdir().expect("checkpoint tempdir");
+    let cp_dir = cp_base.path().to_path_buf();
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let connection_id = "e2e-resume-disabled";
+    let hub = live_hub(connection_id, &hub_dir).await;
+
+    // --- Half A: a disabled engine writes no checkpoint even at a pause -------
+    let resume_off = Arc::new(AtomicBool::new(false));
+    let engine1 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        1,
+        Some(cp_dir.clone()),
+        Arc::clone(&resume_off),
+    );
+    let key = "uploads/resume-disabled.bin".to_string();
+    let spec = EnqueueSpec::for_upload(
+        connection_id.to_string(),
+        bucket.clone(),
+        key.clone(),
+        path.clone(),
+    )
+    .expect("for_upload");
+    let task = engine1.enqueue(spec).await.expect("enqueue");
+
+    // Genuinely reach mid-flight and pause, so the gate is what suppresses the
+    // write -- not an early exit that never had a checkpoint to write.
+    wait_for_mid_flight(&engine1, &task.id, Duration::from_secs(120)).await;
+    engine1.pause(&task.id).await.expect("pause");
+    wait_for_status(
+        &engine1,
+        &task.id,
+        TransferStatus::Paused,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        checkpoint::scan(&cp_dir).is_empty(),
+        "with resume disabled, a mid-flight pause must write NO checkpoint (the gate suppresses \
+         even the forced pause-point write), so nothing can cross a restart"
+    );
+
+    // Reap the still-open multipart upload the paused (uncheckpointed) task left,
+    // so the shared container stays clean.
+    engine1.cancel(&task.id).await.expect("cancel");
+    wait_for_status(
+        &engine1,
+        &task.id,
+        TransferStatus::Canceled,
+        Duration::from_secs(60),
+    )
+    .await;
+    drop(engine1);
+
+    // --- Half B: a disabled startup neither restores nor deletes a leftover ---
+    // Seed a pre-existing checkpoint (as a prior enabled session would have).
+    let seeded_id = "seeded-leftover-task";
+    let seeded = checkpoint::Checkpoint {
+        direction: Direction::Upload,
+        connection_id: connection_id.to_string(),
+        bucket: bucket.clone(),
+        key: "uploads/leftover.bin".to_string(),
+        local_path: path.to_string_lossy().to_string(),
+        file_name: "leftover.bin".to_string(),
+        total: size,
+        resume: ResumeState::Upload(MultipartState {
+            upload_id: "u-leftover".to_string(),
+            completed: vec![],
+            source_size: size,
+            source_mtime: 1,
+        }),
+    };
+    checkpoint::write(&cp_dir, seeded_id, &seeded).expect("seed a leftover checkpoint");
+    assert_eq!(
+        checkpoint::scan(&cp_dir).len(),
+        1,
+        "the seeded checkpoint must be present before the disabled startup"
+    );
+
+    let engine2 = build_engine_cp(
+        Arc::clone(&hub),
+        Arc::new(CollectingSink::default()),
+        4,
+        Some(cp_dir.clone()),
+        Arc::clone(&resume_off),
+    );
+    // Mirror `lib.rs`: the restore scan runs only while resume is enabled. With
+    // the flag off, the whole scan/restore block is skipped -- so nothing is
+    // rebuilt and nothing is deleted.
+    if resume_off.load(std::sync::atomic::Ordering::Relaxed) {
+        restore_from_checkpoints(&engine2, &hub, &cp_dir).await;
+    }
+
+    assert!(
+        snapshot_of(&engine2, seeded_id).await.is_none(),
+        "a disabled startup must not rebuild the leftover checkpoint into a task"
+    );
+    assert!(
+        engine2.snapshot().await.is_empty(),
+        "a disabled startup must rebuild nothing at all"
+    );
+    let after = checkpoint::scan(&cp_dir);
+    assert_eq!(
+        after.len(),
+        1,
+        "a disabled startup must be non-destructive: the leftover checkpoint must remain on disk"
+    );
+    assert_eq!(
+        after[0].0, seeded_id,
+        "and it must be the very same checkpoint"
     );
 
     cleanup_bucket(&client, &provider, &bucket).await;
