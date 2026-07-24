@@ -9,6 +9,8 @@ import {
 } from "react";
 import {
   AlertTriangle,
+  Download,
+  FolderDown,
   FolderOpen,
   Loader2,
   MousePointerClick,
@@ -25,6 +27,7 @@ import { fileMeta } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
 import { useBrowse, type BrowseQuery } from "@/hooks/use-browse";
 import { useErrorText } from "@/hooks/use-error-text";
+import { useStartDownloads } from "@/hooks/use-start-downloads";
 import { useStartUploads } from "@/hooks/use-start-uploads";
 import { useApp, type SelectMode } from "@/store/app-store";
 
@@ -82,21 +85,44 @@ function useEntryHandlers(orderedFileKeys: string[]) {
 /** Per-row hover actions, revealed on hover and kept keyboard-reachable via
  * `group-focus-within` (same affordance the sidebar's connection row uses).
  *
- * Folders get a delete action (recursive: it removes the `prefix/` marker and
- * every object underneath, via `delete_prefix`) but deliberately NO rename:
- * renaming a prefix means copying every key beneath it, which isn't wired
- * yet. The folder delete routes through the same delete dialog as files --
+ * Files get download, rename and delete; folders get download and delete but
+ * deliberately NO rename (renaming a prefix means copying every key beneath
+ * it, which isn't wired yet). The file download queues a single-object
+ * transfer and the folder download recurses the whole prefix -- both routed
+ * through the shared `useStartDownloads` at the `FileBrowser` level, whose
+ * handlers are threaded down here so one dialog/error surface serves every
+ * row. The folder delete routes through the same delete dialog as files --
  * the dialog detects the trailing "/" and switches to the recursive path and
  * its own "folder and all its contents" confirmation copy. This is what
  * finally makes an *empty* in-app folder deletable (M3 left its zero-byte
  * marker unreachable from any UI gesture). */
-function RowActions({ entry }: { entry: ObjectEntry }) {
+function RowActions({
+  entry,
+  onDownloadFile,
+  onDownloadFolder,
+}: {
+  entry: ObjectEntry;
+  onDownloadFile: (entry: ObjectEntry) => void;
+  onDownloadFolder: (entry: ObjectEntry) => void;
+}) {
   const { t } = useTranslation();
   const { openRename, openDeleteObjects } = useApp();
 
   if (entry.is_prefix) {
     return (
-      <span className="flex w-[64px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+      <span className="flex w-[92px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDownloadFolder(entry);
+          }}
+          title={t("objects.downloadFolder")}
+          aria-label={t("objects.downloadFolder")}
+          className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-active hover:text-primary"
+        >
+          <FolderDown className="size-3.5" />
+        </button>
         <button
           type="button"
           onClick={(e) => {
@@ -114,7 +140,19 @@ function RowActions({ entry }: { entry: ObjectEntry }) {
   }
 
   return (
-    <span className="flex w-[64px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+    <span className="flex w-[92px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onDownloadFile(entry);
+        }}
+        title={t("objects.download")}
+        aria-label={t("objects.download")}
+        className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-active hover:text-primary"
+      >
+        <Download className="size-3.5" />
+      </button>
       <button
         type="button"
         onClick={(e) => {
@@ -180,10 +218,14 @@ function ListView({
   entries,
   query,
   orderedFileKeys,
+  onDownloadFile,
+  onDownloadFolder,
 }: {
   entries: ObjectEntry[];
   query: BrowseQuery;
   orderedFileKeys: string[];
+  onDownloadFile: (entry: ObjectEntry) => void;
+  onDownloadFolder: (entry: ObjectEntry) => void;
 }) {
   const { t } = useTranslation();
   const { selectedKeys } = useApp();
@@ -219,7 +261,7 @@ function ListView({
         <span className="w-24 text-right">{t("main.colSize")}</span>
         <span className="w-[120px] pl-5">{t("main.colType")}</span>
         <span className="w-[150px] pl-5">{t("main.colModified")}</span>
-        <span className="w-[64px]" />
+        <span className="w-[92px]" />
       </div>
       <div className="relative" style={{ height: rowVirtualizer.getTotalSize() }}>
         {virtualItems.map((vi) => {
@@ -258,7 +300,11 @@ function ListView({
               <span className="w-[150px] pl-5 text-[12.5px] text-muted-foreground tabular-nums">
                 {entry.is_prefix ? "—" : formatDate(entry.last_modified)}
               </span>
-              <RowActions entry={entry} />
+              <RowActions
+                entry={entry}
+                onDownloadFile={onDownloadFile}
+                onDownloadFolder={onDownloadFolder}
+              />
             </div>
           );
         })}
@@ -382,6 +428,7 @@ export function FileBrowser() {
   const { activeBucket, path, view } = useApp();
   const { query, entries, searching } = useBrowse();
   const { startUploads, guardReady, dialog } = useStartUploads();
+  const { startFileDownload, startFolderDownload, dialog: downloadDialog } = useStartDownloads();
   const [dragging, setDragging] = useState(false);
 
   // `useCallback` so this effect's dependency actually holds still.
@@ -472,7 +519,13 @@ export function FileBrowser() {
     body = (
       <>
         {view === "list" ? (
-          <ListView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
+          <ListView
+            entries={entries}
+            query={query}
+            orderedFileKeys={orderedFileKeys}
+            onDownloadFile={startFileDownload}
+            onDownloadFolder={startFolderDownload}
+          />
         ) : (
           <GridView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
         )}
@@ -493,6 +546,7 @@ export function FileBrowser() {
         </div>
       )}
       {dialog}
+      {downloadDialog}
     </div>
   );
 }

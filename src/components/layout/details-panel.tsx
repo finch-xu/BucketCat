@@ -3,15 +3,18 @@ import { useTranslation } from "react-i18next";
 import { fileMeta, isImageExt } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
 import { useBrowse } from "@/hooks/use-browse";
+import { useStartDownloads } from "@/hooks/use-start-downloads";
 import { useApp } from "@/store/app-store";
 
-/** Shows the single selected file's real metadata. Download/copy-link/share
- * stay visual placeholders until M4 (transfers) and M6 (presign); delete is
- * wired to the object dialogs. ETag/head_object detail arrives in M6. */
+/** Shows the single selected file's real metadata. Copy-link/share stay
+ * visual placeholders until M6 (presign); download and delete are wired --
+ * download queues a transfer via the shared `useStartDownloads`, delete via
+ * the object dialogs. ETag/head_object detail arrives in M6. */
 export function DetailsPanel() {
   const { t } = useTranslation();
   const { selectedKeys, clearSelection, openDeleteObjects } = useApp();
   const { entries } = useBrowse();
+  const { startFileDownload, dialog } = useStartDownloads();
 
   const entry =
     selectedKeys.length === 1
@@ -50,6 +53,7 @@ export function DetailsPanel() {
         <div className="my-4 grid grid-cols-2 gap-2">
           <button
             type="button"
+            onClick={() => startFileDownload(entry)}
             className="inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] bg-primary text-[12.5px] font-semibold text-primary-foreground hover:bg-primary-strong"
           >
             <Download className="size-3.5" />
@@ -101,6 +105,7 @@ export function DetailsPanel() {
           </div>
         </div>
       </div>
+      {dialog}
     </aside>
   );
 }
