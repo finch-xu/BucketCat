@@ -615,21 +615,16 @@ impl Provider for S3Provider {
     }
 
     async fn delete_prefix(&self, bucket: &str, prefix: &str) -> AppResult<BatchResult> {
-        // An empty prefix would enumerate (and delete) every object in the
-        // bucket. That is never a UI gesture -- the only "empty the bucket"
-        // path is the deliberate, separately-guarded delete-bucket flow -- so
-        // reject it outright rather than silently wiping the bucket. Mapped
-        // to `Internal` (like `folder_marker_key`/`from_connection`): the
-        // frontend only ever calls this with a real `prefix/` folder key, so
-        // an empty one reaching here is an upstream bug, not a storage
-        // condition the user caused.
         // Harden the destructive boundary here, not just upstream: require a
-        // folder-shaped (`/`-terminated) prefix. An empty prefix would wipe the
-        // whole bucket; a non-slash prefix like `doc` would match and delete
-        // siblings `docs/…`, `docs2/…`, `document.txt` under the delimiter-less
-        // walk. The frontend only ever passes a real `prefix/` folder key, so
+        // folder-shaped (`/`-terminated) prefix. An empty prefix would
+        // enumerate and delete every object in the bucket; a non-slash prefix
+        // like `doc` would match and delete siblings `docs/…`, `docs2/…`,
+        // `document.txt` under the delimiter-less walk. The only deliberate
+        // "empty the bucket" path is the separately-guarded delete-bucket flow,
+        // and the frontend only ever passes a real `prefix/` folder key, so
         // anything else reaching here is an upstream bug -- mapped to `Internal`
-        // like `folder_marker_key`/`from_connection`.
+        // (like `folder_marker_key`/`from_connection`) rather than a storage
+        // condition the user caused.
         if !is_deletable_prefix(prefix) {
             return Err(AppError::Internal {
                 message: "delete_prefix requires a folder prefix ending in '/'".to_string(),

@@ -167,10 +167,24 @@ where
     // Open (or reopen) the staging file. On a fresh start create+preallocate;
     // on resume the .bcpart already holds the finished chunks.
     let (partfile, done) = if let Some(ds) = existing {
-        (
-            PartFile::reopen(&job.target, total, &ds.bcpart)?,
-            ds.completed_parts,
-        )
+        match PartFile::reopen(&job.target, total, &ds.bcpart) {
+            Ok(pf) => (pf, ds.completed_parts),
+            Err(err) => {
+                // The `.bcpart` vanished while paused (an OS temp sweep, a
+                // manual cleanup). Retry never clears the resume slot, so a
+                // hard `reopen(...)?` here would re-fail on every attempt and
+                // strand the task at Failed with no way to restart. A missing
+                // staging file means the previously-finished chunks' bytes are
+                // gone too, so the only recovery is a clean restart from an
+                // empty `done`. A genuine create failure below is still a real
+                // error (the `?` stays).
+                tracing::warn!(
+                    task = %job.task_id,
+                    "reopening .bcpart failed ({err}); restarting the download from scratch"
+                );
+                (PartFile::create(&job.target, total)?, Vec::new())
+            }
+        }
     } else {
         (PartFile::create(&job.target, total)?, Vec::new())
     };
@@ -263,33 +277,48 @@ where
         bcpart: bcpart.clone(),
     }));
 
+    // Read the stop intent once. Anything arriving after this line arrived
+    // during the finish, and the contract is explicit that a real completion
+    // wins that race. A user-requested stop also wins over "all chunks happened
+    // to finish": cancel discards the .bcpart, pause keeps it.
+    let stop = job.stopped();
+
+    if stop == Some(StopKind::Cancel) {
+        // Deliberately ahead of `first_error`, mirroring upload's ordering. An
+        // error makes the engine file the task `Failed`, and cancelling a
+        // `Failed` task never reaches a runner again -- so if the error won
+        // here, deleting the `.bcpart` would be the cleanup nobody ever
+        // performs and the staging file would leak on local disk forever
+        // (`clear_finished` does not reap it). The error is worth less than the
+        // cleanup: the user asked for this download to go away.
+        //
+        // Drop the Arc so the file handle closes before we delete it.
+        drop(partfile);
+        // Best effort: a failed delete must not turn the cancellation into a
+        // failed task, but it belongs in the log -- a leaked `.bcpart` keeps
+        // costing local disk until something reaps it.
+        if let Err(err) = std::fs::remove_file(&bcpart) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    task = %job.task_id,
+                    path = %bcpart.display(),
+                    "removing .bcpart on cancel failed: {err}"
+                );
+            }
+        }
+        *job.resume.lock().await = None;
+        return Ok(RunOutcome::Stopped);
+    }
+
     if let Some(err) = first_error {
         return Err(err);
     }
 
-    // A user-requested stop wins over "all chunks happened to finish": cancel
-    // discards the .bcpart, pause keeps it.
-    match job.stopped() {
-        Some(StopKind::Cancel) => {
-            // Drop the Arc so the file handle closes before we delete it.
-            drop(partfile);
-            // Best effort: a failed delete must not turn the cancellation into a
-            // failed task, but it belongs in the log -- a leaked `.bcpart` keeps
-            // costing local disk until something reaps it.
-            if let Err(err) = std::fs::remove_file(&bcpart) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        task = %job.task_id,
-                        path = %bcpart.display(),
-                        "removing .bcpart on cancel failed: {err}"
-                    );
-                }
-            }
-            *job.resume.lock().await = None;
-            return Ok(RunOutcome::Stopped);
-        }
-        Some(StopKind::Pause) => return Ok(RunOutcome::Stopped),
-        None => {}
+    if stop.is_some() {
+        // A pause. The `.bcpart` and the finished chunk numbers stay in the
+        // resume slot (persisted above) so the next run reopens the same
+        // staging file instead of re-downloading from zero.
+        return Ok(RunOutcome::Stopped);
     }
 
     // M3: belt-and-suspenders. Nothing above explains a short list, and
@@ -347,6 +376,24 @@ where
     let Some(bytes) = bytes else {
         return Ok(None);
     };
+    // The `.bcpart` is zero-filled by `set_len`, so a short range response (the
+    // object shrank between head and get, or a non-conformant gateway) would
+    // leave a zero gap yet still mark the chunk complete -- `finish()` would
+    // then rename a corrupt file into place and report it `Completed`, the one
+    // hole in "Completed = bytes landed" (the M3 guard counts chunks, not
+    // bytes). Refuse to write anything but the exact requested byte count. A
+    // 0-byte object's single length-0 chunk yields an empty Vec and satisfies
+    // `0 == 0`, so it needs no special case.
+    if bytes.len() as u64 != chunk.length {
+        return Err(AppError::Internal {
+            message: format!(
+                "range read for {key} chunk {} returned {} bytes, expected {}",
+                chunk.number,
+                bytes.len(),
+                chunk.length
+            ),
+        });
+    }
     partfile.write_at(chunk.offset, &bytes)?;
     progress(chunk.length);
     Ok(Some(chunk.number))
@@ -540,6 +587,10 @@ mod tests {
         /// Fire the stop switch when this chunk's range is fetched -- this is
         /// how a user's pause/cancel is made to land in the middle of a run.
         stop_at_chunk: StdMutex<Option<(i32, StopKind)>>,
+        /// Return only this many bytes for the named chunk instead of the full
+        /// requested length -- a short/partial range response, as from an
+        /// object that shrank between head and get or a non-conformant gateway.
+        short_chunk: StdMutex<Option<(i32, u64)>>,
         /// How long one range read takes. Non-zero makes concurrency observable
         /// and makes a read abandonable while it is still in flight.
         op_delay: Duration,
@@ -568,6 +619,7 @@ mod tests {
                 peak: AtomicUsize::new(0),
                 failures: StdMutex::new(HashMap::new()),
                 stop_at_chunk: StdMutex::new(None),
+                short_chunk: StdMutex::new(None),
                 op_delay: Duration::ZERO,
             }
         }
@@ -634,7 +686,14 @@ mod tests {
 
             let start = offset as usize;
             let end = start + length as usize;
-            Ok(self.object[start..end].to_vec())
+            let mut bytes = self.object[start..end].to_vec();
+            // Simulate a short/partial range response for the named chunk.
+            if let Some((n, keep)) = *self.short_chunk.lock().unwrap() {
+                if n == number {
+                    bytes.truncate(keep as usize);
+                }
+            }
+            Ok(bytes)
         }
 
         async fn head_object(&self, _bucket: &str, _key: &str) -> AppResult<ObjectHead> {
@@ -1123,5 +1182,115 @@ mod tests {
             2,
             "the semaphore must be acquired before spawning, or all eight chunks go out at once"
         );
+    }
+
+    // Test 9 (Finding 1): a cancel that races a non-retryable chunk error still
+    // wins -- the download is `Stopped` and the `.bcpart` discarded, not
+    // `Failed` with a leaked staging file. Modelled on upload.rs's
+    // `a_cancel_racing_a_part_failure_still_aborts_the_upload`. Chunk 1's range
+    // read fires the cancel *and then* returns a permanent error, so by join
+    // time `first_error` is `Some` *and* the stop intent is `Cancel` at once.
+    // Cancel must be handled ahead of `first_error`: the engine files an
+    // errored download `Failed`, and cancelling a `Failed` task never reaches a
+    // runner again, so the `.bcpart`-deleting cancel branch would otherwise be
+    // the cleanup nobody ever performs and the staging file would leak forever.
+    #[tokio::test]
+    async fn a_cancel_racing_a_chunk_failure_still_discards_the_bcpart() {
+        let object = make_object((16 * MB) as usize);
+        let rig = rig(1, object.clone(), |fake| {
+            *fake.stop_at_chunk.lock().unwrap() = Some((1, StopKind::Cancel));
+            fake.failures
+                .lock()
+                .unwrap()
+                .insert(1, (u32::MAX, Fail::Permanent));
+        });
+
+        let outcome = rig.run(object.len() as u64).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            RunOutcome::Stopped,
+            "cancel must win over a co-occurring non-retryable error"
+        );
+        assert!(
+            !rig.bcpart().exists(),
+            "a cancel discards the staging file even when an error raced it -- otherwise the \
+             .bcpart leaks forever, since the Failed task never reruns to clean it up"
+        );
+        assert!(
+            !rig.target.exists(),
+            "a cancelled download must never produce the target file"
+        );
+        assert!(
+            rig.resume_state().await.is_none(),
+            "a cancel clears the resume slot"
+        );
+    }
+
+    // Test 10 (Finding 2): a range read that returns fewer bytes than requested
+    // must fail the task, not silently leave a zero gap in the preallocated
+    // `.bcpart` and rename a corrupt file into place. Without the byte-count
+    // assertion the short chunk is marked complete, `finish()` renames, and the
+    // download reports `Completed` for a file with a hole in it -- the one hole
+    // in "Completed = bytes landed" that the chunk-counting M3 guard cannot see.
+    #[tokio::test]
+    async fn a_short_range_read_fails_the_task_and_never_completes() {
+        let object = make_object((16 * MB) as usize);
+        let total = object.len() as u64;
+        let short = multipart_plan(total)[0].length - 1;
+        let rig = rig(4, object.clone(), |fake| {
+            *fake.short_chunk.lock().unwrap() = Some((1, short));
+        });
+
+        let err = rig.run(total).await.unwrap_err();
+
+        assert_eq!(
+            err.code(),
+            "internal",
+            "a short range read is a broken-invariant failure, not a storage error"
+        );
+        assert!(
+            !rig.target.exists(),
+            "a short chunk must never be renamed into place as a complete download"
+        );
+    }
+
+    // Test 11 (Finding 3): a resume whose `.bcpart` has vanished (an OS temp
+    // sweep, a manual cleanup) must fall back to a clean restart rather than
+    // fail `reopen` forever. With the old `reopen(...)?` this run errored and,
+    // because retry never clears the resume slot, stayed stuck at Failed. The
+    // resume records chunk 1 as done, but the missing staging file means its
+    // bytes are gone too, so a correct restart re-fetches chunk 1 as well.
+    #[tokio::test]
+    async fn a_resume_with_a_missing_bcpart_restarts_cleanly() {
+        let object = make_object((16 * MB) as usize);
+        let total = object.len() as u64;
+        let rig = rig(4, object.clone(), |_| {});
+
+        rig.seed_resume(DownloadState {
+            etag: None,
+            completed_parts: vec![1],
+            bcpart: rig.bcpart(),
+        })
+        .await;
+        assert!(
+            !rig.bcpart().exists(),
+            "the staging file is gone before the resume -- that is the condition under test"
+        );
+
+        let outcome = rig.run(total).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.chunks_seen(),
+            vec![1, 2],
+            "a clean restart must re-fetch chunk 1 too -- its bytes vanished with the .bcpart"
+        );
+        assert_eq!(
+            rig.read_target(),
+            object,
+            "the restarted download must still assemble the exact source object"
+        );
+        assert!(rig.resume_state().await.is_none());
     }
 }
