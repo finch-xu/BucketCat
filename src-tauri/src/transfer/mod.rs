@@ -7,6 +7,7 @@
 pub mod engine;
 pub mod model;
 pub mod part;
+pub mod partfile;
 pub mod progress;
 pub mod retry;
 pub mod upload;
@@ -17,6 +18,7 @@ pub use engine::{
 };
 pub use model::{next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto};
 pub use part::{plan_upload, PartSpec, UploadPlan};
+pub use partfile::{bcpart_path, PartFile};
 pub use progress::{
     eta_secs, spawn_aggregator, ProgressMsg, ProgressPayload, ProgressSink, PROGRESS_INTERVAL,
 };
