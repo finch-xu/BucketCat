@@ -177,29 +177,92 @@ where
         }
     }
 
-    // Open (or reopen) the staging file. On a fresh start create+preallocate;
-    // on resume the .bcpart already holds the finished chunks.
-    let (partfile, done) = if let Some(ds) = existing {
-        match PartFile::reopen(&job.target, total, &ds.bcpart) {
-            Ok(pf) => (pf, ds.completed_parts),
-            Err(err) => {
-                // The `.bcpart` vanished while paused (an OS temp sweep, a
-                // manual cleanup). Retry never clears the resume slot, so a
-                // hard `reopen(...)?` here would re-fail on every attempt and
-                // strand the task at Failed with no way to restart. A missing
-                // staging file means the previously-finished chunks' bytes are
-                // gone too, so the only recovery is a clean restart from an
-                // empty `done`. A genuine create failure below is still a real
-                // error (the `?` stays).
-                tracing::warn!(
-                    task = %job.task_id,
-                    "reopening .bcpart failed ({err}); restarting the download from scratch"
-                );
-                (PartFile::create(&job.target, total)?, Vec::new())
+    // Stage the `.bcpart` and reconcile against the object (M4c). The order
+    // differs by fresh vs resume on purpose:
+    //
+    // * A **fresh** download preallocates its staging file *before* the head --
+    //   a local, network-free step -- so a download reaches the disk before it
+    //   touches the network (M4b's property, which the dispatch routing test
+    //   leans on), and only then heads the object to record the ETag baseline a
+    //   later resume compares against. Task 5 persisted `None` here, which no
+    //   resume could trust.
+    // * A **resume** heads *first*, because it has to decide whether the
+    //   existing `.bcpart` can be trusted before reopening it. The `.bcpart` is
+    //   only as good as the object still being the one the download started
+    //   against, and the ETag is that proof.
+    let (partfile, done, etag): (PartFile, Vec<i32>, Option<String>) = match existing {
+        None => {
+            let pf = PartFile::create(&job.target, total)?;
+            match provider.head_object(&job.bucket, &job.key).await {
+                Ok(head) => (pf, Vec::new(), head.etag),
+                Err(err) => {
+                    // A retryable failure re-runs the whole download, which
+                    // reuses this same freshly-created `.bcpart`, so keep it. A
+                    // permanent one (a 404, an auth error) can never succeed, so
+                    // don't leave a stray, untracked staging file behind.
+                    if !is_retryable(&err) {
+                        pf.abort();
+                    }
+                    return Err(err);
+                }
             }
         }
-    } else {
-        (PartFile::create(&job.target, total)?, Vec::new())
+        Some(ds) => match provider.head_object(&job.bucket, &job.key).await {
+            Ok(head) => {
+                // Continue only if the object is provably unchanged. A changed
+                // ETag -- or no baseline ETag to trust (an in-memory state
+                // predating the field, or a head that returned none) -- means
+                // the `.bcpart` may not match the current object, so discard it
+                // and restart from scratch under the current ETag. A mismatched
+                // partial must never be presented as a resumed download.
+                if ds.etag.is_some() && ds.etag == head.etag {
+                    match PartFile::reopen(&job.target, total, &ds.bcpart) {
+                        Ok(pf) => (pf, ds.completed_parts, head.etag),
+                        Err(err) => {
+                            // The `.bcpart` vanished while paused (an OS temp
+                            // sweep, a manual cleanup). Retry never clears the
+                            // resume slot, so a hard `reopen(...)?` here would
+                            // re-fail on every attempt and strand the task at
+                            // Failed with no way to restart. A missing staging
+                            // file means the previously-finished chunks' bytes
+                            // are gone too, so the only recovery is a clean
+                            // restart from an empty `done`. A genuine create
+                            // failure below is still a real error (the `?`).
+                            tracing::warn!(
+                                task = %job.task_id,
+                                "reopening .bcpart failed ({err}); restarting the download from scratch"
+                            );
+                            (PartFile::create(&job.target, total)?, Vec::new(), head.etag)
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        task = %job.task_id,
+                        key = %job.key,
+                        "object changed under the resume; discarding the .bcpart and restarting the download"
+                    );
+                    discard_stale_bcpart(&job.task_id, &ds.bcpart);
+                    (PartFile::create(&job.target, total)?, Vec::new(), head.etag)
+                }
+            }
+            Err(err) => {
+                // The head failed on a resume. A definitive 404 means the object
+                // is gone: the partial can never become a correct copy of it, so
+                // discard it and surface the failure. A transient head failure
+                // (timeout, unreachable) must leave the `.bcpart` intact so the
+                // engine's retry can reconcile again -- throwing away good bytes
+                // on a blip would be its own bug.
+                if matches!(err, AppError::KeyNotFound { .. }) {
+                    tracing::info!(
+                        task = %job.task_id,
+                        key = %job.key,
+                        "object gone under the resume; discarding the .bcpart"
+                    );
+                    discard_stale_bcpart(&job.task_id, &ds.bcpart);
+                }
+                return Err(err);
+            }
+        },
     };
     let partfile = Arc::new(partfile);
     let bcpart = partfile.bcpart_path().to_path_buf();
@@ -220,7 +283,7 @@ where
     // Record resume state immediately so a cancel before any chunk lands still
     // knows which .bcpart to delete.
     let init_state = ResumeState::Download(DownloadState {
-        etag: None,
+        etag: etag.clone(),
         completed_parts: done.clone(),
         bcpart: bcpart.clone(),
     });
@@ -289,7 +352,7 @@ where
     // Persist what landed before deciding anything, so a pause, a permanent
     // failure and a later retry all resume from the same place.
     let landed_state = ResumeState::Download(DownloadState {
-        etag: None,
+        etag: etag.clone(),
         completed_parts: completed.clone(),
         bcpart: bcpart.clone(),
     });
@@ -369,6 +432,22 @@ where
         .finish()?;
     *job.resume.lock().await = None;
     Ok(RunOutcome::Completed)
+}
+
+/// Best-effort removal of a `.bcpart` whose object changed or vanished under a
+/// resume (M4c). A failed delete must not turn the reconcile into a failed
+/// task, but it belongs in the log -- a leaked `.bcpart` keeps costing local
+/// disk until something reaps it. Mirrors the cancel branch's cleanup.
+fn discard_stale_bcpart(task_id: &str, bcpart: &std::path::Path) {
+    if let Err(err) = std::fs::remove_file(bcpart) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                task = %task_id,
+                path = %bcpart.display(),
+                "removing stale .bcpart on resume mismatch failed: {err}"
+            );
+        }
+    }
 }
 
 async fn download_one_chunk<P>(
@@ -469,7 +548,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
@@ -477,6 +556,12 @@ mod tests {
     use crate::transfer::partfile::bcpart_path;
 
     const MB: u64 = 1024 * 1024;
+
+    /// The ETag the fake's `head_object` reports by default, and the baseline a
+    /// resume test seeds into its `DownloadState`. Kept in one place so an
+    /// "unchanged" resume can assert continue and a "changed" resume can flip
+    /// the head to something else.
+    const OBJECT_ETAG: &str = "etag-v1";
 
     fn spec(number: i32) -> PartSpec {
         PartSpec {
@@ -618,6 +703,14 @@ mod tests {
         /// How long one range read takes. Non-zero makes concurrency observable
         /// and makes a read abandonable while it is still in flight.
         op_delay: Duration,
+        /// The ETag `head_object` reports. `Some(OBJECT_ETAG)` by default so a
+        /// fresh download stores a real baseline and an unchanged resume's
+        /// stored ETag matches; a test flips it to make "current" differ from a
+        /// checkpoint's stored ETag -- i.e. the object changed under the resume.
+        head_etag: StdMutex<Option<String>>,
+        /// When set, `head_object` fails with `storage/key-not-found`, as if the
+        /// object had been deleted between the checkpoint and the resume (a 404).
+        head_missing: AtomicBool,
     }
 
     impl FakeProvider {
@@ -645,6 +738,8 @@ mod tests {
                 stop_at_chunk: StdMutex::new(None),
                 short_chunk: StdMutex::new(None),
                 op_delay: Duration::ZERO,
+                head_etag: StdMutex::new(Some(OBJECT_ETAG.to_string())),
+                head_missing: AtomicBool::new(false),
             }
         }
 
@@ -722,9 +817,14 @@ mod tests {
 
         async fn head_object(&self, _bucket: &str, _key: &str) -> AppResult<ObjectHead> {
             self.heads.fetch_add(1, Ordering::SeqCst);
+            if self.head_missing.load(Ordering::SeqCst) {
+                return Err(AppError::KeyNotFound {
+                    key: "k".to_string(),
+                });
+            }
             Ok(ObjectHead {
                 size: self.object.len() as u64,
-                etag: None,
+                etag: self.head_etag.lock().unwrap().clone(),
                 content_type: None,
             })
         }
@@ -1101,7 +1201,9 @@ mod tests {
             // Dropped without finish(): the .bcpart stays on disk holding chunk 1.
         }
         rig.seed_resume(DownloadState {
-            etag: None,
+            // The head still reports OBJECT_ETAG, so this in-session resume is
+            // provably against the same object and continues (M4c).
+            etag: Some(OBJECT_ETAG.to_string()),
             completed_parts: vec![1],
             bcpart: rig.bcpart(),
         })
@@ -1305,7 +1407,10 @@ mod tests {
         let rig = rig(4, object.clone(), |_| {});
 
         rig.seed_resume(DownloadState {
-            etag: None,
+            // The etag still matches the head, so the resume is trusted and
+            // reaches the reopen -- which then hits the missing-.bcpart fallback
+            // this test is about, not the M4c etag discard.
+            etag: Some(OBJECT_ETAG.to_string()),
             completed_parts: vec![1],
             bcpart: rig.bcpart(),
         })
@@ -1329,5 +1434,166 @@ mod tests {
             "the restarted download must still assemble the exact source object"
         );
         assert!(rig.resume_state().await.is_none());
+    }
+
+    // Test 12 (M4c Task 8): a cross-restart resume whose object CHANGED -- the
+    // head's ETag no longer matches the checkpoint's stored ETag -- must discard
+    // the stale `.bcpart` and re-fetch EVERY chunk, the one the checkpoint marked
+    // complete included. Splicing fresh chunks onto bytes from a different object
+    // would assemble a plausible-looking corrupt file. The stale chunk 1 is
+    // pre-staged with a garbage fill, so trusting it shows up twice: chunk 1 is
+    // never re-fetched, and its garbage survives into the assembled file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn download_resume_restarts_when_the_etag_changed() {
+        let object = make_object((16 * MB) as usize);
+        let total = object.len() as u64;
+        let rig = rig(4, object.clone(), |fake| {
+            // "current" object differs from the one the checkpoint was cut against.
+            *fake.head_etag.lock().unwrap() = Some("etag-v2".to_string());
+        });
+
+        // Pre-stage a stale chunk 1 recorded complete under the OLD etag, with
+        // deliberately wrong bytes so a reused-partial bug corrupts the file.
+        let plan = multipart_plan(total);
+        let c1 = plan[0];
+        {
+            let pf = PartFile::create(&rig.target, total).unwrap();
+            pf.write_at(c1.offset, &vec![0xABu8; c1.length as usize])
+                .unwrap();
+            // Dropped without finish(): the .bcpart stays on disk holding the
+            // stale chunk 1.
+        }
+        assert!(rig.bcpart().exists());
+        rig.seed_resume(DownloadState {
+            etag: Some(OBJECT_ETAG.to_string()),
+            completed_parts: vec![1],
+            bcpart: rig.bcpart(),
+        })
+        .await;
+
+        let outcome = rig.run(total).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.chunks_seen(),
+            vec![1, 2],
+            "a changed object must re-fetch every chunk, not trust the stale .bcpart"
+        );
+        assert_eq!(
+            rig.provider.calls_of(1),
+            1,
+            "the chunk the checkpoint marked complete must be re-downloaded after the etag changed"
+        );
+        assert_eq!(
+            rig.read_target(),
+            object,
+            "the restart must assemble the CURRENT object, not the stale partial's garbage bytes"
+        );
+        assert!(
+            !rig.bcpart().exists(),
+            "a completed restart renames its fresh .bcpart into place"
+        );
+        assert!(rig.resume_state().await.is_none());
+    }
+
+    // Test 13 (M4c Task 8): a cross-restart resume whose object is UNCHANGED --
+    // the head's ETag still matches the checkpoint's stored ETag -- must reuse
+    // the `.bcpart` and fetch only the missing chunks, exactly as M4b's
+    // in-session resume does. Guards the reconcile against over-discarding a
+    // still-valid partial: if it re-fetched everything this would fail on chunk
+    // 1's call count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn download_resume_continues_when_the_etag_matches() {
+        let object = make_object((16 * MB) as usize);
+        let total = object.len() as u64;
+        let rig = rig(4, object.clone(), |_| {}); // default head etag == OBJECT_ETAG
+
+        // Pre-stage chunk 1 with its CORRECT bytes; the resume records it done
+        // under the same etag the head still reports.
+        let plan = multipart_plan(total);
+        let c1 = plan[0];
+        {
+            let pf = PartFile::create(&rig.target, total).unwrap();
+            pf.write_at(
+                c1.offset,
+                &object[c1.offset as usize..(c1.offset + c1.length) as usize],
+            )
+            .unwrap();
+        }
+        rig.seed_resume(DownloadState {
+            etag: Some(OBJECT_ETAG.to_string()),
+            completed_parts: vec![1],
+            bcpart: rig.bcpart(),
+        })
+        .await;
+
+        let outcome = rig.run(total).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.calls_of(1),
+            0,
+            "an unchanged object must not re-download a chunk already in the .bcpart"
+        );
+        assert_eq!(
+            rig.provider.calls_of(2),
+            1,
+            "only the missing chunk is fetched on an unchanged resume"
+        );
+        assert_eq!(
+            rig.read_target(),
+            object,
+            "the resumed download must still assemble the exact source object"
+        );
+        assert!(rig.resume_state().await.is_none());
+    }
+
+    // Test 14 (M4c Task 8): a resume whose object has VANISHED (head 404 /
+    // NotFound) must never present the stale `.bcpart` as a resumed download: it
+    // discards the partial and surfaces the not-found failure. Under M4b this
+    // resumed and "completed" against the still-in-memory fake bytes -- a file
+    // the server no longer has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn download_resume_discards_and_fails_when_the_object_is_gone() {
+        let object = make_object((16 * MB) as usize);
+        let total = object.len() as u64;
+        let rig = rig(4, object.clone(), |fake| {
+            fake.head_missing.store(true, Ordering::SeqCst);
+        });
+
+        let plan = multipart_plan(total);
+        let c1 = plan[0];
+        {
+            let pf = PartFile::create(&rig.target, total).unwrap();
+            pf.write_at(
+                c1.offset,
+                &object[c1.offset as usize..(c1.offset + c1.length) as usize],
+            )
+            .unwrap();
+        }
+        assert!(rig.bcpart().exists());
+        rig.seed_resume(DownloadState {
+            etag: Some(OBJECT_ETAG.to_string()),
+            completed_parts: vec![1],
+            bcpart: rig.bcpart(),
+        })
+        .await;
+
+        let err = rig.run(total).await.unwrap_err();
+
+        assert_eq!(err.code(), "storage/key-not-found");
+        assert!(
+            !rig.bcpart().exists(),
+            "a resume against a vanished object discards the stale partial"
+        );
+        assert!(
+            !rig.target.exists(),
+            "nothing is renamed into place when the object is gone"
+        );
+        assert_eq!(
+            rig.provider.chunks_seen(),
+            Vec::<i32>::new(),
+            "not a single chunk is fetched once the head says the object is gone"
+        );
     }
 }
