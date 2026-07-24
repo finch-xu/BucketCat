@@ -1,14 +1,19 @@
 //! Transfer commands. Thin, like every other command module: parse, delegate
 //! to [`TransferEngine`], return a DTO.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use tauri::State;
 
 use crate::commands::AppState;
 use crate::error::AppResult;
-use crate::provider::Provider;
+use crate::provider::{ObjectEntry, Provider};
 use crate::transfer::{EnqueueSpec, TransferEngine, TransferTaskDto};
+
+/// Objects per `list_objects_flat` page while walking a folder for download.
+/// 1000 is S3's `ListObjectsV2` maximum, so the subtree is walked in the
+/// fewest possible round-trips (mirrors the provider's own recursive walks).
+const FLAT_LIST_PAGE_SIZE: i32 = 1000;
 
 /// JavaScript's `String.prototype.trim` semantics, which are NOT Rust's
 /// `str::trim`: ECMAScript strips Unicode `White_Space` *minus* U+0085
@@ -137,6 +142,137 @@ pub async fn enqueue_download(
         .unwrap_or_else(|| key.rsplit('/').next().unwrap_or(&key).to_string());
     let spec = EnqueueSpec::for_download(connection_id, bucket, key, path, head.size, file_name);
     engine.enqueue(spec).await
+}
+
+/// The local path an object lands at under a folder download: `local_dir`
+/// joined with `key`'s path relative to `prefix`, with any `..`/absolute
+/// components stripped so a crafted key can never escape `local_dir`.
+///
+/// `key` comes from the remote store and is therefore attacker-influenceable:
+/// a key like `docs/../../etc/passwd` must NOT resolve outside `local_dir`.
+/// The relative part (whatever follows `prefix`) is rebuilt from *only* its
+/// [`Component::Normal`] pieces, so `ParentDir` (`..`), `RootDir` (a leading
+/// `/`), `CurDir` (`.`) and Windows `Prefix` components are all dropped. The
+/// result is always a descendant of `local_dir`.
+///
+/// Returns `None` when nothing normal survives -- e.g. `key` equal to the
+/// `prefix` marker (`"docs/"`), which strips to an empty relative path. That
+/// must not silently produce `local_dir` itself. A `key` that does not start
+/// with `prefix` (defensive; `list_objects_flat` only returns keys under
+/// `prefix`) is treated as its own relative path and still sanitized, so it
+/// can never escape either.
+fn local_target(prefix: &str, key: &str, local_dir: &Path) -> Option<PathBuf> {
+    let relative = key.strip_prefix(prefix).unwrap_or(key);
+    let mut sanitized = PathBuf::new();
+    for component in Path::new(relative).components() {
+        if let Component::Normal(part) = component {
+            sanitized.push(part);
+        }
+    }
+    if sanitized.as_os_str().is_empty() {
+        return None;
+    }
+    Some(local_dir.join(sanitized))
+}
+
+/// Queues a recursive folder download: one task per real object under
+/// `prefix`, reconstructing the subtree beneath `local_dir`.
+///
+/// The subtree is walked with the delimiter-less [`Provider::list_objects_flat`]
+/// in a pagination loop (like `delete_prefix`), which returns every object
+/// under `prefix` INCLUDING zero-byte folder-marker objects. Those markers --
+/// any key ending in `/`, both the `prefix/` marker itself and any nested
+/// empty-folder marker -- are skipped: they are directory placeholders, not
+/// files, and downloading one would create a spurious empty file named after
+/// the folder.
+///
+/// Each object's local target is `local_dir` joined with its path relative to
+/// `prefix`, sanitized by [`local_target`] so a crafted key can never escape
+/// `local_dir`. The size comes straight from the listing (which already
+/// carries it); only when the server omitted it does this fall back to a
+/// per-object `head_object`, avoiding a wasted round-trip otherwise.
+///
+/// Design §7 partial failure: an object that cannot be turned into a usable
+/// local path (or whose head fallback / enqueue fails) is skipped with a
+/// `warn!` and the walk continues -- one bad object must not sink the whole
+/// folder. Returns the tasks that were actually enqueued.
+#[tauri::command]
+pub async fn enqueue_folder_download(
+    state: State<'_, AppState>,
+    engine: State<'_, TransferEngine>,
+    connection_id: String,
+    bucket: String,
+    prefix: String,
+    local_dir: String,
+) -> AppResult<Vec<TransferTaskDto>> {
+    let provider = state.hub().provider(&connection_id).await?;
+    let local_dir = PathBuf::from(&local_dir);
+
+    // Accumulate every object across pages, exactly like `delete_prefix`.
+    let mut entries: Vec<ObjectEntry> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = provider
+            .list_objects_flat(&bucket, &prefix, token.as_deref(), FLAT_LIST_PAGE_SIZE)
+            .await?;
+        entries.extend(page.entries);
+        match page.next_token {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+
+    let mut queued = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // Skip folder markers: a key ending in `/` is a 0-byte directory
+        // placeholder (the `prefix/` marker or a nested empty-folder marker),
+        // not a file. `local_target` also rejects the exact `prefix` marker,
+        // but a nested marker like `docs/sub/` strips to `sub` and would
+        // otherwise be enqueued as a bogus file -- so the skip happens here.
+        if entry.key.ends_with('/') {
+            continue;
+        }
+        let Some(path) = local_target(&prefix, &entry.key, &local_dir) else {
+            tracing::warn!(key = %entry.key, "skipping object with no usable local path");
+            continue;
+        };
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| {
+                entry
+                    .key
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&entry.key)
+                    .to_string()
+            });
+        // Prefer the size the flat listing already carries; only head the
+        // object when the server omitted it (a wasted round-trip otherwise).
+        let total = match entry.size {
+            Some(size) => size,
+            None => match provider.head_object(&bucket, &entry.key).await {
+                Ok(head) => head.size,
+                Err(err) => {
+                    tracing::warn!(key = %entry.key, "skipping object whose size could not be resolved: {err}");
+                    continue;
+                }
+            },
+        };
+        let spec = EnqueueSpec::for_download(
+            connection_id.clone(),
+            bucket.clone(),
+            entry.key,
+            path,
+            total,
+            file_name,
+        );
+        match engine.enqueue(spec).await {
+            Ok(task) => queued.push(task),
+            Err(err) => tracing::warn!("skipping object that could not be enqueued: {err}"),
+        }
+    }
+    Ok(queued)
 }
 
 /// Every task the engine knows about, newest first. Called once when the
@@ -339,5 +475,87 @@ mod tests {
             "/definitely/does/not/exist/a.txt".to_string(),
         )
         .is_none());
+    }
+
+    // --- local_target: the relative structure under `prefix` is preserved,
+    // but a crafted key can never escape `local_dir` (the whole point). -----
+
+    #[test]
+    fn local_target_preserves_the_subtree_under_the_prefix() {
+        assert_eq!(
+            local_target("docs/", "docs/sub/a.txt", Path::new("/D")),
+            Some(PathBuf::from("/D/sub/a.txt"))
+        );
+    }
+
+    #[test]
+    fn local_target_of_a_direct_child_lands_at_the_root_of_local_dir() {
+        assert_eq!(
+            local_target("docs/", "docs/a.txt", Path::new("/D")),
+            Some(PathBuf::from("/D/a.txt"))
+        );
+    }
+
+    #[test]
+    fn local_target_strips_parent_dir_so_a_crafted_key_cannot_escape() {
+        // A key carrying `..` segments must not write outside `local_dir`.
+        // The discriminating assertion is the *absence of `..`*: `starts_with`
+        // alone is fooled by a lexical `/D/../secret` (it still "starts with"
+        // /D), so a sanitizer regression would slip past a starts_with-only
+        // test. See the red/green proof in the task report.
+        let target = local_target("docs/", "docs/../secret", Path::new("/D"))
+            .expect("a sanitized `..` key still has a Normal component");
+        assert!(
+            target.components().all(|c| c != Component::ParentDir),
+            "sanitized path must contain no `..`: {}",
+            target.display()
+        );
+        assert!(
+            target.starts_with("/D"),
+            "sanitized path must stay under local_dir: {}",
+            target.display()
+        );
+        // Concretely: the `..` is dropped, not resolved.
+        assert_eq!(target, PathBuf::from("/D/secret"));
+    }
+
+    #[test]
+    fn local_target_strips_a_deep_dot_dot_traversal() {
+        let target = local_target("docs/", "docs/../../etc/passwd", Path::new("/D"))
+            .expect("normal components survive");
+        assert!(target.components().all(|c| c != Component::ParentDir));
+        assert!(target.starts_with("/D"));
+        assert_eq!(target, PathBuf::from("/D/etc/passwd"));
+    }
+
+    #[test]
+    fn local_target_strips_an_absolute_root_component() {
+        // A prefix without a trailing slash makes the relative part begin with
+        // `/`; the RootDir component must be dropped, not honoured, or the
+        // join would jump to the filesystem root.
+        let target =
+            local_target("docs", "docs/etc", Path::new("/D")).expect("normal components survive");
+        assert_eq!(target, PathBuf::from("/D/etc"));
+        assert!(target.starts_with("/D"));
+    }
+
+    #[test]
+    fn local_target_of_the_prefix_marker_is_none_not_local_dir_itself() {
+        // The `prefix/` marker strips to an empty relative path; returning
+        // `local_dir` itself would point a download at the folder, so it must
+        // be `None`. (The command skips `/`-terminated keys before ever
+        // reaching here, but the helper still must not manufacture a target.)
+        assert_eq!(local_target("docs/", "docs/", Path::new("/D")), None);
+    }
+
+    #[test]
+    fn local_target_of_a_key_not_under_the_prefix_is_still_contained() {
+        // Defensive: `list_objects_flat` only returns keys under `prefix`, but
+        // if one slips through it is treated as its own relative path and
+        // still sanitized -- it can never escape `local_dir`.
+        let target = local_target("docs/", "other/a.txt", Path::new("/D"))
+            .expect("normal components survive");
+        assert_eq!(target, PathBuf::from("/D/other/a.txt"));
+        assert!(target.starts_with("/D"));
     }
 }

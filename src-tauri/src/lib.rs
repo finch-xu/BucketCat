@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use commands::{
     add_connection, cancel_transfer, clear_finished_transfers, create_folder, delete_connection,
-    delete_objects, delete_prefix, enqueue_download, enqueue_uploads, list_buckets,
-    list_connections, list_objects, list_transfers, pause_transfer, rename_object, resume_transfer,
-    retry_transfer, test_connection, update_connection, AppState,
+    delete_objects, delete_prefix, enqueue_download, enqueue_folder_download, enqueue_uploads,
+    list_buckets, list_connections, list_objects, list_transfers, pause_transfer, rename_object,
+    resume_transfer, retry_transfer, test_connection, update_connection, AppState,
 };
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -117,6 +117,7 @@ pub fn run() {
             create_folder,
             enqueue_uploads,
             enqueue_download,
+            enqueue_folder_download,
             list_transfers,
             pause_transfer,
             resume_transfer,

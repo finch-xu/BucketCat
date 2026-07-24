@@ -319,6 +319,25 @@ export function enqueueDownload(
   });
 }
 
+/** Queues a recursive folder download: one task per real object under
+ * `prefix`, reconstructing the subtree beneath `localDir` (an absolute path
+ * the frontend picked via the directory dialog). Zero-byte folder markers are
+ * skipped, and objects that resolve to no usable local path are dropped rather
+ * than failing the batch, so the result may be shorter than the object count. */
+export function enqueueFolderDownload(
+  connectionId: string,
+  bucket: string,
+  prefix: string,
+  localDir: string,
+): Promise<TransferTask[]> {
+  return invokeCommand<TransferTask[]>("enqueue_folder_download", {
+    connectionId,
+    bucket,
+    prefix,
+    localDir,
+  });
+}
+
 export function listTransfers(): Promise<TransferTask[]> {
   return invokeCommand<TransferTask[]>("list_transfers");
 }
