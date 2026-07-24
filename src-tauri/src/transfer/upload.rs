@@ -907,6 +907,17 @@ mod tests {
             Ok(())
         }
 
+        // Task 4 adds the trait method; Task 7 will make this fake return
+        // meaningful data for resume-after-restart tests. Not exercised yet.
+        async fn multipart_list(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> AppResult<Vec<UploadedPart>> {
+            Ok(Vec::new())
+        }
+
         async fn head_object(&self, _bucket: &str, _key: &str) -> AppResult<ObjectHead> {
             unimplemented!("an upload never heads objects")
         }

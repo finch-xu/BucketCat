@@ -817,6 +817,41 @@ impl Provider for S3Provider {
         Ok(())
     }
 
+    async fn multipart_list(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> AppResult<Vec<UploadedPart>> {
+        let mut out = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_parts()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id);
+            if let Some(m) = &marker {
+                req = req.part_number_marker(m);
+            }
+            let resp = req.send().await.map_err(normalize_s3_error)?;
+            for p in resp.parts() {
+                out.push(UploadedPart {
+                    number: p.part_number().unwrap_or_default(),
+                    etag: p.e_tag().unwrap_or_default().to_string(),
+                    size: p.size().unwrap_or_default().max(0) as u64,
+                });
+            }
+            if resp.is_truncated().unwrap_or(false) {
+                marker = resp.next_part_number_marker().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     async fn head_object(&self, bucket: &str, key: &str) -> AppResult<ObjectHead> {
         let out = self
             .client

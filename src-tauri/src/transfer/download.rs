@@ -799,6 +799,15 @@ mod tests {
             unimplemented!("a download never aborts a multipart upload")
         }
 
+        async fn multipart_list(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> AppResult<Vec<UploadedPart>> {
+            unimplemented!("a download never lists multipart parts")
+        }
+
         async fn list_objects_flat(
             &self,
             _bucket: &str,

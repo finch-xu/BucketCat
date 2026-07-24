@@ -211,6 +211,18 @@ pub trait Provider {
     /// billing for storage indefinitely.
     async fn multipart_abort(&self, bucket: &str, key: &str, upload_id: &str) -> AppResult<()>;
 
+    /// Lists the parts the server has actually accepted for an in-progress
+    /// multipart upload (`ListParts`, paginated). M4c's cross-restart resume
+    /// treats this as the authoritative "already done" set -- a checkpoint
+    /// file can lie (write interrupted, disk truncated), but the server's own
+    /// record of what it received cannot.
+    async fn multipart_list(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> AppResult<Vec<UploadedPart>>;
+
     /// Cheapest possible metadata read: object size (needed to plan the
     /// download) plus ETag/content-type. `storage/key-not-found` if absent.
     async fn head_object(&self, bucket: &str, key: &str) -> AppResult<ObjectHead>;

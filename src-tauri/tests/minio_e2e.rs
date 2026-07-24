@@ -1252,6 +1252,45 @@ async fn aborting_a_multipart_upload_removes_the_fragments() {
     cleanup_bucket(&client, &provider, &bucket).await;
 }
 
+/// `multipart_list` (ListParts) reports exactly the parts the server has
+/// actually accepted for an in-progress upload -- the authoritative
+/// "already done" set M4c's cross-restart resume (Task 7) consults instead
+/// of trusting a local checkpoint file, which could be stale or truncated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn multipart_list_returns_the_accepted_parts() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let bucket = unique_bucket_name();
+    provider.create_bucket(&bucket).await.expect("bucket");
+    let key = "mp/list.bin";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("src.bin");
+    write_pseudo_random_file(&path, 20 * MB, 0x5EED_2001);
+
+    let upload_id = provider.multipart_init(&bucket, key).await.expect("init");
+    let plan = match plan_upload(20 * MB) {
+        UploadPlan::Multipart { parts, .. } => parts,
+        _ => panic!("20MB must be multipart"),
+    };
+    for p in plan.iter().take(2) {
+        provider
+            .upload_part_from_file(&bucket, key, &upload_id, p.number, &path, p.offset, p.length)
+            .await
+            .expect("upload_part");
+    }
+    let listed = provider
+        .multipart_list(&bucket, key, &upload_id)
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 2, "the two uploaded parts must be listed");
+    assert!(
+        listed.iter().all(|p| !p.etag.is_empty()),
+        "each listed part has an etag"
+    );
+    let _ = provider.multipart_abort(&bucket, key, &upload_id).await;
+    cleanup_bucket(&raw_seed_client(), &provider, &bucket).await;
+}
+
 /// A 0-byte file lands as a real 0-byte object. The single-stream path
 /// (`plan_upload(0) == Single { length: 0 }`) must handle an empty body --
 /// this is folder-marker-adjacent and easy to get wrong.
