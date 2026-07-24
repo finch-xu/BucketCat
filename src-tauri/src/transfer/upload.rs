@@ -66,6 +66,27 @@ pub fn pending_parts(plan: &[PartSpec], done: &[UploadedPart]) -> Vec<PartSpec> 
         .collect()
 }
 
+/// The source file's fingerprint -- `(size, mtime as unix milliseconds)` --
+/// captured when a multipart upload is created. A cross-restart resume
+/// (M4c) will compare this against the file's current fingerprint before
+/// trusting a saved resume state, so a `stat` that fails must not fail the
+/// upload itself: it degrades to `(0, 0)`, the same as a fingerprint that
+/// was simply never captured.
+fn source_fingerprint(path: &std::path::Path) -> (u64, i64) {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            (meta.len(), mtime)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
 /// The slice of a [`TaskContext`] an upload actually uses.
 struct UploadJob {
     task_id: String,
@@ -231,6 +252,16 @@ where
         .cloned()
         .collect();
 
+    // Captured once per multipart upload, not re-`stat`ed on every write below:
+    // a resumed run must keep reporting the fingerprint of the file as it was
+    // when the upload was created, so a later cross-restart resume (M4c) can
+    // tell the source changed instead of comparing the file against itself.
+    let (source_size, source_mtime) = if existing.upload_id.is_empty() {
+        source_fingerprint(&job.path)
+    } else {
+        (existing.source_size, existing.source_mtime)
+    };
+
     let upload_id = if existing.upload_id.is_empty() {
         let id = provider.multipart_init(&job.bucket, &job.key).await?;
         // Recorded immediately: if everything below fails, a cancel still has
@@ -238,6 +269,8 @@ where
         *job.resume.lock().await = Some(ResumeState::Upload(MultipartState {
             upload_id: id.clone(),
             completed: carried.clone(),
+            source_size,
+            source_mtime,
         }));
         id
     } else {
@@ -309,6 +342,8 @@ where
     *job.resume.lock().await = Some(ResumeState::Upload(MultipartState {
         upload_id: upload_id.clone(),
         completed: done.clone(),
+        source_size,
+        source_mtime,
     }));
 
     // Read the stop intent once. Anything arriving after this line arrived
@@ -957,6 +992,22 @@ mod tests {
         fn reported(&self) -> u64 {
             self.reported.load(Ordering::SeqCst)
         }
+
+        /// Like `job`, but pointed at a real file instead of `job()`'s
+        /// deliberately-nonexistent stand-in. Only the fingerprint test below
+        /// needs a real file on disk -- everything else in this module is
+        /// exercised entirely through the fake provider, which never touches
+        /// the filesystem itself.
+        fn job_at(&self, path: PathBuf) -> UploadJob {
+            UploadJob {
+                path,
+                ..self.job()
+            }
+        }
+
+        async fn run_at(&self, path: PathBuf, total: u64) -> AppResult<RunOutcome> {
+            run_upload(&self.job_at(path), Arc::clone(&self.provider), total).await
+        }
     }
 
     #[tokio::test]
@@ -1144,6 +1195,7 @@ mod tests {
                 etag: "\"etag-1\"".to_string(),
                 size: 8 * MB,
             }],
+            ..Default::default()
         })
         .await;
 
@@ -1317,6 +1369,7 @@ mod tests {
                 etag: "\"stale\"".to_string(),
                 size: 8 * MB,
             }],
+            ..Default::default()
         })
         .await;
 
@@ -1371,6 +1424,7 @@ mod tests {
                 etag: "\"etag-1\"".to_string(),
                 size: 8 * MB,
             }],
+            ..Default::default()
         })
         .await;
         rig.switch.request(StopKind::Cancel);
@@ -1397,6 +1451,33 @@ mod tests {
             rig.resume_state().await.is_none(),
             "the upload was aborted, so its id and parts are worthless"
         );
+    }
+
+    #[tokio::test]
+    async fn a_paused_multipart_upload_records_the_source_files_fingerprint() {
+        // A completed upload clears its resume slot entirely (see
+        // `a_multipart_upload_reports_completed_only_after_the_server_assembles_it`),
+        // so the fingerprint has to be observed on a *paused* upload instead --
+        // exactly like `pausing_a_multipart_upload_keeps_its_upload_id_and_accepted_parts`,
+        // just against a real file so `run_upload` has something to stat.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src.bin");
+        std::fs::write(&path, vec![7u8; 20 * MB as usize]).unwrap(); // > MULTIPART_THRESHOLD
+        let meta = std::fs::metadata(&path).unwrap();
+
+        let rig = rig(1, |fake| {
+            *fake.stop_at_part.lock().unwrap() = Some((1, StopKind::Pause));
+        });
+
+        let outcome = rig.run_at(path.clone(), 20 * MB).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Stopped);
+        let state = rig
+            .resume_state()
+            .await
+            .expect("a pause must leave resume state, fingerprint included");
+        assert_eq!(state.source_size, meta.len());
+        assert!(state.source_mtime > 0, "mtime must be captured");
     }
 
     #[tokio::test]

@@ -142,6 +142,14 @@ impl TaskControl {
 pub struct MultipartState {
     pub upload_id: String,
     pub completed: Vec<UploadedPart>,
+    /// The source file's size, in bytes, captured when the multipart upload
+    /// was created. A cross-restart resume (M4c) will compare this against
+    /// the file's current size before trusting the resume.
+    pub source_size: u64,
+    /// The source file's mtime, unix milliseconds, captured alongside
+    /// `source_size`. `0` means the fingerprint was never captured -- either
+    /// an in-memory state predating this field, or a `stat` that failed.
+    pub source_mtime: i64,
 }
 
 /// In-flight download bookkeeping for an in-session pause/resume. **Memory
@@ -1652,6 +1660,7 @@ mod tests {
                 etag: "\"e1\"".to_string(),
                 size: 8,
             }],
+            ..Default::default()
         }
     }
 
