@@ -308,6 +308,15 @@ pub(crate) fn chunk_keys(keys: &[String], size: usize) -> Vec<&[String]> {
     keys.chunks(size).collect()
 }
 
+/// Whether `prefix` is safe to hand to a recursive `delete_prefix`. Requires a
+/// folder-shaped, `/`-terminated prefix: an empty one would wipe the whole
+/// bucket, and a non-slash one (`doc`) would match and delete siblings
+/// (`docs/…`, `document.txt`) under the delimiter-less walk. Pure so the
+/// destructive boundary's guard is unit-tested rather than trusted.
+pub(crate) fn is_deletable_prefix(prefix: &str) -> bool {
+    prefix.ends_with('/')
+}
+
 /// Characters percent-encoded in an `x-amz-copy-source` value: everything
 /// except RFC 3986 unreserved characters and `/` (the bucket/key
 /// separator). The SDK does NOT encode this header itself, and unencoded
@@ -614,9 +623,16 @@ impl Provider for S3Provider {
         // frontend only ever calls this with a real `prefix/` folder key, so
         // an empty one reaching here is an upstream bug, not a storage
         // condition the user caused.
-        if prefix.is_empty() {
+        // Harden the destructive boundary here, not just upstream: require a
+        // folder-shaped (`/`-terminated) prefix. An empty prefix would wipe the
+        // whole bucket; a non-slash prefix like `doc` would match and delete
+        // siblings `docs/…`, `docs2/…`, `document.txt` under the delimiter-less
+        // walk. The frontend only ever passes a real `prefix/` folder key, so
+        // anything else reaching here is an upstream bug -- mapped to `Internal`
+        // like `folder_marker_key`/`from_connection`.
+        if !is_deletable_prefix(prefix) {
             return Err(AppError::Internal {
-                message: "delete_prefix requires a non-empty prefix".to_string(),
+                message: "delete_prefix requires a folder prefix ending in '/'".to_string(),
             });
         }
 
@@ -1523,6 +1539,18 @@ mod tests {
 
     fn numbered_keys(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("k{i}")).collect()
+    }
+
+    #[test]
+    fn is_deletable_prefix_requires_a_trailing_slash() {
+        // The recursive-delete guard: only folder-shaped prefixes are safe.
+        assert!(is_deletable_prefix("docs/"));
+        assert!(is_deletable_prefix("a/b/c/"));
+        // Empty would wipe the bucket; a non-slash prefix would delete
+        // siblings (docs2/, document.txt) under the delimiter-less walk.
+        assert!(!is_deletable_prefix(""));
+        assert!(!is_deletable_prefix("docs"));
+        assert!(!is_deletable_prefix("doc"));
     }
 
     #[test]
