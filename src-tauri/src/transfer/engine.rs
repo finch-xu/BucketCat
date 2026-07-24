@@ -1639,7 +1639,7 @@ mod tests {
         // no live runner, so `cancel` applies `Canceled` itself and must abort
         // the orphaned upload -- nobody else will. The unit harness has no live
         // endpoint, so the network abort cannot fire; but the engine *reaching*
-        // the abort path is observable: `abort_orphaned_multipart` `take()`s the
+        // the abort path is observable: `cleanup_orphaned_transfer` `take()`s the
         // resume slot before it ever touches the network, so a drained slot
         // proves the path ran and the discriminator (`resume` still `Some`) fired
         // before the warn-and-return on the unreachable endpoint.
@@ -1681,7 +1681,7 @@ mod tests {
         // biased `select!` and applies `Cancel` through `apply_stop` -- without
         // ever acquiring a permit or invoking the runner. That engine-side apply
         // must also abort the orphaned upload. Same observation as path 1: the
-        // drained slot proves `abort_orphaned_multipart` ran.
+        // drained slot proves `cleanup_orphaned_transfer` ran.
         let h = harness(1);
         // Task a takes the only permit and parks, so b is provably stuck Queued.
         let running = h.engine.enqueue(spec("a")).await.unwrap();
@@ -1718,7 +1718,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelling_a_paused_task_without_multipart_state_is_a_plain_cancel() {
         // The discriminator must not fire on a single-stream task: with an empty
-        // resume slot there is no upload to abort, and `abort_orphaned_multipart`
+        // resume slot there is no upload to abort, and `cleanup_orphaned_transfer`
         // must return without incident. (A `None` slot never reaches the network
         // build at all.)
         let h = harness(1);
