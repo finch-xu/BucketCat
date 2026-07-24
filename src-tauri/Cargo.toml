@@ -42,4 +42,8 @@ tauri-plugin-dialog = "2"
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util", "macros", "rt-multi-thread"] }
+# Already resolved at 0.11.0 in the main dependency tree (see `[dependencies]`
+# above and Cargo.lock), so adding it here as a dev-dependency for the MinIO
+# end-to-end hash checks pulls no new crate and no extra compile.
+sha2 = "0.11.0"
 
