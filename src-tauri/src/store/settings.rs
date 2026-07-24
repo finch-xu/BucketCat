@@ -53,6 +53,25 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// Returns the `(max_tasks, max_parts)` the transfer engine should be
+    /// constructed with, clamped to the same `[1, 5]` / `[1, 8]` ranges the
+    /// setter commands enforce on the write path.
+    ///
+    /// The write path already clamps, but `load` deliberately does not (it
+    /// only deserializes and falls back to defaults on a missing/corrupt
+    /// file), so a hand-edited or externally-written `settings.json` can
+    /// still hold an out-of-range value. Clamping here — at the single point
+    /// where settings cross into the engine — keeps `max_tasks: 0` from
+    /// building a zero-permit `Semaphore` that would silently deadlock every
+    /// transfer, and keeps `max_tasks: 999` from bypassing the documented
+    /// concurrency cap. Mirrors the `.max(1)` guard the part limit already
+    /// has at its own consume site.
+    pub fn engine_bounds(&self) -> (usize, usize) {
+        (clamp_tasks(self.max_tasks), clamp_parts(self.max_parts))
+    }
+}
+
 /// Clamps a caller-requested max-concurrent-tasks setting to `[1, 5]`.
 pub fn clamp_tasks(n: usize) -> usize {
     n.clamp(1, 5)
@@ -154,5 +173,32 @@ mod tests {
         assert_eq!(clamp_tasks(99), 5);
         assert_eq!(clamp_parts(0), 1);
         assert_eq!(clamp_parts(99), 8);
+    }
+
+    #[test]
+    fn engine_bounds_clamp_out_of_range_persisted_values() {
+        // A hand-edited `settings.json` can hold values the write-path
+        // clamps never saw. `max_tasks: 0` must not reach the engine (a
+        // zero-permit semaphore deadlocks every transfer); `999` must not
+        // bypass the documented cap.
+        let low = Settings {
+            max_tasks: 0,
+            max_parts: 0,
+            ..Default::default()
+        };
+        assert_eq!(low.engine_bounds(), (1, 1));
+        let high = Settings {
+            max_tasks: 999,
+            max_parts: 999,
+            ..Default::default()
+        };
+        assert_eq!(high.engine_bounds(), (5, 8));
+        // In-range values pass through untouched.
+        let ok = Settings {
+            max_tasks: 3,
+            max_parts: 4,
+            ..Default::default()
+        };
+        assert_eq!(ok.engine_bounds(), (3, 4));
     }
 }

@@ -118,9 +118,18 @@ pub fn run() {
                 }),
                 Arc::new(TauriStateSink(handle)),
                 progress_tx,
-                EngineConfig {
-                    max_tasks: settings.max_tasks,
-                    max_parts: settings.max_parts,
+                {
+                    // Clamp the persisted concurrency to the documented
+                    // ranges before the engine consumes it: `load` does not
+                    // clamp, so a hand-edited `settings.json` with
+                    // `max_tasks: 0` would otherwise build a zero-permit
+                    // semaphore and deadlock every transfer. See
+                    // `Settings::engine_bounds`.
+                    let (max_tasks, max_parts) = settings.engine_bounds();
+                    EngineConfig {
+                        max_tasks,
+                        max_parts,
+                    }
                 },
                 Some(checkpoint_dir.clone()),
                 resume_enabled.clone(),
