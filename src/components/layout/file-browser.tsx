@@ -182,24 +182,31 @@ function RowActions({
 }
 
 /** Batch action bar, visible only while objects are selected. Selection is
- * files-only (folder clicks clear it), so every selected key resolves to a
- * real object in the current listing -- `entries` is passed in so the batch
- * download can name each local file from `entry.name`, exactly as the
- * single-file download does, rather than re-deriving it from the key. */
+ * files-only (folder clicks clear it), so every selected key is a real object.
+ * `entries` is passed in only to recover each object's display name: when a
+ * selected key is still in the loaded listing we name its local file from
+ * `entry.name` (exactly as single-file download does); when it is not -- a
+ * selected key can outlive the listing, e.g. deleted elsewhere then a manual
+ * Refresh re-fetches without clearing the selection -- we fall back to the
+ * key's basename so the key is still queued rather than silently dropped. A
+ * now-missing object then surfaces as a visible error, not a shorter batch. */
 function SelectionBar({
   entries,
   onDownload,
 }: {
   entries: ObjectEntry[];
-  onDownload: (entries: ObjectEntry[]) => void;
+  onDownload: (items: { key: string; name: string }[]) => void;
 }) {
   const { t } = useTranslation();
   const { selectedKeys, clearSelection, openDeleteObjects } = useApp();
 
   if (selectedKeys.length === 0) return null;
 
-  const selectedSet = new Set(selectedKeys);
-  const selectedEntries = entries.filter((e) => selectedSet.has(e.key));
+  const nameByKey = new Map(entries.map((e) => [e.key, e.name]));
+  const selectedItems = selectedKeys.map((key) => ({
+    key,
+    name: nameByKey.get(key) ?? (key.slice(key.lastIndexOf("/") + 1) || key),
+  }));
 
   return (
     <div className="flex h-11 shrink-0 items-center justify-between gap-3 border-t border-border bg-background px-4">
@@ -216,7 +223,7 @@ function SelectionBar({
         </button>
         <button
           type="button"
-          onClick={() => onDownload(selectedEntries)}
+          onClick={() => onDownload(selectedItems)}
           className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-[8px] bg-primary px-3 text-[12.5px] font-semibold text-primary-foreground hover:bg-primary-strong"
         >
           <Download className="size-3.5" />

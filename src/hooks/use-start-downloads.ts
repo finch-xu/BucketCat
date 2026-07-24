@@ -28,13 +28,21 @@ export interface UseStartDownloadsResult {
   startFolderDownload: (entry: ObjectEntry) => void;
   /** Downloads several selected file objects at once (the selection bar's
    * batch action). Opens a single directory picker (defaulting to the system
-   * download directory); on confirm, queues one task per entry into that
+   * download directory); on confirm, queues one task per item into that
    * directory (local path = dir/name), pushes every returned task and opens
    * the panel. A cancelled picker does nothing, and an empty list is a no-op.
-   * Selection is files-only (clicking a folder clears the selection), so every
-   * entry here is a real object -- no prefix recursion, unlike the folder
-   * download; each file just lands flat in the chosen directory. */
-  startBatchDownload: (entries: ObjectEntry[]) => void;
+   *
+   * Takes `{ key, name }` pairs rather than `ObjectEntry`s on purpose: the
+   * caller works from the selection (a set of keys), and a selected key can
+   * outlive the loaded listing it was picked from -- e.g. an object deleted
+   * elsewhere, then a manual Refresh that re-fetches the listing without
+   * clearing the selection. Passing keys straight through means such a key is
+   * still queued and its now-missing object surfaces as a visible
+   * `storage/key-not-found` error, instead of being silently dropped when it
+   * no longer resolves to an entry. Selection is files-only (clicking a folder
+   * clears it), so every item is a real object -- no prefix recursion, unlike
+   * the folder download; each file lands flat in the chosen directory. */
+  startBatchDownload: (items: { key: string; name: string }[]) => void;
   /** Pre-keyed error dialog element -- render `{dialog}` anywhere under this
    * hook's caller; it is `null` while nothing has failed. Mirrors the way
    * `useStartUploads` surfaces a rejected command instead of letting it be an
@@ -110,8 +118,8 @@ export function useStartDownloads(): UseStartDownloadsResult {
   );
 
   const startBatchDownload = useCallback(
-    (entries: ObjectEntry[]) => {
-      if (entries.length === 0) return; // nothing selected -- no dialog, no-op
+    (items: { key: string; name: string }[]) => {
+      if (items.length === 0) return; // nothing selected -- no dialog, no-op
       void (async () => {
         try {
           const localDir = await open({ directory: true, defaultPath: await downloadDir() });
@@ -120,9 +128,9 @@ export function useStartDownloads(): UseStartDownloadsResult {
           // sequentially so a mid-list failure surfaces in the dialog with the
           // earlier files already queued and running (same fail-forward shape
           // as the per-folder path -- the panel just doesn't pop on error).
-          for (const entry of entries) {
-            const localPath = await join(localDir, entry.name);
-            const task = await enqueueDownload(activeConn, activeBucket, entry.key, localPath);
+          for (const item of items) {
+            const localPath = await join(localDir, item.name);
+            const task = await enqueueDownload(activeConn, activeBucket, item.key, localPath);
             applyState(task);
           }
           setPanelOpen(true);
