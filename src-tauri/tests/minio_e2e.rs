@@ -1815,17 +1815,16 @@ async fn cancelling_a_resumed_upload_still_aborts() {
     drop(hub);
 }
 
-/// Cancelling a *paused* upload must also reap its fragments.
+/// Cancelling a *paused* upload must also reap its fragments (I-2 fix).
 ///
-/// I-2 GAP (currently OPEN): when a task holding multipart state is cancelled
-/// while it has NO live runner (i.e. while `Paused`), `engine.cancel` applies
-/// `Canceled` directly -- `Paused` is not `is_active`, so no driver is spawned
-/// and no runner ever runs the multipart cancel/abort branch. The recorded
-/// `upload_id` is never aborted and its fragments leak until the bucket's
-/// lifecycle rules reap them. The correct behavior is `pending == 0`; this
-/// test asserts that and is EXPECTED TO FAIL against the current engine,
-/// documenting the leak. It stays `#[ignore]`d like the rest of this opt-in
-/// suite; when I-2 is fixed it must pass unchanged.
+/// When a task holding multipart state is cancelled while it has NO live runner
+/// (i.e. while `Paused`), `engine.cancel` applies `Canceled` itself. Because no
+/// runner ever runs the multipart cancel/abort branch, the engine must abort
+/// the orphaned upload directly -- `abort_orphaned_multipart` fires from the
+/// self-apply branch of `cancel`, discriminating on a `resume` slot that still
+/// holds an `upload_id`. Without it the recorded upload id is never aborted and
+/// its fragments leak until the bucket's lifecycle rules reap them; with it
+/// `pending == 0`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn cancelling_a_paused_upload_reaps_fragments() {
@@ -1872,7 +1871,8 @@ async fn cancelling_a_paused_upload_reaps_fragments() {
         "the paused upload must be open before the cancel"
     );
 
-    // Cancel while Paused: no live runner to observe it, so nothing aborts.
+    // Cancel while Paused: no live runner to observe it, so the engine must
+    // abort the orphaned upload itself from `cancel`'s self-apply branch.
     engine.cancel(&task.id).await.expect("cancel");
     wait_for_status(
         &engine,
@@ -1891,8 +1891,8 @@ async fn cancelling_a_paused_upload_reaps_fragments() {
 
     assert_eq!(
         pending, 0,
-        "I-2 GAP: cancelling a Paused multipart task must reap its fragments, but {pending} \
-         pending upload(s) remain for {key} -- no abort path runs when a task has multipart \
-         state and no live runner"
+        "I-2 fix: cancelling a Paused multipart task must reap its fragments, but {pending} \
+         pending upload(s) remain for {key} -- the engine's self-apply cancel branch must abort \
+         the orphaned upload when a task has multipart state and no live runner"
     );
 }

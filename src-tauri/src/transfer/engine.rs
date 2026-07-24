@@ -58,7 +58,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::provider::{ProviderHub, UploadedPart};
+use crate::provider::{Provider, ProviderHub, UploadedPart};
 use crate::transfer::model::{
     next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto,
 };
@@ -496,10 +496,67 @@ impl EngineInner {
                 let applied = self.apply(task_id, TransferCommand::Cancel, None).await;
                 if applied {
                     self.forget_progress(task_id);
+                    self.abort_orphaned_multipart(task_id).await;
                 }
                 applied
             }
             None => false,
+        }
+    }
+
+    /// Best-effort abort of a multipart upload orphaned by a cancel that no
+    /// runner handled (a `Paused`/`Failed` task, or a resumed task still
+    /// `Queued` waiting for a permit). The runner clears `resume` to `None`
+    /// after *it* aborts, so a `resume` still holding an `upload_id` here means
+    /// nobody cleaned up and the fragments would bill the user until the
+    /// bucket's lifecycle rules reap them.
+    ///
+    /// Failure is logged, never propagated: a cleanup failure must not turn a
+    /// completed cancellation into an error (the same discipline the runner's
+    /// own cancel branch follows). `take()` on the `resume` mutex makes this
+    /// safe against a racing runner -- whoever takes the `Some` does the abort,
+    /// the other sees `None`.
+    async fn abort_orphaned_multipart(self: &Arc<Self>, task_id: &str) {
+        // Clone the coordinates + the resume handle out under the task lock,
+        // then release it: the network abort must not run with any lock held
+        // (the crate-wide rule -- no lock across a network `.await`).
+        let (resume, connection_id, bucket, key) = {
+            let tasks = self.tasks.lock().await;
+            let Some(record) = tasks.get(task_id) else {
+                return;
+            };
+            (
+                Arc::clone(&record.resume),
+                record.dto.connection_id.clone(),
+                record.dto.bucket.clone(),
+                record.dto.key.clone(),
+            )
+        };
+
+        let Some(state) = resume.lock().await.take() else {
+            return;
+        };
+        if state.upload_id.is_empty() {
+            return;
+        }
+
+        let provider = match self.hub.provider(&connection_id).await {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(task = %task_id, "cannot build provider to abort orphaned multipart: {err}");
+                return;
+            }
+        };
+        match provider
+            .multipart_abort(&bucket, &key, &state.upload_id)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(task = %task_id, "aborted orphaned multipart upload on cancel")
+            }
+            Err(err) => {
+                tracing::warn!(task = %task_id, upload_id = %state.upload_id, "abort of orphaned multipart failed: {err}")
+            }
         }
     }
 
@@ -626,6 +683,7 @@ impl TransferEngine {
                 .await
         {
             self.inner.forget_progress(task_id);
+            self.inner.abort_orphaned_multipart(task_id).await;
         }
         Ok(())
     }
@@ -1522,6 +1580,142 @@ mod tests {
             Some(&TransferStatus::Canceled),
             "cancelling a Failed task must apply the transition inside `cancel`"
         );
+    }
+
+    /// Reads a task's resume handle straight out of the table. The tests below
+    /// stand in for a runner that paused mid-multipart by seeding the slot
+    /// themselves -- the fake runner never touches it.
+    async fn resume_handle(h: &Harness, task_id: &str) -> Arc<Mutex<Option<MultipartState>>> {
+        let tasks = h.engine.inner.tasks.lock().await;
+        Arc::clone(&tasks.get(task_id).expect("task present").resume)
+    }
+
+    fn multipart_state(upload_id: &str) -> MultipartState {
+        MultipartState {
+            upload_id: upload_id.to_string(),
+            completed: vec![UploadedPart {
+                number: 1,
+                etag: "\"e1\"".to_string(),
+                size: 8,
+            }],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_paused_task_drains_its_orphaned_multipart_state() {
+        // I-2 path 1: a `Paused` task holding multipart state is cancelled with
+        // no live runner, so `cancel` applies `Canceled` itself and must abort
+        // the orphaned upload -- nobody else will. The unit harness has no live
+        // endpoint, so the network abort cannot fire; but the engine *reaching*
+        // the abort path is observable: `abort_orphaned_multipart` `take()`s the
+        // resume slot before it ever touches the network, so a drained slot
+        // proves the path ran and the discriminator (`resume` still `Some`) fired
+        // before the warn-and-return on the unreachable endpoint.
+        let h = harness(1);
+        let paused = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a starts",
+        )
+        .await;
+        h.engine.pause(&paused.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&paused.id).last() == Some(&TransferStatus::Paused),
+            "task a reaches Paused",
+        )
+        .await;
+
+        let resume = resume_handle(&h, &paused.id).await;
+        *resume.lock().await = Some(multipart_state("u-1"));
+
+        h.engine.cancel(&paused.id).await.unwrap();
+        assert_eq!(
+            h.sink.statuses_of(&paused.id).last(),
+            Some(&TransferStatus::Canceled),
+            "cancelling a Paused task must still apply Canceled"
+        );
+        assert!(
+            resume.lock().await.is_none(),
+            "the engine must drain the resume slot on its own cancel-apply; a slot left Some means \
+             the abort path never ran and the fragments would leak"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_resumed_but_queued_task_drains_its_orphaned_multipart_state() {
+        // I-2 path 3: a resumed task can sit `Queued` on the semaphore with
+        // multipart state in its resume slot. `Queued` is `is_active`, so
+        // `cancel` only fires the token; the parked driver wakes on it via the
+        // biased `select!` and applies `Cancel` through `apply_stop` -- without
+        // ever acquiring a permit or invoking the runner. That engine-side apply
+        // must also abort the orphaned upload. Same observation as path 1: the
+        // drained slot proves `abort_orphaned_multipart` ran.
+        let h = harness(1);
+        // Task a takes the only permit and parks, so b is provably stuck Queued.
+        let running = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a takes the only permit",
+        )
+        .await;
+
+        let queued = h.engine.enqueue(spec("b")).await.unwrap();
+        // Stand in for a resumed task whose earlier run left multipart state.
+        let resume = resume_handle(&h, &queued.id).await;
+        *resume.lock().await = Some(multipart_state("u-2"));
+
+        h.engine.cancel(&queued.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&queued.id).last() == Some(&TransferStatus::Canceled),
+            "the queued task reaches Canceled via its driver",
+        )
+        .await;
+        assert_eq!(
+            h.runner.started.load(Ordering::SeqCst),
+            1,
+            "the queued task must be cancelled without the runner ever being invoked"
+        );
+        assert!(
+            resume.lock().await.is_none(),
+            "the driver's apply_stop must drain the resume slot; a slot left Some means the abort \
+             path never ran and the fragments would leak"
+        );
+        let _ = running;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_paused_task_without_multipart_state_is_a_plain_cancel() {
+        // The discriminator must not fire on a single-stream task: with an empty
+        // resume slot there is no upload to abort, and `abort_orphaned_multipart`
+        // must return without incident. (A `None` slot never reaches the network
+        // build at all.)
+        let h = harness(1);
+        let paused = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a starts",
+        )
+        .await;
+        h.engine.pause(&paused.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&paused.id).last() == Some(&TransferStatus::Paused),
+            "task a reaches Paused",
+        )
+        .await;
+
+        let resume = resume_handle(&h, &paused.id).await;
+        assert!(
+            resume.lock().await.is_none(),
+            "no multipart state was seeded"
+        );
+
+        h.engine.cancel(&paused.id).await.unwrap();
+        assert_eq!(
+            h.sink.statuses_of(&paused.id).last(),
+            Some(&TransferStatus::Canceled),
+            "a Paused single-stream task still cancels cleanly"
+        );
+        assert!(resume.lock().await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
