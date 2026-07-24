@@ -45,6 +45,14 @@ export function DetailsPanel() {
   const [copied, setCopied] = useState(false);
   const copyTimeoutRef = useRef<number | null>(null);
 
+  // Tracks the key of the entry currently on screen so an in-flight presign
+  // can tell, once it resolves, whether the user has since switched to a
+  // different entry. A ref (not state) so it reflects the latest render
+  // synchronously -- `onSuccess` below reads it after an await, not during
+  // a render, so state's one-render-behind semantics wouldn't work here.
+  const currentKeyRef = useRef<string | undefined>(entry?.key);
+  currentKeyRef.current = entry?.key;
+
   const headQuery = useQuery<ObjectHead, AppError>({
     queryKey: ["head", activeConn, activeBucket, entry?.key ?? ""],
     queryFn: () => headObject(activeConn, activeBucket, entry?.key ?? ""),
@@ -54,9 +62,15 @@ export function DetailsPanel() {
   // The presigned URL only ever lives in this piece of state -- never
   // persisted, never logged. Switching to a different entry (or clearing
   // the selection) below discards it along with the rest of the share UI.
-  const presignMutation = useMutation<string, AppError, number>({
-    mutationFn: (secs) => presignGet(activeConn, activeBucket, entry?.key ?? "", secs),
-    onSuccess: (url) => setShareUrl(url),
+  // The mutation carries its target key in `variables` so `onSuccess` can
+  // drop a result that resolves after the user has already moved on to a
+  // different entry -- otherwise a slow presign for entry A could land on
+  // entry B's screen once it finally resolves.
+  const presignMutation = useMutation<string, AppError, { secs: number; key: string }>({
+    mutationFn: ({ secs, key }) => presignGet(activeConn, activeBucket, key, secs),
+    onSuccess: (url, variables) => {
+      if (variables.key === currentKeyRef.current) setShareUrl(url);
+    },
   });
 
   useEffect(() => {
@@ -176,7 +190,7 @@ export function DetailsPanel() {
                 </select>
                 <button
                   type="button"
-                  onClick={() => presignMutation.mutate(expirySecs)}
+                  onClick={() => presignMutation.mutate({ secs: expirySecs, key: entry.key })}
                   disabled={presignMutation.isPending}
                   className="h-[30px] shrink-0 cursor-pointer rounded-[7px] bg-primary px-3 text-[12px] font-semibold text-primary-foreground hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
                 >
