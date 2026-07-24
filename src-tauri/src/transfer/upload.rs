@@ -134,11 +134,22 @@ async fn run_upload<P>(job: &UploadJob, provider: Arc<P>, total: u64) -> AppResu
 where
     P: Provider + Send + Sync + 'static,
 {
-    // Checked before any round trip: a stop that is already pending would
-    // otherwise make the multipart path create an upload purely to abort it
-    // again a moment later. This is never a bogus `Stopped` -- the intent is
-    // present, so the engine has a legal transition to apply.
-    if job.stopped().is_some() {
+    // Checked before any round trip: a stop that is already pending on a fresh
+    // upload would otherwise make the multipart path create an upload purely to
+    // abort it again a moment later. This is never a bogus `Stopped` -- the
+    // intent is present, so the engine has a legal transition to apply.
+    //
+    // The resume slot must be empty to take this exit. A task paused
+    // mid-multipart holds `{upload_id, completed}` here; on resume the engine
+    // spawns a fresh driver and a cancel can land in that window, so the stop
+    // is already pending when the runner starts. Short-circuiting then would
+    // return `Stopped` *without* aborting the recorded upload id -- the engine
+    // files `Canceled`, `clear_finished` drops the record, and the server-side
+    // fragments bill the user forever. With resume state present we fall
+    // through into the multipart path instead: it reuses the recorded
+    // `upload_id`, the spawn loop breaks on its first iteration because the stop
+    // is already requested, and the cancel branch issues the abort.
+    if job.stopped().is_some() && job.resume.lock().await.is_none() {
         return Ok(RunOutcome::Stopped);
     }
 
@@ -622,6 +633,10 @@ mod tests {
         /// and makes a request abandonable while it is still in flight.
         op_delay: Duration,
         abort_fails: bool,
+        /// Make `multipart_complete` return an error -- the server refused to
+        /// assemble the object. The runner must surface this as `Err`, never
+        /// report `Completed` for a commit that did not happen.
+        complete_fails: bool,
     }
 
     impl FakeProvider {
@@ -640,6 +655,7 @@ mod tests {
                 stop_on_complete: StdMutex::new(None),
                 op_delay: Duration::ZERO,
                 abort_fails: false,
+                complete_fails: false,
             }
         }
 
@@ -820,6 +836,9 @@ mod tests {
         ) -> AppResult<()> {
             assert_eq!(upload_id, UPLOAD_ID);
             *self.assembled.lock().unwrap() = Some(parts.to_vec());
+            if self.complete_fails {
+                return Err(AppError::Unreachable);
+            }
             let late = *self.stop_on_complete.lock().unwrap();
             if let Some(kind) = late {
                 self.switch.request(kind);
@@ -919,10 +938,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_stop_that_is_already_pending_short_circuits_before_any_request() {
+        // A multipart-sized upload, so that a missing pre-flight guard would
+        // reach `multipart_init` and create an upload purely to abort it a
+        // moment later -- a single-stream size can never call init, so it would
+        // leave the guard's removal undetectable. The rig seeds no resume
+        // state, so the guard still short-circuits after the I-1 fix, which
+        // only falls through when there is a recorded upload id to clean up.
         let rig = rig(4, |_| {});
         rig.switch.request(StopKind::Cancel);
 
-        let outcome = rig.run(1024).await.unwrap();
+        let outcome = rig.run(MULTIPART_THRESHOLD).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Stopped);
         assert_eq!(rig.provider.puts(), 0);
@@ -930,6 +955,11 @@ mod tests {
             rig.provider.inits(),
             0,
             "creating a multipart upload only to abort it a moment later is pure waste"
+        );
+        assert_eq!(
+            rig.provider.aborts(),
+            0,
+            "nothing was created, so there is nothing to abort"
         );
         assert_eq!(
             rig.reported(),
@@ -1282,5 +1312,77 @@ mod tests {
             "a cleanup that failed must not turn the user's cancellation into a failed task"
         );
         assert_eq!(rig.provider.aborts(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_resumed_upload_at_the_preflight_still_aborts_the_fragments() {
+        // A task paused mid-multipart holds `{upload_id, completed}` in its
+        // resume slot. On resume the engine spawns a fresh driver and applies
+        // `Start`; if the user cancels in that window the stop is already
+        // pending when the runner reaches its pre-flight. Short-circuiting there
+        // would return `Stopped` without aborting -- the engine files
+        // `Canceled`, `clear_finished` drops the record, and the recorded
+        // upload id's fragments bill the user forever. The pre-flight must fall
+        // through into the multipart path so the cancel branch aborts.
+        let rig = rig(4, |_| {});
+        rig.seed_resume(MultipartState {
+            upload_id: UPLOAD_ID.to_string(),
+            completed: vec![UploadedPart {
+                number: 1,
+                etag: "\"etag-1\"".to_string(),
+                size: 8 * MB,
+            }],
+        })
+        .await;
+        rig.switch.request(StopKind::Cancel);
+
+        let outcome = rig.run(16 * MB).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Stopped);
+        assert_eq!(
+            rig.provider.aborts(),
+            1,
+            "the resume slot held an upload id; cancelling without aborting strands the \
+             fragments forever"
+        );
+        assert_eq!(
+            rig.provider.inits(),
+            0,
+            "a resume reuses the recorded upload id rather than opening a second one"
+        );
+        assert!(
+            rig.provider.never_assembled(),
+            "a cancelled upload must not be committed"
+        );
+        assert!(
+            rig.resume_state().await.is_none(),
+            "the upload was aborted, so its id and parts are worthless"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_commit_fails_the_task_rather_than_reporting_completed() {
+        // `multipart_complete` returning an error means the server refused to
+        // assemble the object. Reporting `Completed` here is the one lie the
+        // engine cannot catch -- it would record success next to an object that
+        // does not exist. The only truthful answer is `Err`, so the engine
+        // files `Failed`; the resume slot must survive so a retry can re-issue
+        // the commit rather than orphan the upload.
+        let rig = rig(4, |fake| {
+            fake.complete_fails = true;
+        });
+
+        let err = rig.run(16 * MB).await.unwrap_err();
+
+        assert_eq!(
+            err.code(),
+            "network/unreachable",
+            "a rejected commit must surface as the server's error, not a silent success"
+        );
+        let state = rig
+            .resume_state()
+            .await
+            .expect("a rejected commit must leave the upload id behind for a retry");
+        assert_eq!(state.upload_id, UPLOAD_ID);
     }
 }
