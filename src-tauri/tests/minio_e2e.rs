@@ -1396,6 +1396,50 @@ async fn threshold_boundary_files_each_land() {
     cleanup_bucket(&client, &provider, &bucket).await;
 }
 
+// --- M6a Task 1: presign_get -------------------------------------------------
+
+/// A presigned GET URL actually works: uploaded object -> `presign_get` ->
+/// an unauthenticated `curl` of the URL -> SHA-256 match against the source.
+/// This is the only place the presigning path meets a real server -- MinIO's
+/// presigned-URL support has its own quirks (clock skew, path- vs
+/// virtual-hosted addressing) that no unit test against a fake can catch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn presign_get_yields_a_working_url() {
+    let provider = from_connection(&minio_connection("minioadmin")).expect("provider");
+    let client = raw_seed_client();
+    let bucket = unique_bucket_name();
+    provider.create_bucket(&bucket).await.expect("bucket");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("share.bin");
+    write_pseudo_random_file(&path, 2 * MB, 0x5EED_6001);
+    provider
+        .put_object_from_file(&bucket, "share.bin", &path, 2 * MB)
+        .await
+        .expect("put");
+
+    let url = provider
+        .presign_get(&bucket, "share.bin", 3600)
+        .await
+        .expect("presign");
+
+    // curl the presigned URL WITHOUT any credentials -- the whole point of a
+    // presigned URL is that the signature in the query string is enough.
+    let out = dir.path().join("fetched.bin");
+    let status = std::process::Command::new("curl")
+        .args(["-fsS", "-o", out.to_str().unwrap(), &url])
+        .status()
+        .expect("curl runs");
+    assert!(status.success(), "presigned GET must succeed: {url}");
+    assert_eq!(
+        hex(&sha256_file(&out)),
+        hex(&sha256_file(&path)),
+        "fetched bytes must match source"
+    );
+
+    cleanup_bucket(&client, &provider, &bucket).await;
+}
+
 // --- Group B/C: the full engine + runner + provider ------------------------
 
 /// Collects every state transition the engine emits, keyed by task id, so a

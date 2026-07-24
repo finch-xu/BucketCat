@@ -1023,6 +1023,15 @@ mod tests {
         ) -> AppResult<ListPage> {
             unimplemented!("an upload never lists objects")
         }
+
+        async fn presign_get(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _expires_secs: u64,
+        ) -> AppResult<String> {
+            unimplemented!("an upload never presigns a share url")
+        }
     }
 
     struct Rig {

@@ -20,7 +20,8 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 use crate::error::{AppError, AppResult};
 use crate::provider::{
-    BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, ObjectHead, Provider, UploadedPart,
+    clamp_expiry, BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, ObjectHead, Provider,
+    UploadedPart,
 };
 use crate::store::Connection;
 
@@ -933,6 +934,33 @@ impl Provider for S3Provider {
             next_token: out.next_continuation_token().map(str::to_string),
         })
     }
+
+    async fn presign_get(&self, bucket: &str, key: &str, expires_secs: u64) -> AppResult<String> {
+        // `PresigningConfig::expires_in` is the only fallible step here, and
+        // it's NOT an `SdkError` (it's a config-construction error raised
+        // before any request is built), so it can't go through
+        // `normalize_s3_error` -- mapped by hand to `AppError::Internal`.
+        // `clamp_expiry` keeps this from ever actually failing in practice
+        // (it only errors above 7 days, which `clamp_expiry` already bounds
+        // to), but the fallible signature is kept honest rather than
+        // `unwrap`ped.
+        let cfg = aws_sdk_s3::presigning::PresigningConfig::expires_in(
+            std::time::Duration::from_secs(clamp_expiry(expires_secs)),
+        )
+        .map_err(|e| AppError::Internal {
+            message: format!("presign config: {e}"),
+        })?;
+        let req = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(cfg)
+            .await
+            .map_err(normalize_s3_error)?;
+        // NEVER log `req.uri()` -- it carries a live request signature.
+        Ok(req.uri().to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1728,5 +1756,14 @@ mod tests {
         // is ever called).
         assert_eq!(range_header(0, 0), "bytes=0-0");
         assert_eq!(range_header(5, 0), "bytes=5-5");
+    }
+
+    // --- clamp_expiry (pure) -------------------------------------------------
+
+    #[test]
+    fn clamp_expiry_bounds_to_one_and_seven_days() {
+        assert_eq!(clamp_expiry(0), 1);
+        assert_eq!(clamp_expiry(3600), 3600);
+        assert_eq!(clamp_expiry(999_999_999), 604_800);
     }
 }

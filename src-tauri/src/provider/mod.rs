@@ -15,6 +15,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 
+/// Clamps a caller-requested presigned-URL lifetime to a range S3 itself
+/// enforces: at least 1 second, at most 604,800 seconds (7 days -- the hard
+/// maximum `aws_sdk_s3::presigning::PresigningConfig::expires_in` accepts).
+/// Called by [`S3Provider::presign_get`] before building the presigning
+/// config, so a caller-supplied `0` or an absurdly large value never reaches
+/// the SDK as a `PresigningConfigError` -- it's silently bounded into the
+/// valid range instead. Pure, unit-tested below.
+pub fn clamp_expiry(secs: u64) -> u64 {
+    secs.clamp(1, 604_800)
+}
+
 /// A bucket as shown to the frontend.
 ///
 /// Deliberately a plain DTO -- no `aws_sdk_s3` type ever crosses this
@@ -250,6 +261,14 @@ pub trait Provider {
         token: Option<&str>,
         max_keys: i32,
     ) -> AppResult<ListPage>;
+
+    /// A time-limited, unauthenticated GET URL for `key` -- the foundation of
+    /// the Share feature. `expires_secs` is bounded via [`clamp_expiry`]
+    /// before being handed to the SDK, so a caller-supplied `0` or an
+    /// absurdly large value never reaches it as a `PresigningConfigError`.
+    /// The returned URL carries a live signature: callers MUST NOT log it
+    /// (logging `key` is fine).
+    async fn presign_get(&self, bucket: &str, key: &str, expires_secs: u64) -> AppResult<String>;
 }
 
 #[cfg(test)]

@@ -941,6 +941,15 @@ mod tests {
         ) -> AppResult<ListPage> {
             unimplemented!("a download never lists objects")
         }
+
+        async fn presign_get(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _expires_secs: u64,
+        ) -> AppResult<String> {
+            unimplemented!("a download never presigns a share url")
+        }
     }
 
     struct Rig {
