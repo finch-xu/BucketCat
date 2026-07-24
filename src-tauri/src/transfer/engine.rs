@@ -65,6 +65,7 @@ use crate::transfer::checkpoint::{self, Checkpoint};
 use crate::transfer::model::{
     next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto,
 };
+use crate::transfer::part::{plan_upload, PartSpec, UploadPlan};
 use crate::transfer::progress::ProgressMsg;
 
 /// Concurrency limits (design §5). Runtime hot-update belongs to the settings
@@ -425,6 +426,41 @@ struct TaskRecord {
     control: TaskControl,
     resume: Arc<Mutex<Option<ResumeState>>>,
     transferred: Arc<AtomicU64>,
+}
+
+/// Bytes a checkpoint's completed parts already account for -- the preset for a
+/// restored task's `transferred` (see [`TransferEngine::restore_paused`]) so a
+/// freshly relaunched panel shows real progress rather than `0/total`.
+///
+/// - **Upload**: the sum of the recorded multipart parts' sizes, straight from
+///   the [`UploadedPart`]s the previous run committed.
+/// - **Download**: the sum of the plan chunks whose 1-based `number` the
+///   checkpoint marks done. The chunk boundaries are a pure function of `total`
+///   ([`plan_upload`]), rebuilt here exactly as the download runner derives
+///   them, so no `.bcpart` or network read is needed to size them.
+fn checkpoint_completed_bytes(cp: &Checkpoint) -> u64 {
+    match &cp.resume {
+        ResumeState::Upload(ms) => ms.completed.iter().map(|p| p.size).sum(),
+        ResumeState::Download(ds) => {
+            let done: std::collections::HashSet<i32> = ds.completed_parts.iter().copied().collect();
+            // Mirror the download runner's chunk derivation (see
+            // `download.rs`): a small object is one chunk numbered 1, a large
+            // one is the multipart plan's parts unchanged.
+            let chunks: Vec<PartSpec> = match plan_upload(cp.total) {
+                UploadPlan::Single { length } => vec![PartSpec {
+                    number: 1,
+                    offset: 0,
+                    length,
+                }],
+                UploadPlan::Multipart { parts, .. } => parts,
+            };
+            chunks
+                .iter()
+                .filter(|c| done.contains(&c.number))
+                .map(|c| c.length)
+                .sum()
+        }
+    }
 }
 
 struct EngineInner {
@@ -840,6 +876,59 @@ impl TransferEngine {
         self.inner.sink.state_changed(&dto);
         self.inner.spawn_driver(id);
         Ok(dto)
+    }
+
+    /// Rebuilds a checkpointed transfer as a `Paused` task at startup, offline.
+    ///
+    /// This is the cross-restart counterpart to [`TransferEngine::pause`]: a
+    /// checkpoint the previous session left behind is re-registered as a
+    /// `Paused` row, with the [`ResumeState`] loaded straight from the file and
+    /// `transferred` preset to the bytes that session already landed, so the
+    /// panel shows real progress on a fresh launch rather than `0/total`.
+    ///
+    /// Crucially it does **not** spawn a driver -- the task stays `Paused`
+    /// until the user resumes it, at which point the normal resume path
+    /// re-`head`s / re-checks and picks up from the recorded parts. Nothing
+    /// here touches the network or builds a provider; the caller has already
+    /// discarded any orphan whose connection no longer exists.
+    pub async fn restore_paused(&self, task_id: String, cp: Checkpoint) {
+        // Preset the byte counter from the checkpoint's completed parts before
+        // moving `cp` apart into the dto and the resume slot below.
+        let preset = checkpoint_completed_bytes(&cp);
+        let dto = TransferTaskDto {
+            id: task_id.clone(),
+            // A fresh `seq` from the same counter `enqueue` uses, so the
+            // restored rows sort among any tasks enqueued later this session.
+            seq: self.inner.seq.fetch_add(1, Ordering::SeqCst),
+            direction: cp.direction,
+            connection_id: cp.connection_id,
+            bucket: cp.bucket,
+            key: cp.key,
+            local_path: cp.local_path,
+            file_name: cp.file_name,
+            total: cp.total,
+            transferred: preset,
+            status: TransferStatus::Paused,
+            error_code: None,
+        };
+
+        {
+            let mut tasks = self.inner.tasks.lock().await;
+            tasks.insert(
+                task_id,
+                TaskRecord {
+                    dto: dto.clone(),
+                    control: TaskControl::new(),
+                    resume: Arc::new(Mutex::new(Some(cp.resume))),
+                    transferred: Arc::new(AtomicU64::new(preset)),
+                },
+            );
+        }
+
+        tracing::info!(task = %dto.id, key = %dto.key, transferred = preset, "transfer restored as paused");
+        // The startup path has no IPC return value, so the panel can only learn
+        // of the row through the sink.
+        self.inner.sink.state_changed(&dto);
     }
 
     /// Asks a running task to stop and keep its progress. The transition to
@@ -2183,6 +2272,76 @@ mod tests {
             persisted_upload_id(),
             "after-window",
             "a disabled writer must not write even with force"
+        );
+    }
+
+    /// A download checkpoint marking two of a 100 MiB object's 8 MiB chunks
+    /// done. `plan_upload(100 MiB)` splits it into 13 chunks (the last short),
+    /// the first twelve exactly `MIN_PART_SIZE`, so "chunks 1 and 2 done" means
+    /// the restored task's `transferred` must be exactly `2 * 8 MiB`.
+    fn download_checkpoint_with_two_completed_chunks() -> Checkpoint {
+        Checkpoint {
+            direction: Direction::Download,
+            connection_id: "c1".to_string(),
+            bucket: "b".to_string(),
+            key: "big.bin".to_string(),
+            local_path: "/tmp/big.bin".to_string(),
+            file_name: "big.bin".to_string(),
+            total: 100 * 1024 * 1024,
+            resume: ResumeState::Download(DownloadState {
+                etag: Some("\"e1\"".to_string()),
+                completed_parts: vec![1, 2],
+                bcpart: std::path::PathBuf::from("/tmp/big.bin.bcpart"),
+            }),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_paused_rebuilds_a_paused_task_without_a_driver() {
+        // The cross-restart counterpart to a pause: a checkpoint the previous
+        // session left behind is rebuilt as a `Paused` row, offline, with its
+        // already-done bytes preset -- but no driver is spawned, so nothing
+        // touches the network and the task waits for the user to resume it.
+        let h = harness(1);
+        h.engine
+            .restore_paused(
+                "t-restored".to_string(),
+                download_checkpoint_with_two_completed_chunks(),
+            )
+            .await;
+
+        let dto = h.task("t-restored").await;
+        assert_eq!(
+            dto.status,
+            TransferStatus::Paused,
+            "a restored checkpoint must come back as Paused"
+        );
+        assert_eq!(
+            dto.transferred,
+            16 * 1024 * 1024,
+            "the two completed 8 MiB chunks must be preset as transferred, not left at 0"
+        );
+        // The panel learns of the restored row only through the sink -- there
+        // is no IPC return value on the startup path.
+        assert_eq!(
+            h.sink.statuses_of("t-restored"),
+            vec![TransferStatus::Paused],
+            "restore must emit exactly one Paused state so the panel shows the row"
+        );
+
+        // Give any (erroneously spawned) driver every chance to run, then prove
+        // none did: the fake runner never started, and the status never left
+        // Paused.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            h.runner.started.load(Ordering::SeqCst),
+            0,
+            "restore_paused must not spawn a driver; the runner must never be invoked"
+        );
+        assert_eq!(
+            h.task("t-restored").await.status,
+            TransferStatus::Paused,
+            "with no driver the task can only stay Paused"
         );
     }
 }

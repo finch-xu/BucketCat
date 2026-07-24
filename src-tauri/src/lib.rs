@@ -5,6 +5,7 @@ pub mod provider;
 pub mod store;
 pub mod transfer;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use commands::{
@@ -75,7 +76,7 @@ pub fn run() {
             }
 
             let config_dir = app.path().app_config_dir()?;
-            let state = AppState::new(config_dir)?;
+            let state = AppState::new(config_dir.clone())?;
             app.manage(state);
 
             // The engine holds the hub directly rather than going through
@@ -91,13 +92,17 @@ pub fn run() {
             let progress_tx = tauri::async_runtime::block_on(async {
                 spawn_aggregator(Arc::new(TauriProgressSink(handle.clone())))
             });
-            // Checkpoints live under the app data dir. `resume_enabled` defaults
-            // to `true`; M4c Task 6/9 will load the persisted flag and thread
-            // the real value here -- a `true` default is correct and
-            // non-breaking until then.
+            // The persisted resume flag gates both the checkpoint *writer*
+            // (threaded into the engine) and the startup *restore* below. One
+            // atomic feeds both, read from the same config dir the SecureStore
+            // uses, so turning resume off in settings both stops writing and
+            // skips rebuilding.
+            let settings = store::settings::load(&config_dir.join("settings.json"));
+            let resume_enabled = Arc::new(AtomicBool::new(settings.resume_enabled));
+            // Checkpoints live under the app data dir.
             let checkpoint_dir = transfer::checkpoint::checkpoint_dir(&app.path().app_data_dir()?);
-            app.manage(TransferEngine::new(
-                hub,
+            let engine = TransferEngine::new(
+                hub.clone(),
                 Arc::new(DispatchRunner {
                     upload: Arc::new(UploadRunner),
                     download: Arc::new(DownloadRunner),
@@ -105,9 +110,52 @@ pub fn run() {
                 Arc::new(TauriStateSink(handle)),
                 progress_tx,
                 EngineConfig::default(),
-                Some(checkpoint_dir),
-                Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            ));
+                Some(checkpoint_dir.clone()),
+                resume_enabled.clone(),
+            );
+
+            // Startup restore (M4c Task 6): rebuild each unfinished transfer as
+            // a `Paused` row, offline, and discard any whose connection is gone.
+            // Same `block_on` reason as `spawn_aggregator` above: `setup` runs
+            // before Tauri's runtime is entered, and `restore_paused` awaits the
+            // task lock. A read failure leaves every checkpoint untouched rather
+            // than mistaking them all for orphans and deleting them.
+            if resume_enabled.load(Ordering::Relaxed) {
+                tauri::async_runtime::block_on(async {
+                    match hub.connection_ids().await {
+                        Ok(ids) => {
+                            let known: std::collections::HashSet<String> =
+                                ids.into_iter().collect();
+                            for (id, cp) in transfer::checkpoint::scan(&checkpoint_dir) {
+                                if !known.contains(&cp.connection_id) {
+                                    // Orphan: its connection was deleted. Drop the
+                                    // checkpoint, and a download's staging file too
+                                    // -- nobody will ever resume it.
+                                    if cp.direction == transfer::Direction::Download {
+                                        let _ = std::fs::remove_file(
+                                            transfer::partfile::bcpart_path(std::path::Path::new(
+                                                &cp.local_path,
+                                            )),
+                                        );
+                                    }
+                                    transfer::checkpoint::remove(&checkpoint_dir, &id);
+                                    tracing::warn!(task = %id, conn = %cp.connection_id, "orphan checkpoint discarded");
+                                    continue;
+                                }
+                                engine.restore_paused(id, cp).await;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "cannot read connections for checkpoint restore; leaving \
+                                 checkpoints in place: {err}"
+                            );
+                        }
+                    }
+                });
+            }
+
+            app.manage(engine);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

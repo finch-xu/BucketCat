@@ -103,6 +103,16 @@ impl ProviderHub {
         store.load()
     }
 
+    /// The id of every saved connection, and nothing else. Used by the startup
+    /// checkpoint restore (M4c) to tell a live connection's checkpoints from an
+    /// orphan's without ever handling -- or logging -- a credential: it projects
+    /// the decrypted list down to ids in memory and drops the rest immediately.
+    /// Same lock scope as [`ProviderHub::connections`].
+    pub async fn connection_ids(&self) -> AppResult<Vec<String>> {
+        let store = self.store.lock().await;
+        Ok(store.load()?.into_iter().map(|c| c.id).collect())
+    }
+
     /// Runs one load-modify-save cycle under a single lock, then invalidates
     /// the client cache. `f` returning `Err` aborts before `save`, so a failed
     /// edit leaves the persisted list untouched.
