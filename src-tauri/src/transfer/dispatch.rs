@@ -115,6 +115,9 @@ mod tests {
             Arc::new(NoopSink),
             progress_tx,
             EngineConfig::default(),
+            // This test exercises direction routing, not checkpointing.
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
 
         // --- Direction::Download must reach DownloadRunner ------------------

@@ -49,8 +49,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::provider::{Provider, ProviderHub, UploadedPart};
+use crate::transfer::checkpoint::{self, Checkpoint};
 use crate::transfer::model::{
     next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto,
 };
@@ -200,6 +202,89 @@ impl ProgressHandle {
     }
 }
 
+/// The static half of a [`Checkpoint`] -- everything about a task that never
+/// changes for the life of the transfer. Captured once when the driver spawns
+/// so [`CheckpointWriter::persist`] can rebuild the full checkpoint from just
+/// the live [`ResumeState`] without touching the task table again.
+///
+/// Holds `connection_id` (an opaque handle into the secure store), never a
+/// credential -- the checkpoint file must be safe to leave on disk.
+#[derive(Debug, Clone)]
+struct CheckpointStatics {
+    direction: Direction,
+    connection_id: String,
+    bucket: String,
+    key: String,
+    local_path: String,
+    file_name: String,
+    total: u64,
+}
+
+/// A per-task handle that mirrors the in-memory [`ResumeState`] to a checkpoint
+/// file (M4c, decision D-T5). Best-effort and coalesced:
+///
+/// - **Gated**: a write is a no-op while `enabled` (the runtime resume flag) is
+///   `false`, so turning resume off stops persisting without touching any call
+///   site.
+/// - **Coalesced**: a non-`force` write within ~2s of the last one is skipped,
+///   so a burst of per-part resume-sets costs a bounded number of files rather
+///   than one per part. `force` writes (the first set, and the pause point)
+///   always land so a cancel-before-any-part or a pause is never lost.
+/// - **Never fatal**: a write failure is logged and swallowed -- a checkpoint
+///   is an optimisation, and failing the transfer over one would be a
+///   regression the user cannot act on.
+///
+/// Cheap to clone; the throttle timestamp and the flag are shared through
+/// `Arc`, so every clone made for a runner's job coalesces against the same
+/// clock.
+#[derive(Clone)]
+pub struct CheckpointWriter {
+    dir: PathBuf,
+    task_id: String,
+    statics: CheckpointStatics,
+    enabled: Arc<AtomicBool>,
+    /// Last successful (or skipped-because-recent) write, on the tokio clock so
+    /// the throttle follows a test's virtual time. Behind a `std` mutex: the
+    /// critical section never awaits, so this must not be a tokio mutex.
+    last: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl CheckpointWriter {
+    /// Coalesced, gated, best-effort write of the task's checkpoint. See the
+    /// type docs; `force` bypasses only the throttle, never the gate.
+    pub fn persist(&self, resume: &ResumeState, force: bool) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if !force {
+            let mut last = self.last.lock().unwrap();
+            let now = tokio::time::Instant::now();
+            if let Some(prev) = *last {
+                if now.duration_since(prev) < Duration::from_secs(2) {
+                    return;
+                }
+            }
+            *last = Some(now);
+        }
+        let cp = Checkpoint {
+            direction: self.statics.direction,
+            connection_id: self.statics.connection_id.clone(),
+            bucket: self.statics.bucket.clone(),
+            key: self.statics.key.clone(),
+            local_path: self.statics.local_path.clone(),
+            file_name: self.statics.file_name.clone(),
+            total: self.statics.total,
+            resume: resume.clone(),
+        };
+        if let Err(err) = checkpoint::write(&self.dir, &self.task_id, &cp) {
+            // Best-effort: a checkpoint is a resume optimisation, so a write
+            // failure is logged and swallowed -- never propagated into the
+            // transfer's own result.
+            tracing::warn!(task = %self.task_id, "checkpoint write failed: {err}");
+        }
+    }
+}
+
 /// Everything a runner needs. Deliberately concrete: the runner is chosen at
 /// engine construction, so there is no reason to abstract this further.
 pub struct TaskContext {
@@ -209,6 +294,20 @@ pub struct TaskContext {
     pub part_limit: usize,
     pub progress: ProgressHandle,
     pub resume: Arc<Mutex<Option<ResumeState>>>,
+    /// The checkpoint mirror, or `None` when checkpointing is disabled (no
+    /// checkpoint dir configured). Cloned into the runner's job so the resume
+    /// call sites can persist without reaching back into the engine.
+    pub checkpoint: Option<CheckpointWriter>,
+}
+
+impl TaskContext {
+    /// Mirrors `resume` to the checkpoint file if checkpointing is enabled for
+    /// this task. A no-op when there is no writer. See [`CheckpointWriter`].
+    pub fn persist_checkpoint(&self, resume: &ResumeState, force: bool) {
+        if let Some(writer) = &self.checkpoint {
+            writer.persist(resume, force);
+        }
+    }
 }
 
 /// What a runner actually did. The engine cannot infer this from a stop
@@ -337,6 +436,14 @@ struct EngineInner {
     task_sem: Arc<Semaphore>,
     seq: AtomicU64,
     config: EngineConfig,
+    /// Where per-task checkpoints live, or `None` to disable checkpointing
+    /// entirely (the engine's own unit tests pass `None` to keep behaviour
+    /// unchanged).
+    checkpoint_dir: Option<PathBuf>,
+    /// The runtime resume flag, shared into every [`CheckpointWriter`]. Toggling
+    /// it (M4c Task 6/9) turns checkpoint writing on or off without rebuilding
+    /// the engine.
+    resume_enabled: Arc<AtomicBool>,
 }
 
 impl EngineInner {
@@ -424,8 +531,26 @@ impl EngineInner {
         }
 
         // `dto` is moved into the context below, so read what the progress
-        // handle needs out of it first.
+        // handle and the checkpoint writer need out of it first.
         let total = dto.total;
+        // Build the checkpoint writer from the task's static fields (decision
+        // D-T5). Only when a checkpoint dir is configured; otherwise the runner
+        // sees `None` and every `persist_checkpoint` is a no-op.
+        let checkpoint = self.checkpoint_dir.as_ref().map(|dir| CheckpointWriter {
+            dir: dir.clone(),
+            task_id: task_id.clone(),
+            statics: CheckpointStatics {
+                direction: dto.direction,
+                connection_id: dto.connection_id.clone(),
+                bucket: dto.bucket.clone(),
+                key: dto.key.clone(),
+                local_path: dto.local_path.clone(),
+                file_name: dto.file_name.clone(),
+                total: dto.total,
+            },
+            enabled: Arc::clone(&self.resume_enabled),
+            last: Arc::new(std::sync::Mutex::new(None)),
+        });
         let ctx = TaskContext {
             task: dto,
             hub: Arc::clone(&self.hub),
@@ -438,6 +563,7 @@ impl EngineInner {
                 transferred,
             },
             resume,
+            checkpoint,
         };
 
         // The runner gets its own task so that a panic inside it cannot take
@@ -488,6 +614,10 @@ impl EngineInner {
                 }
                 self.forget_progress(&task_id);
                 self.apply(&task_id, TransferCommand::Complete, None).await;
+                // Terminal: the object is on the server (or on disk), so the
+                // checkpoint has nothing left to resume. Paused/Failed keep
+                // theirs; only Completed and Canceled reap it.
+                self.remove_checkpoint(&task_id);
             }
             Ok(RunOutcome::Stopped) => {
                 if !self.apply_stop(&task_id, &control).await {
@@ -556,12 +686,25 @@ impl EngineInner {
         }
     }
 
+    /// Removes a task's checkpoint file if checkpointing is configured. Called
+    /// only from terminal transitions (Completed, Canceled); a no-op when no
+    /// checkpoint dir was set, and best-effort inside [`checkpoint::remove`].
+    fn remove_checkpoint(&self, task_id: &str) {
+        if let Some(dir) = &self.checkpoint_dir {
+            checkpoint::remove(dir, task_id);
+        }
+    }
+
     /// Best-effort cleanup of a transfer cancelled with no live runner to do
     /// it. The runner clears `resume` after *it* cleans up, so a still-`Some`
     /// resume here means nobody did -- an upload's server-side multipart is
     /// aborted, a download's local `.bcpart` is deleted. Failure is logged,
     /// never propagated; `take()` makes it safe against a racing runner.
     async fn cleanup_orphaned_transfer(self: &Arc<Self>, task_id: &str) {
+        // Cancel is terminal, so reap the checkpoint first -- unconditionally,
+        // before the resume-slot early return below, so a cancel with nothing
+        // to abort still drops any checkpoint the task had written.
+        self.remove_checkpoint(task_id);
         // Clone the coordinates + the resume handle out under the task lock,
         // then release it: the network abort must not run with any lock held
         // (the crate-wide rule -- no lock across a network `.await`).
@@ -640,6 +783,8 @@ impl TransferEngine {
         sink: Arc<dyn TransferSink>,
         progress: mpsc::UnboundedSender<ProgressMsg>,
         config: EngineConfig,
+        checkpoint_dir: Option<PathBuf>,
+        resume_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inner: Arc::new(EngineInner {
@@ -651,6 +796,8 @@ impl TransferEngine {
                 task_sem: Arc::new(Semaphore::new(config.max_tasks)),
                 seq: AtomicU64::new(0),
                 config,
+                checkpoint_dir,
+                resume_enabled,
             }),
         }
     }
@@ -849,6 +996,11 @@ mod tests {
         report_bytes: AtomicU64,
         /// Runs that got as far as reporting `report_bytes`.
         reported: AtomicUsize,
+        /// If set, each run mirrors this resume state to a checkpoint (`force`)
+        /// while it is running -- standing in for a real multipart runner that
+        /// has an upload id worth persisting. The write goes through the engine's
+        /// real [`CheckpointWriter`], so a test observes genuine file state.
+        checkpoint_state: StdMutex<Option<ResumeState>>,
     }
 
     impl FakeRunner {
@@ -862,6 +1014,7 @@ mod tests {
                 mode: StdMutex::new(FakeMode::Normal),
                 report_bytes: AtomicU64::new(0),
                 reported: AtomicUsize::new(0),
+                checkpoint_state: StdMutex::new(None),
             })
         }
 
@@ -887,6 +1040,13 @@ mod tests {
             let bytes = self.report_bytes.load(Ordering::SeqCst);
             if bytes > 0 {
                 ctx.progress.add(bytes);
+            }
+            // Mirror the checkpoint *before* bumping `reported`, so a test that
+            // waits on `reported == 1` is guaranteed the file is already on disk.
+            if let Some(state) = self.checkpoint_state.lock().unwrap().clone() {
+                ctx.persist_checkpoint(&state, true);
+            }
+            if bytes > 0 {
                 self.reported.fetch_add(1, Ordering::SeqCst);
             }
 
@@ -994,6 +1154,18 @@ mod tests {
     }
 
     fn harness(max_tasks: usize) -> Harness {
+        harness_cfg(max_tasks, None, true)
+    }
+
+    /// The full harness constructor: `checkpoint_dir` + the resume flag let the
+    /// checkpoint tests below observe the writer/remove paths, while `harness`
+    /// keeps its two-`None`-equivalent defaults so every existing test is
+    /// unchanged.
+    fn harness_cfg(
+        max_tasks: usize,
+        checkpoint_dir: Option<PathBuf>,
+        resume_enabled: bool,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let hub = Arc::new(ProviderHub::new(crate::store::SecureStore {
             path: dir.path().join("connections.enc"),
@@ -1010,6 +1182,8 @@ mod tests {
                 max_tasks,
                 max_parts: 4,
             },
+            checkpoint_dir,
+            Arc::new(AtomicBool::new(resume_enabled)),
         );
         Harness {
             engine,
@@ -1885,5 +2059,130 @@ mod tests {
         assert_eq!(spec.file_name, "photo.jpg");
         assert_eq!(spec.local_path, path.to_string_lossy());
         assert_eq!(spec.direction, Direction::Upload);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_running_upload_writes_a_checkpoint_then_removes_it_on_completion() {
+        let cp_dir = tempfile::tempdir().unwrap();
+        let h = harness_cfg(1, Some(cp_dir.path().to_path_buf()), true);
+        // A real multipart runner has an upload id worth persisting; the fake
+        // stands in by mirroring one resume state through the engine's *real*
+        // CheckpointWriter once it is running with progress. The assertions
+        // below observe genuine file state via `checkpoint::scan`, not a mock.
+        h.runner.report_bytes.store(256, Ordering::SeqCst);
+        *h.runner.checkpoint_state.lock().unwrap() =
+            Some(ResumeState::Upload(multipart_state("u-live")));
+
+        let task = h.engine.enqueue(spec("big")).await.unwrap();
+        eventually(
+            || h.runner.reported.load(Ordering::SeqCst) == 1,
+            "the running upload reports progress",
+        )
+        .await;
+        assert!(
+            !checkpoint::scan(cp_dir.path()).is_empty(),
+            "a checkpoint must be written mid-flight so a crash can resume the transfer"
+        );
+
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Completed),
+            "the upload reaches Completed",
+        )
+        .await;
+        eventually(
+            || checkpoint::scan(cp_dir.path()).is_empty(),
+            "the checkpoint must be removed on completion; a survivor would resume a finished task",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disabling_resume_writes_no_checkpoint() {
+        let cp_dir = tempfile::tempdir().unwrap();
+        let h = harness_cfg(1, Some(cp_dir.path().to_path_buf()), false);
+        // Same running-with-progress scenario as the sibling test, but with the
+        // resume flag off: the gate must suppress every write.
+        h.runner.report_bytes.store(256, Ordering::SeqCst);
+        *h.runner.checkpoint_state.lock().unwrap() =
+            Some(ResumeState::Upload(multipart_state("u-live")));
+
+        let task = h.engine.enqueue(spec("big")).await.unwrap();
+        eventually(
+            || h.runner.reported.load(Ordering::SeqCst) == 1,
+            "the running upload reports progress",
+        )
+        .await;
+        // Give any stray write every chance to land before concluding none did.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            checkpoint::scan(cp_dir.path()).is_empty(),
+            "with resume disabled the gate must suppress every checkpoint write, even mid-flight"
+        );
+        let _ = task;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persist_coalesces_non_forced_writes_but_force_always_lands() {
+        // Unit cover for the throttle, on the virtual clock so it needs no real
+        // sleeps. Writes are distinguished by upload id, so "did this write
+        // land" is observable straight from the file's content.
+        let cp_dir = tempfile::tempdir().unwrap();
+        let writer = CheckpointWriter {
+            dir: cp_dir.path().to_path_buf(),
+            task_id: "t".to_string(),
+            statics: CheckpointStatics {
+                direction: Direction::Upload,
+                connection_id: "c1".to_string(),
+                bucket: "b".to_string(),
+                key: "k".to_string(),
+                local_path: "/tmp/k".to_string(),
+                file_name: "k".to_string(),
+                total: 1024,
+            },
+            enabled: Arc::new(AtomicBool::new(true)),
+            last: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let state = |id: &str| ResumeState::Upload(multipart_state(id));
+        let persisted_upload_id = || {
+            let found = checkpoint::scan(cp_dir.path());
+            assert_eq!(found.len(), 1, "exactly one checkpoint file");
+            match &found[0].1.resume {
+                ResumeState::Upload(ms) => ms.upload_id.clone(),
+                _ => panic!("expected an upload checkpoint"),
+            }
+        };
+
+        writer.persist(&state("first"), false); // last == None -> writes
+        assert_eq!(persisted_upload_id(), "first");
+        writer.persist(&state("coalesced"), false); // within 2s -> skipped
+        assert_eq!(
+            persisted_upload_id(),
+            "first",
+            "a non-force write inside the 2s window must be coalesced away"
+        );
+        writer.persist(&state("forced"), true); // force -> ignores the throttle
+        assert_eq!(
+            persisted_upload_id(),
+            "forced",
+            "a force write must land regardless of the throttle"
+        );
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        writer.persist(&state("after-window"), false); // >2s since last -> writes
+        assert_eq!(
+            persisted_upload_id(),
+            "after-window",
+            "a non-force write after the window elapses must land"
+        );
+
+        // And the gate wins over everything: a disabled writer never writes.
+        writer.enabled.store(false, Ordering::Relaxed);
+        writer.persist(&state("gated"), true);
+        assert_eq!(
+            persisted_upload_id(),
+            "after-window",
+            "a disabled writer must not write even with force"
+        );
     }
 }

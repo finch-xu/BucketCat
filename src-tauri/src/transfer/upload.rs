@@ -35,7 +35,8 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{AppError, AppResult};
 use crate::provider::{Provider, UploadedPart};
 use crate::transfer::engine::{
-    MultipartState, ResumeState, RunOutcome, StopKind, TaskContext, TransferRunner,
+    CheckpointWriter, MultipartState, ResumeState, RunOutcome, StopKind, TaskContext,
+    TransferRunner,
 };
 use crate::transfer::part::{plan_upload, PartSpec, UploadPlan};
 use crate::transfer::retry::{backoff_delay, is_retryable, MAX_RETRIES};
@@ -98,6 +99,10 @@ struct UploadJob {
     stop: StopFn,
     progress: ProgressFn,
     resume: Arc<Mutex<Option<ResumeState>>>,
+    /// Mirrors the in-memory resume slot to a checkpoint file (M4c). `None`
+    /// when checkpointing is disabled, in which case `persist_checkpoint` is a
+    /// no-op.
+    checkpoint: Option<CheckpointWriter>,
 }
 
 impl UploadJob {
@@ -117,6 +122,7 @@ impl UploadJob {
             stop: Arc::new(move || control.requested()),
             progress: Arc::new(move |bytes| progress.add(bytes)),
             resume: Arc::clone(&ctx.resume),
+            checkpoint: ctx.checkpoint.clone(),
         }
     }
 
@@ -126,6 +132,14 @@ impl UploadJob {
 
     fn report(&self, bytes: u64) {
         (*self.progress)(bytes);
+    }
+
+    /// Mirrors `state` to the checkpoint file (coalesced/gated/best-effort);
+    /// a no-op when checkpointing is disabled. See [`CheckpointWriter`].
+    fn persist_checkpoint(&self, state: &ResumeState, force: bool) {
+        if let Some(writer) = &self.checkpoint {
+            writer.persist(state, force);
+        }
     }
 }
 
@@ -266,12 +280,16 @@ where
         let id = provider.multipart_init(&job.bucket, &job.key).await?;
         // Recorded immediately: if everything below fails, a cancel still has
         // an upload id to abort with, so no server-side fragments leak.
-        *job.resume.lock().await = Some(ResumeState::Upload(MultipartState {
+        let init_state = ResumeState::Upload(MultipartState {
             upload_id: id.clone(),
             completed: carried.clone(),
             source_size,
             source_mtime,
-        }));
+        });
+        *job.resume.lock().await = Some(init_state.clone());
+        // The first set, before any part lands: `force` so a cancel-before-any-
+        // part can read the upload id it must abort even after a restart.
+        job.persist_checkpoint(&init_state, true);
         id
     } else {
         existing.upload_id.clone()
@@ -339,12 +357,16 @@ where
     // Persist what landed before deciding anything, so a pause, a permanent
     // failure and a later retry all resume from the same place.
     let done = completed.lock().await.clone();
-    *job.resume.lock().await = Some(ResumeState::Upload(MultipartState {
+    let landed_state = ResumeState::Upload(MultipartState {
         upload_id: upload_id.clone(),
         completed: done.clone(),
         source_size,
         source_mtime,
-    }));
+    });
+    *job.resume.lock().await = Some(landed_state.clone());
+    // A per-part checkpoint refresh: coalesced, so a task that finishes many
+    // parts in a burst writes a bounded number of files rather than one each.
+    job.persist_checkpoint(&landed_state, false);
 
     // Read the stop intent once. Anything arriving after this line arrived
     // during the commit, and the contract is explicit that a real completion
@@ -379,7 +401,9 @@ where
     if stop.is_some() {
         // A pause. Nothing is aborted and the resume slot keeps the upload id
         // plus every accepted part, so the next run continues instead of
-        // re-uploading from zero.
+        // re-uploading from zero. `force` the checkpoint so the pause point is
+        // current on disk even if the per-part write above was coalesced away.
+        job.persist_checkpoint(&landed_state, true);
         return Ok(RunOutcome::Stopped);
     }
 
@@ -982,6 +1006,10 @@ mod tests {
                     reported.fetch_add(bytes, Ordering::SeqCst);
                 }),
                 resume: Arc::clone(&self.resume),
+                // The runner's decision logic is under test here, not the
+                // checkpoint mirror; disabling it keeps these tests filesystem-
+                // free (the engine tests cover the writer end).
+                checkpoint: None,
             }
         }
 

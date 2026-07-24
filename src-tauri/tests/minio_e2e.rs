@@ -1459,6 +1459,10 @@ fn build_engine(
             max_tasks: 3,
             max_parts,
         },
+        // The e2e tests here assert transfer semantics, not checkpoint
+        // persistence; disable checkpointing to keep them unchanged.
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
     )
 }
 

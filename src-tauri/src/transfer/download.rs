@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{AppError, AppResult};
 use crate::provider::Provider;
 use crate::transfer::engine::{
-    DownloadState, ResumeState, RunOutcome, StopKind, TaskContext, TransferRunner,
+    CheckpointWriter, DownloadState, ResumeState, RunOutcome, StopKind, TaskContext, TransferRunner,
 };
 use crate::transfer::part::{plan_upload, PartSpec, UploadPlan};
 use crate::transfer::partfile::PartFile;
@@ -85,6 +85,10 @@ struct DownloadJob {
     stop: StopFn,
     progress: ProgressFn,
     resume: Arc<Mutex<Option<ResumeState>>>,
+    /// Mirrors the in-memory resume slot to a checkpoint file (M4c). `None`
+    /// when checkpointing is disabled, in which case `persist_checkpoint` is a
+    /// no-op.
+    checkpoint: Option<CheckpointWriter>,
 }
 
 impl DownloadJob {
@@ -104,6 +108,7 @@ impl DownloadJob {
             stop: Arc::new(move || control.requested()),
             progress: Arc::new(move |bytes| progress.add(bytes)),
             resume: Arc::clone(&ctx.resume),
+            checkpoint: ctx.checkpoint.clone(),
         }
     }
 
@@ -113,6 +118,14 @@ impl DownloadJob {
 
     fn report(&self, bytes: u64) {
         (*self.progress)(bytes);
+    }
+
+    /// Mirrors `state` to the checkpoint file (coalesced/gated/best-effort);
+    /// a no-op when checkpointing is disabled. See [`CheckpointWriter`].
+    fn persist_checkpoint(&self, state: &ResumeState, force: bool) {
+        if let Some(writer) = &self.checkpoint {
+            writer.persist(state, force);
+        }
     }
 }
 
@@ -206,11 +219,15 @@ where
     }
     // Record resume state immediately so a cancel before any chunk lands still
     // knows which .bcpart to delete.
-    *job.resume.lock().await = Some(ResumeState::Download(DownloadState {
+    let init_state = ResumeState::Download(DownloadState {
         etag: None,
         completed_parts: done.clone(),
         bcpart: bcpart.clone(),
-    }));
+    });
+    *job.resume.lock().await = Some(init_state.clone());
+    // The first set, before any chunk lands: `force` so a cancel-before-any-
+    // chunk can read the `.bcpart` it must delete even after a restart.
+    job.persist_checkpoint(&init_state, true);
 
     let pending = pending_chunks(&chunks, &done);
     let permits = Arc::new(Semaphore::new(job.part_limit.max(1)));
@@ -271,11 +288,15 @@ where
 
     // Persist what landed before deciding anything, so a pause, a permanent
     // failure and a later retry all resume from the same place.
-    *job.resume.lock().await = Some(ResumeState::Download(DownloadState {
+    let landed_state = ResumeState::Download(DownloadState {
         etag: None,
         completed_parts: completed.clone(),
         bcpart: bcpart.clone(),
-    }));
+    });
+    *job.resume.lock().await = Some(landed_state.clone());
+    // A per-chunk checkpoint refresh: coalesced, so a download that finishes
+    // many chunks in a burst writes a bounded number of files, not one each.
+    job.persist_checkpoint(&landed_state, false);
 
     // Read the stop intent once. Anything arriving after this line arrived
     // during the finish, and the contract is explicit that a real completion
@@ -317,7 +338,10 @@ where
     if stop.is_some() {
         // A pause. The `.bcpart` and the finished chunk numbers stay in the
         // resume slot (persisted above) so the next run reopens the same
-        // staging file instead of re-downloading from zero.
+        // staging file instead of re-downloading from zero. `force` the
+        // checkpoint so the pause point is current even if the per-chunk write
+        // above was coalesced away.
+        job.persist_checkpoint(&landed_state, true);
         return Ok(RunOutcome::Stopped);
     }
 
@@ -864,6 +888,10 @@ mod tests {
                     reported.fetch_add(bytes, Ordering::SeqCst);
                 }),
                 resume: Arc::clone(&self.resume),
+                // The runner's decision logic is under test here, not the
+                // checkpoint mirror; disabling it keeps these tests filesystem-
+                // free (the engine tests cover the writer end).
+                checkpoint: None,
             }
         }
 

@@ -91,6 +91,11 @@ pub fn run() {
             let progress_tx = tauri::async_runtime::block_on(async {
                 spawn_aggregator(Arc::new(TauriProgressSink(handle.clone())))
             });
+            // Checkpoints live under the app data dir. `resume_enabled` defaults
+            // to `true`; M4c Task 6/9 will load the persisted flag and thread
+            // the real value here -- a `true` default is correct and
+            // non-breaking until then.
+            let checkpoint_dir = transfer::checkpoint::checkpoint_dir(&app.path().app_data_dir()?);
             app.manage(TransferEngine::new(
                 hub,
                 Arc::new(DispatchRunner {
@@ -100,6 +105,8 @@ pub fn run() {
                 Arc::new(TauriStateSink(handle)),
                 progress_tx,
                 EngineConfig::default(),
+                Some(checkpoint_dir),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ));
             Ok(())
         })
