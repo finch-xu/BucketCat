@@ -80,11 +80,12 @@ export function UploadConflictDialog({
  * because the collision guard wasn't ready. Every one of these previously
  * ended in nothing at all appearing on screen.
  *
- * COPY GAP (see the report): there are no `upload.*` strings for these three
- * cases yet, so this reuses the nearest existing keys --
- * `objects.partialSummary` for the queued/skipped counts and
- * `objects.checkingNames` for the refused drop. Dedicated copy would read
- * considerably better. */
+ * Dedicated `upload.*` copy for all three cases: `upload.skippedSummary` for
+ * the queued/skipped counts (the delete dialog's `objects.partialSummary` is
+ * about succeeded/failed deletes, not queued/skipped uploads -- reusing it
+ * misdescribed what happened) and `upload.notReadyBody` for the refused drop
+ * (`objects.checkingNames` is a fragment meant to sit next to other UI, not
+ * read as a whole sentence on its own). */
 export function UploadNoticeDialog({
   notice,
   onClose,
@@ -98,8 +99,8 @@ export function UploadNoticeDialog({
   let body: string;
   if (notice.kind === "error") body = errorText(notice.error);
   else if (notice.kind === "skipped") {
-    body = t("objects.partialSummary", { succeeded: notice.queued, failed: notice.skipped });
-  } else body = t("objects.checkingNames");
+    body = t("upload.skippedSummary", { queued: notice.queued, skipped: notice.skipped });
+  } else body = t("upload.notReadyBody");
 
   return (
     <Modal onClose={onClose} className="w-[420px]">
@@ -108,7 +109,8 @@ export function UploadNoticeDialog({
           <AlertTriangle className="size-[18px]" />
         </span>
         <div className="min-w-0 flex-1 pt-1">
-          <p className="text-[13px] text-fg2">{body}</p>
+          <div className="text-[15px] font-bold">{t("upload.noticeTitle")}</div>
+          <p className="mt-1.5 text-[13px] text-fg2">{body}</p>
         </div>
       </div>
       <div className="mt-3 flex items-center justify-end gap-2.5 border-t border-border2 px-5 py-4">

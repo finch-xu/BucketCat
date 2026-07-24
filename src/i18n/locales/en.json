@@ -82,7 +82,10 @@
     "conflictBody": "These {{count}} file(s) will overwrite objects in the current folder. Overwriting cannot be undone.",
     "overwrite": "Overwrite",
     "skip": "Skip these files",
-    "dropHint": "Drop to upload into this folder"
+    "dropHint": "Drop to upload into this folder",
+    "noticeTitle": "Upload result",
+    "skippedSummary": "{{queued}} queued, {{skipped}} skipped",
+    "notReadyBody": "Still checking for existing names in this folder. Please try again in a moment."
   },
   "transfer": {
     "title": "Transfers",

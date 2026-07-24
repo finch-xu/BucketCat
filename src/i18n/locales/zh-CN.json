@@ -82,7 +82,10 @@
     "conflictBody": "以下 {{count}} 个文件会覆盖当前目录中的同名对象。对象存储的覆盖不可撤销。",
     "overwrite": "覆盖",
     "skip": "跳过这些文件",
-    "dropHint": "松开即可上传到当前目录"
+    "dropHint": "松开即可上传到当前目录",
+    "noticeTitle": "上传结果",
+    "skippedSummary": "已加入 {{queued}} 个，跳过 {{skipped}} 个",
+    "notReadyBody": "正在检查当前目录中的同名文件，请稍后重试。"
   },
   "transfer": {
     "title": "传输任务",
