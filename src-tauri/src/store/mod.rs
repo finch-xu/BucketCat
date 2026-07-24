@@ -8,6 +8,7 @@
 
 pub mod model;
 pub mod secure;
+pub mod settings;
 
 pub use model::{Connection, ConnectionDto, ConnectionInput};
 pub use secure::{derive_key, SecureStore};
