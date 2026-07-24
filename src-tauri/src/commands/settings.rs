@@ -27,6 +27,7 @@ use crate::provider::clamp_expiry;
 use crate::store::settings::{self, clamp_parts, clamp_tasks, Settings};
 use crate::transfer::{
     bcpart_path, checkpoint, checkpoint_dir, plan_restore, Checkpoint, Direction, RestoreAction,
+    TransferEngine,
 };
 
 /// Tauri-managed handle to the runtime resume flag. Wraps the *same*
@@ -171,17 +172,32 @@ pub struct CleanResult {
 /// empty plan (never treat "store unreadable" as "no connections exist") is
 /// handled by the caller, one layer up in [`clean_checkpoint_residue`],
 /// before `known` is ever built.
+///
+/// `active` is the set of task ids the running [`TransferEngine`] currently
+/// tracks (Running/Paused/Queued/Failed -- anything still in its map). Unlike
+/// the startup `restore_all`, which only ever runs once before any transfer
+/// exists, this command can be invoked from the UI at arbitrary runtime --
+/// including while a transfer whose connection was *just* deleted is still
+/// in flight, its runner holding a cached provider and actively writing its
+/// `.bcpart`. Such a task's checkpoint has an unknown `connection_id` (so
+/// `plan_restore` calls it an orphan) but its `task_id` is still `active`:
+/// it is not residue, it is a live task the engine owns, and deleting its
+/// checkpoint/`.bcpart` out from under the runner would fail an otherwise-
+/// healthy transfer when it later tries to rename the `.bcpart` into place.
+/// Filtering those ids out here -- before a single file is touched -- is
+/// what makes this safe to wire to a button the user can press mid-transfer.
 fn orphan_removals(
     scanned: Vec<(String, Checkpoint)>,
     known: &HashSet<String>,
+    active: &HashSet<String>,
 ) -> Vec<(String, Direction, PathBuf)> {
     plan_restore(scanned, &Ok(known.clone()))
         .into_iter()
         .filter_map(|action| match action {
-            RestoreAction::DiscardOrphan(id, cp) => {
+            RestoreAction::DiscardOrphan(id, cp) if !active.contains(&id) => {
                 Some((id, cp.direction, PathBuf::from(cp.local_path)))
             }
-            RestoreAction::Restore(..) => None,
+            RestoreAction::DiscardOrphan(..) | RestoreAction::Restore(..) => None,
         })
         .collect()
 }
@@ -209,7 +225,7 @@ fn remove_orphans(dir: &Path, orphans: Vec<(String, Direction, PathBuf)>) -> Cle
                 }
             }
         }
-        match std::fs::metadata(dir.join(format!("{id}.json"))) {
+        match std::fs::metadata(checkpoint::path_for(dir, &id)) {
             Ok(meta) => freed_bytes += meta.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(task = %id, "stat checkpoint failed: {e}"),
@@ -234,14 +250,25 @@ fn remove_orphans(dir: &Path, orphans: Vec<(String, Direction, PathBuf)>) -> Cle
 /// alone [`remove_orphans`]) ever runs, exactly like the startup path -- a
 /// transient read failure must never be mistaken for "no connections exist"
 /// and discard every checkpoint on disk.
+///
+/// `engine.snapshot()` supplies the second safety net: unlike `restore_all`,
+/// which only ever runs once at startup before any transfer exists, this
+/// command is reachable from the UI at arbitrary runtime -- including while
+/// a transfer is in flight for a connection the user just deleted. That
+/// task's checkpoint looks orphaned (its `connection_id` is gone) but the
+/// engine is still actively running/pausing/retrying it, so its id shows up
+/// in the snapshot; [`orphan_removals`] excludes it, leaving the live task's
+/// checkpoint and `.bcpart` untouched.
 #[tauri::command]
 pub async fn clean_checkpoint_residue(
     state: State<'_, AppState>,
+    engine: State<'_, TransferEngine>,
     app: AppHandle,
 ) -> AppResult<CleanResult> {
     let known: HashSet<String> = state.hub().connection_ids().await?.into_iter().collect();
+    let active: HashSet<String> = engine.snapshot().await.into_iter().map(|t| t.id).collect();
     let dir = app_checkpoint_dir(&app)?;
-    let orphans = orphan_removals(checkpoint::scan(&dir), &known);
+    let orphans = orphan_removals(checkpoint::scan(&dir), &known, &active);
     Ok(remove_orphans(&dir, orphans))
 }
 
@@ -392,8 +419,9 @@ mod tests {
             ),
         ];
         let known: HashSet<String> = HashSet::from(["c1".to_string()]);
+        let active: HashSet<String> = HashSet::new();
 
-        let orphans = orphan_removals(scanned, &known);
+        let orphans = orphan_removals(scanned, &known, &active);
 
         assert_eq!(
             orphans.len(),
@@ -422,8 +450,9 @@ mod tests {
             ),
         ];
         let known: HashSet<String> = HashSet::new();
+        let active: HashSet<String> = HashSet::new();
 
-        let mut orphans = orphan_removals(scanned, &known);
+        let mut orphans = orphan_removals(scanned, &known, &active);
         orphans.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(orphans.len(), 2);
@@ -442,6 +471,43 @@ mod tests {
                 Direction::Upload,
                 PathBuf::from("/tmp/up.bin")
             )
+        );
+    }
+
+    /// Regression for the M6c Task 3 race: a checkpoint with an unknown
+    /// connection (so `plan_restore` would call it an orphan) whose `task_id`
+    /// is still in the engine's live snapshot -- a Running/Paused/Queued/
+    /// Failed task the engine owns -- must be left alone, because deleting
+    /// its checkpoint/`.bcpart` out from under an in-flight runner fails an
+    /// otherwise-healthy transfer. A second orphan with the same unknown
+    /// connection but no matching active id is true residue and must still
+    /// be selected, proving `active` filters surgically rather than
+    /// suppressing removal altogether.
+    #[test]
+    fn orphan_removals_skips_a_checkpoint_the_engine_still_tracks() {
+        let scanned = vec![
+            (
+                "t-in-flight".to_string(),
+                cp(Direction::Download, "deleted-conn", "/tmp/live.bin"),
+            ),
+            (
+                "t-truly-orphaned".to_string(),
+                cp(Direction::Download, "deleted-conn", "/tmp/dead.bin"),
+            ),
+        ];
+        let known: HashSet<String> = HashSet::new();
+        let active: HashSet<String> = HashSet::from(["t-in-flight".to_string()]);
+
+        let orphans = orphan_removals(scanned, &known, &active);
+
+        assert_eq!(
+            orphans.len(),
+            1,
+            "the actively-tracked task's checkpoint must be protected"
+        );
+        assert_eq!(
+            orphans[0].0, "t-truly-orphaned",
+            "only the non-active orphan is selected for removal"
         );
     }
 

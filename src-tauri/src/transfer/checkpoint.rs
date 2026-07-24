@@ -27,7 +27,10 @@ pub fn checkpoint_dir(base: &Path) -> PathBuf {
     dir
 }
 
-fn path_for(dir: &Path, task_id: &str) -> PathBuf {
+/// `pub(crate)` so callers outside this module (e.g. the settings command's
+/// residue cleanup) that need the on-disk path a checkpoint lives at can
+/// reuse this rather than re-deriving the `<id>.json` naming convention.
+pub(crate) fn path_for(dir: &Path, task_id: &str) -> PathBuf {
     dir.join(format!("{task_id}.json"))
 }
 
