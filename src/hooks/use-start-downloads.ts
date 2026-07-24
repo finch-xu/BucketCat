@@ -26,6 +26,15 @@ export interface UseStartDownloadsResult {
    * one task per real object under the prefix, pushes every returned task and
    * opens the panel. A cancelled picker does nothing. */
   startFolderDownload: (entry: ObjectEntry) => void;
+  /** Downloads several selected file objects at once (the selection bar's
+   * batch action). Opens a single directory picker (defaulting to the system
+   * download directory); on confirm, queues one task per entry into that
+   * directory (local path = dir/name), pushes every returned task and opens
+   * the panel. A cancelled picker does nothing, and an empty list is a no-op.
+   * Selection is files-only (clicking a folder clears the selection), so every
+   * entry here is a real object -- no prefix recursion, unlike the folder
+   * download; each file just lands flat in the chosen directory. */
+  startBatchDownload: (entries: ObjectEntry[]) => void;
   /** Pre-keyed error dialog element -- render `{dialog}` anywhere under this
    * hook's caller; it is `null` while nothing has failed. Mirrors the way
    * `useStartUploads` surfaces a rejected command instead of letting it be an
@@ -100,6 +109,31 @@ export function useStartDownloads(): UseStartDownloadsResult {
     [activeConn, activeBucket, applyState, setPanelOpen],
   );
 
+  const startBatchDownload = useCallback(
+    (entries: ObjectEntry[]) => {
+      if (entries.length === 0) return; // nothing selected -- no dialog, no-op
+      void (async () => {
+        try {
+          const localDir = await open({ directory: true, defaultPath: await downloadDir() });
+          if (!localDir) return; // user cancelled the directory picker
+          // One picker, then one task per file into that directory. Enqueued
+          // sequentially so a mid-list failure surfaces in the dialog with the
+          // earlier files already queued and running (same fail-forward shape
+          // as the per-folder path -- the panel just doesn't pop on error).
+          for (const entry of entries) {
+            const localPath = await join(localDir, entry.name);
+            const task = await enqueueDownload(activeConn, activeBucket, entry.key, localPath);
+            applyState(task);
+          }
+          setPanelOpen(true);
+        } catch (reason) {
+          setError(toAppError(reason));
+        }
+      })();
+    },
+    [activeConn, activeBucket, applyState, setPanelOpen],
+  );
+
   // Plain `createElement`, not JSX -- this is a `.ts` file (same reasoning as
   // `useStartUploads`'s dialog). Keeps the exact visual language of
   // `UploadNoticeDialog` so a download failure reads identically to an upload
@@ -150,5 +184,5 @@ export function useStartDownloads(): UseStartDownloadsResult {
     });
   }
 
-  return { startFileDownload, startFolderDownload, dialog };
+  return { startFileDownload, startFolderDownload, startBatchDownload, dialog };
 }

@@ -181,12 +181,25 @@ function RowActions({
   );
 }
 
-/** Batch action bar, visible only while objects are selected. */
-function SelectionBar() {
+/** Batch action bar, visible only while objects are selected. Selection is
+ * files-only (folder clicks clear it), so every selected key resolves to a
+ * real object in the current listing -- `entries` is passed in so the batch
+ * download can name each local file from `entry.name`, exactly as the
+ * single-file download does, rather than re-deriving it from the key. */
+function SelectionBar({
+  entries,
+  onDownload,
+}: {
+  entries: ObjectEntry[];
+  onDownload: (entries: ObjectEntry[]) => void;
+}) {
   const { t } = useTranslation();
   const { selectedKeys, clearSelection, openDeleteObjects } = useApp();
 
   if (selectedKeys.length === 0) return null;
+
+  const selectedSet = new Set(selectedKeys);
+  const selectedEntries = entries.filter((e) => selectedSet.has(e.key));
 
   return (
     <div className="flex h-11 shrink-0 items-center justify-between gap-3 border-t border-border bg-background px-4">
@@ -200,6 +213,14 @@ function SelectionBar() {
           className="h-7 cursor-pointer rounded-[8px] border border-border bg-background px-3 text-[12.5px] font-medium text-fg2 hover:bg-hover"
         >
           {t("objects.clearSelection")}
+        </button>
+        <button
+          type="button"
+          onClick={() => onDownload(selectedEntries)}
+          className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-[8px] bg-primary px-3 text-[12.5px] font-semibold text-primary-foreground hover:bg-primary-strong"
+        >
+          <Download className="size-3.5" />
+          {t("objects.download")}
         </button>
         <button
           type="button"
@@ -428,7 +449,8 @@ export function FileBrowser() {
   const { activeBucket, path, view } = useApp();
   const { query, entries, searching } = useBrowse();
   const { startUploads, guardReady, dialog } = useStartUploads();
-  const { startFileDownload, startFolderDownload, dialog: downloadDialog } = useStartDownloads();
+  const { startFileDownload, startFolderDownload, startBatchDownload, dialog: downloadDialog } =
+    useStartDownloads();
   const [dragging, setDragging] = useState(false);
 
   // `useCallback` so this effect's dependency actually holds still.
@@ -529,7 +551,7 @@ export function FileBrowser() {
         ) : (
           <GridView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
         )}
-        <SelectionBar />
+        <SelectionBar entries={entries} onDownload={startBatchDownload} />
       </>
     );
   }
