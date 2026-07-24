@@ -253,46 +253,95 @@ where
         _ => MultipartState::default(),
     };
 
-    // A recorded completion naming a part this plan does not contain is
-    // unusable: `CompleteMultipartUpload` rejects a part number the upload
-    // never issued, so carrying one forward would fail the whole transfer at
-    // its very last step. `pending_parts` already ignores such entries;
-    // dropping them here as well keeps the accepted list and the plan in step.
     let planned: HashSet<i32> = plan.iter().map(|spec| spec.number).collect();
-    let carried: Vec<UploadedPart> = existing
-        .completed
-        .iter()
-        .filter(|part| planned.contains(&part.number))
-        .cloned()
-        .collect();
 
-    // Captured once per multipart upload, not re-`stat`ed on every write below:
-    // a resumed run must keep reporting the fingerprint of the file as it was
-    // when the upload was created, so a later cross-restart resume (M4c) can
-    // tell the source changed instead of comparing the file against itself.
-    let (source_size, source_mtime) = if existing.upload_id.is_empty() {
-        source_fingerprint(&job.path)
+    // Decide whether this run continues an existing upload or starts a fresh
+    // one, and -- crucially -- what the *server* considers already done. A
+    // saved resume state is only as trustworthy as two things it cannot vouch
+    // for on its own: that the source file is still the one the upload was
+    // created for, and that the parts its checkpoint claims were accepted
+    // really reached the server. Both are verified here, before any part is
+    // (re-)sent, so a cross-restart resume assembles the right object instead
+    // of a plausible-looking corrupt one.
+    //
+    // `resume_id` is `Some` only when the upload can genuinely be continued;
+    // otherwise it is `None` and a brand-new `multipart_init` follows below.
+    // `carried` is the *server-authoritative* set of already-accepted parts
+    // (empty for a fresh upload), never the checkpoint's own `completed` list.
+    let (resume_id, carried, source_size, source_mtime) = if existing.upload_id.is_empty() {
+        // A fresh upload: capture the fingerprint of the file as it is now, so
+        // a later resume can tell whether it changed underneath us.
+        let (size, mtime) = source_fingerprint(&job.path);
+        (None, Vec::new(), size, mtime)
     } else {
-        (existing.source_size, existing.source_mtime)
+        let (cur_size, cur_mtime) = source_fingerprint(&job.path);
+        if (cur_size, cur_mtime) != (existing.source_size, existing.source_mtime) {
+            // The bytes on disk are not the bytes this upload was created for.
+            // Continuing would splice new parts onto old ones and assemble a
+            // corrupt object, so abort the stale upload (best-effort -- its
+            // fragments would otherwise keep billing the user), forget it, and
+            // fall through to a fresh upload of the current file.
+            if let Err(err) = provider
+                .multipart_abort(&job.bucket, &job.key, &existing.upload_id)
+                .await
+            {
+                tracing::warn!(task = %job.task_id, "abort of stale upload failed: {err}");
+            }
+            *job.resume.lock().await = None;
+            (None, Vec::new(), cur_size, cur_mtime)
+        } else {
+            // The source matches. The checkpoint's `completed` can still be
+            // wrong (a write interrupted mid-flush, a truncated disk), so ask
+            // the server what it actually holds and treat *that* as the set of
+            // finished parts. A part it reports outside this plan is dropped:
+            // `CompleteMultipartUpload` rejects a number the upload never
+            // issued, and a stale entry must never shrink the real work.
+            match provider
+                .multipart_list(&job.bucket, &job.key, &existing.upload_id)
+                .await
+            {
+                Ok(server_parts) => {
+                    let carried: Vec<UploadedPart> = server_parts
+                        .into_iter()
+                        .filter(|part| planned.contains(&part.number))
+                        .collect();
+                    (
+                        Some(existing.upload_id.clone()),
+                        carried,
+                        existing.source_size,
+                        existing.source_mtime,
+                    )
+                }
+                Err(err) => {
+                    // The id is gone or unreachable, so it cannot be continued:
+                    // sending parts under it would only fail at complete time.
+                    // Forget it and start fresh against the current file.
+                    tracing::warn!(task = %job.task_id, "listing parts to resume failed: {err}");
+                    *job.resume.lock().await = None;
+                    (None, Vec::new(), cur_size, cur_mtime)
+                }
+            }
+        }
     };
 
-    let upload_id = if existing.upload_id.is_empty() {
-        let id = provider.multipart_init(&job.bucket, &job.key).await?;
-        // Recorded immediately: if everything below fails, a cancel still has
-        // an upload id to abort with, so no server-side fragments leak.
-        let init_state = ResumeState::Upload(MultipartState {
-            upload_id: id.clone(),
-            completed: carried.clone(),
-            source_size,
-            source_mtime,
-        });
-        *job.resume.lock().await = Some(init_state.clone());
-        // The first set, before any part lands: `force` so a cancel-before-any-
-        // part can read the upload id it must abort even after a restart.
-        job.persist_checkpoint(&init_state, true);
-        id
-    } else {
-        existing.upload_id.clone()
+    let upload_id = match resume_id {
+        Some(id) => id,
+        None => {
+            let id = provider.multipart_init(&job.bucket, &job.key).await?;
+            // Recorded immediately: if everything below fails, a cancel still
+            // has an upload id to abort with, so no server-side fragments leak.
+            let init_state = ResumeState::Upload(MultipartState {
+                upload_id: id.clone(),
+                completed: carried.clone(),
+                source_size,
+                source_mtime,
+            });
+            *job.resume.lock().await = Some(init_state.clone());
+            // The first set, before any part lands: `force` so a cancel-before-
+            // any-part can read the upload id it must abort even after a restart.
+            job.persist_checkpoint(&init_state, true);
+            id
+        }
     };
 
     // The engine zeroes `transferred` and sends `Forget` whenever a task is
@@ -704,6 +753,12 @@ mod tests {
         /// assemble the object. The runner must surface this as `Err`, never
         /// report `Completed` for a commit that did not happen.
         complete_fails: bool,
+        /// What `multipart_list` reports the server has accepted. Configurable
+        /// so a resume test can make the *server* disagree with the
+        /// checkpoint's `completed` -- e.g. return an empty list even though
+        /// the checkpoint claims part 1 is done -- which is exactly the case
+        /// the server-authoritative reconciliation must get right.
+        listed: StdMutex<Vec<UploadedPart>>,
     }
 
     impl FakeProvider {
@@ -723,6 +778,7 @@ mod tests {
                 op_delay: Duration::ZERO,
                 abort_fails: false,
                 complete_fails: false,
+                listed: StdMutex::new(Vec::new()),
             }
         }
 
@@ -931,15 +987,17 @@ mod tests {
             Ok(())
         }
 
-        // Task 4 adds the trait method; Task 7 will make this fake return
-        // meaningful data for resume-after-restart tests. Not exercised yet.
+        // The server's own record of accepted parts -- authoritative on a
+        // cross-restart resume. Defaults to empty (the server accepted
+        // nothing), which a test overrides via the `listed` field to model a
+        // server that has some parts already.
         async fn multipart_list(
             &self,
             _bucket: &str,
             _key: &str,
             _upload_id: &str,
         ) -> AppResult<Vec<UploadedPart>> {
-            Ok(Vec::new())
+            Ok(self.listed.lock().unwrap().clone())
         }
 
         async fn head_object(&self, _bucket: &str, _key: &str) -> AppResult<ObjectHead> {
@@ -1223,7 +1281,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_resumed_upload_replays_finished_parts_into_the_progress_bar() {
-        let rig = rig(4, |_| {});
+        // The server confirms it holds part 1, matching the checkpoint. With
+        // both in agreement the runner reuses the id and skips part 1.
+        let rig = rig(4, |fake| {
+            fake.listed = StdMutex::new(vec![UploadedPart {
+                number: 1,
+                etag: "\"etag-1\"".to_string(),
+                size: 8 * MB,
+            }]);
+        });
         rig.seed_resume(MultipartState {
             upload_id: UPLOAD_ID.to_string(),
             completed: vec![UploadedPart {
@@ -1397,7 +1463,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_resume_state_naming_a_part_outside_the_plan_never_reaches_complete() {
-        let rig = rig(4, |_| {});
+        // Even the *server* can report a part this plan does not contain (an
+        // upload created against a different plan). It must be dropped, not
+        // carried into the commit that `CompleteMultipartUpload` would reject.
+        let rig = rig(4, |fake| {
+            fake.listed = StdMutex::new(vec![UploadedPart {
+                number: 99,
+                etag: "\"stale\"".to_string(),
+                size: 8 * MB,
+            }]);
+        });
         rig.seed_resume(MultipartState {
             upload_id: UPLOAD_ID.to_string(),
             completed: vec![UploadedPart {
@@ -1514,6 +1589,107 @@ mod tests {
             .expect("a pause must leave resume state, fingerprint included");
         assert_eq!(state.source_size, meta.len());
         assert!(state.source_mtime > 0, "mtime must be captured");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_restarts_when_the_source_changed() {
+        // The resume state was captured against a file whose fingerprint no
+        // longer matches what is on disk. Continuing on the old upload id would
+        // splice new parts onto old ones and assemble a corrupt object, so the
+        // runner must abort the stale upload and start a brand-new one against
+        // the current file -- re-uploading every part rather than trusting the
+        // checkpoint's `completed`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src.bin");
+        std::fs::write(&path, vec![9u8; 16 * MB as usize]).unwrap();
+
+        let rig = rig(4, |_| {});
+        rig.seed_resume(MultipartState {
+            upload_id: UPLOAD_ID.to_string(),
+            // Claims part 1 is already done -- a claim the source change voids.
+            completed: vec![UploadedPart {
+                number: 1,
+                etag: "\"old\"".to_string(),
+                size: 8 * MB,
+            }],
+            // A size that cannot be the 16MB file we just wrote: the
+            // fingerprint mismatch is what forces the restart.
+            source_size: 999,
+            source_mtime: 1,
+        })
+        .await;
+
+        let outcome = rig.run_at(path.clone(), 16 * MB).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.aborts(),
+            1,
+            "the stale upload id must be aborted so its fragments stop billing"
+        );
+        assert_eq!(
+            rig.provider.inits(),
+            1,
+            "a changed source forces a brand-new multipart upload rather than continuing the old id"
+        );
+        assert_eq!(
+            rig.provider.parts_seen(),
+            vec![1, 2],
+            "every part is re-uploaded against the new file; nothing is carried from the stale \
+             checkpoint"
+        );
+        assert_eq!(rig.provider.assembled_numbers(), vec![1, 2]);
+        assert_eq!(
+            rig.reported(),
+            16 * MB,
+            "only the bytes actually re-sent count; the voided part 1 is not re-reported"
+        );
+        assert!(rig.resume_state().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_trusts_multipart_list_not_the_checkpoint_completed() {
+        // The checkpoint claims part 1 is already on the server, but the
+        // server's own ListParts reports nothing. The server wins: part 1 must
+        // be (re-)uploaded rather than skipped on the strength of a checkpoint
+        // that could have been written before the part actually landed.
+        let rig = rig(4, |_| {}); // fake.multipart_list returns empty by default
+        rig.seed_resume(MultipartState {
+            upload_id: UPLOAD_ID.to_string(),
+            completed: vec![UploadedPart {
+                number: 1,
+                etag: "\"claimed-but-never-landed\"".to_string(),
+                size: 8 * MB,
+            }],
+            // (0, 0) matches the fingerprint of the deliberately-nonexistent
+            // stand-in path, so the source-change branch is not taken and the
+            // reconciliation against the server's part list is what decides.
+            source_size: 0,
+            source_mtime: 0,
+        })
+        .await;
+
+        let outcome = rig.run(16 * MB).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.inits(),
+            0,
+            "the upload id is still valid, so the run continues it rather than opening a new one"
+        );
+        assert_eq!(
+            rig.provider.aborts(),
+            0,
+            "nothing is stale -- the fingerprint matched, so there is nothing to abort"
+        );
+        assert_eq!(
+            rig.provider.attempts_of(1),
+            1,
+            "the server never accepted part 1, so it must actually be uploaded despite the \
+             checkpoint claiming otherwise"
+        );
+        assert_eq!(rig.provider.parts_seen(), vec![1, 2]);
+        assert_eq!(rig.provider.assembled_numbers(), vec![1, 2]);
     }
 
     #[tokio::test]
