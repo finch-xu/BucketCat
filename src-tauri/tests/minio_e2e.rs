@@ -1274,7 +1274,9 @@ async fn multipart_list_returns_the_accepted_parts() {
     };
     for p in plan.iter().take(2) {
         provider
-            .upload_part_from_file(&bucket, key, &upload_id, p.number, &path, p.offset, p.length)
+            .upload_part_from_file(
+                &bucket, key, &upload_id, p.number, &path, p.offset, p.length,
+            )
             .await
             .expect("upload_part");
     }

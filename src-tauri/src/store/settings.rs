@@ -19,7 +19,9 @@ fn default_true() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { resume_enabled: true }
+        Self {
+            resume_enabled: true,
+        }
     }
 }
 
@@ -78,7 +80,13 @@ mod tests {
     fn save_then_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("settings.json");
-        save(&p, &Settings { resume_enabled: false }).unwrap();
+        save(
+            &p,
+            &Settings {
+                resume_enabled: false,
+            },
+        )
+        .unwrap();
         assert!(!load(&p).resume_enabled);
         // 原子写不留 .tmp
         assert!(!p.with_extension("json.tmp").exists());

@@ -1038,10 +1038,7 @@ mod tests {
         /// exercised entirely through the fake provider, which never touches
         /// the filesystem itself.
         fn job_at(&self, path: PathBuf) -> UploadJob {
-            UploadJob {
-                path,
-                ..self.job()
-            }
+            UploadJob { path, ..self.job() }
         }
 
         async fn run_at(&self, path: PathBuf, total: u64) -> AppResult<RunOutcome> {
