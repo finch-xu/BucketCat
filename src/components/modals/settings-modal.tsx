@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -59,24 +60,30 @@ function Row({ label, children }: { label: React.ReactNode; children: React.Reac
 /** Bounded +/- numeric stepper shared by the max-tasks and max-parts rows.
  * `onChange` only ever receives a value already inside `[min, max]` -- the
  * buttons clamp before calling it -- but callers still clamp again before
- * persisting, since this is also the value shown optimistically. */
+ * persisting, since this is also the value shown optimistically.
+ * `disabled` is set by callers while their own persist is in flight so a
+ * disabled button never fires `onClick` -- at most one persist per field can
+ * ever be in flight, which rules out an out-of-order optimistic revert. */
 function Stepper({
   value,
   min,
   max,
   onChange,
+  disabled = false,
 }: {
   value: number;
   min: number;
   max: number;
   onChange: (n: number) => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="flex items-center gap-0.5 overflow-hidden rounded-[9px] border border-border bg-panel">
       <button
         type="button"
         onClick={() => onChange(Math.max(min, value - 1))}
-        className="size-[30px] cursor-pointer text-base text-fg2 hover:bg-hover"
+        disabled={disabled}
+        className="size-[30px] cursor-pointer text-base text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
       >
         −
       </button>
@@ -84,7 +91,8 @@ function Stepper({
       <button
         type="button"
         onClick={() => onChange(Math.min(max, value + 1))}
-        className="size-[30px] cursor-pointer text-base text-fg2 hover:bg-hover"
+        disabled={disabled}
+        className="size-[30px] cursor-pointer text-base text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
       >
         +
       </button>
@@ -105,17 +113,21 @@ export function SettingsModal() {
     setTransferSettings,
   } = useApp();
   const errorText = useErrorText();
+  const queryClient = useQueryClient();
   const [resumeEnabled, setResumeEnabledState] = useState(true);
   // Real backend settings (M6c): fall back to the backend's own defaults
   // (see `Settings::default()` in `src-tauri/src/store/settings.rs`) until
   // `getSettings()` resolves below.
   const [maxTasks, setMaxTasksState] = useState(3);
   const [maxParts, setMaxPartsState] = useState(4);
+  const [maxTasksPending, setMaxTasksPending] = useState(false);
+  const [maxPartsPending, setMaxPartsPending] = useState(false);
   const [shareExpirySecs, setShareExpirySecsState] = useState(3600);
   const [cleanResult, setCleanResult] = useState<CleanResult | null>(null);
   const [cleanError, setCleanError] = useState<AppError | null>(null);
   const [cleanPending, setCleanPending] = useState(false);
   const [clearError, setClearError] = useState<AppError | null>(null);
+  const [clearPending, setClearPending] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -148,37 +160,56 @@ export function SettingsModal() {
     };
   }, []);
 
+  // The modal never unmounts (it self-gates below instead) so a stale
+  // result/error banner from a previous open would otherwise reappear next
+  // time the modal is shown. Reset them on close instead.
+  useEffect(() => {
+    if (!showSettings) {
+      setCleanResult(null);
+      setCleanError(null);
+      setClearError(null);
+    }
+  }, [showSettings]);
+
   if (!showSettings) return null;
 
   function handleMaxTasksChange(n: number) {
     const clamped = Math.min(5, Math.max(1, n));
     const previous = maxTasks;
     setMaxTasksState(clamped);
-    setMaxTasks(clamped).catch((err) => {
-      // Persist rejected: revert the optimistic local state, same pattern
-      // as the resume-transfers switch below.
-      setMaxTasksState(previous);
-      console.error("Failed to persist max tasks", err);
-    });
+    setMaxTasksPending(true);
+    setMaxTasks(clamped)
+      .catch((err) => {
+        // Persist rejected: revert the optimistic local state, same pattern
+        // as the resume-transfers switch below.
+        setMaxTasksState(previous);
+        console.error("Failed to persist max tasks", err);
+      })
+      .finally(() => setMaxTasksPending(false));
   }
 
   function handleMaxPartsChange(n: number) {
     const clamped = Math.min(8, Math.max(1, n));
     const previous = maxParts;
     setMaxPartsState(clamped);
-    setMaxParts(clamped).catch((err) => {
-      setMaxPartsState(previous);
-      console.error("Failed to persist max parts", err);
-    });
+    setMaxPartsPending(true);
+    setMaxParts(clamped)
+      .catch((err) => {
+        setMaxPartsState(previous);
+        console.error("Failed to persist max parts", err);
+      })
+      .finally(() => setMaxPartsPending(false));
   }
 
   function handleShareExpiryChange(secs: number) {
     const previous = shareExpirySecs;
     setShareExpirySecsState(secs);
-    setShareExpiry(secs).catch((err) => {
-      setShareExpirySecsState(previous);
-      console.error("Failed to persist share expiry", err);
-    });
+    setShareExpiry(secs)
+      .then(() => queryClient.invalidateQueries({ queryKey: ["settings"] }))
+      .catch((err) => {
+        setShareExpirySecsState(previous);
+        console.error("Failed to persist share expiry", err);
+      });
   }
 
   function handleCleanResidue() {
@@ -197,6 +228,7 @@ export function SettingsModal() {
   // `transfer://state` event that terminal tasks never re-emit.
   function handleClearHistory() {
     setClearError(null);
+    setClearPending(true);
     clearFinishedTransfers()
       .then(() => {
         const { tasks, drop } = useTransferStore.getState();
@@ -204,7 +236,8 @@ export function SettingsModal() {
           if (task.status === "completed" || task.status === "canceled") drop(id);
         }
       })
-      .catch((err: AppError) => setClearError(err));
+      .catch((err: AppError) => setClearError(err))
+      .finally(() => setClearPending(false));
   }
 
   const locale: AppLocale = i18n.language === "zh-CN" ? "zh-CN" : "en";
@@ -270,10 +303,22 @@ export function SettingsModal() {
 
         <SectionTitle>{t("settings.transfers")}</SectionTitle>
         <Row label={t("settings.concurrency")}>
-          <Stepper value={maxTasks} min={1} max={5} onChange={handleMaxTasksChange} />
+          <Stepper
+            value={maxTasks}
+            min={1}
+            max={5}
+            onChange={handleMaxTasksChange}
+            disabled={maxTasksPending}
+          />
         </Row>
         <Row label={t("settings.maxParts")}>
-          <Stepper value={maxParts} min={1} max={8} onChange={handleMaxPartsChange} />
+          <Stepper
+            value={maxParts}
+            min={1}
+            max={8}
+            onChange={handleMaxPartsChange}
+            disabled={maxPartsPending}
+          />
         </Row>
         <div className="-mt-1 mb-1 text-[11.5px] text-muted-foreground">
           <div>{t("settings.concurrencyHint", { total: maxTasks * maxParts })}</div>
@@ -367,7 +412,8 @@ export function SettingsModal() {
           <button
             type="button"
             onClick={handleClearHistory}
-            className="cursor-pointer rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] font-medium text-fg2 hover:bg-hover"
+            disabled={clearPending}
+            className="cursor-pointer rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] font-medium text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
           >
             {t("settings.clearHistory")}
           </button>

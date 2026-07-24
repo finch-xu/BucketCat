@@ -82,8 +82,10 @@ export function DetailsPanel() {
   const [preview, setPreview] = useState<PreviewState>(EMPTY_PREVIEW);
 
   // Once the user has touched the expiry dropdown themselves, their choice
-  // wins for the rest of this session -- the settings-derived default below
-  // must never clobber an explicit override.
+  // wins for this object -- the settings-derived default below must never
+  // clobber an explicit override. The override is per-object, not
+  // per-session: it's reset whenever the selected entry changes (see the
+  // entry-change effect below), matching "临时改本次" (this share only).
   const expiryTouchedRef = useRef(false);
 
   // Lightweight one-shot fetch of the persisted default (M6c's Settings
@@ -135,6 +137,12 @@ export function DetailsPanel() {
     setShareUrl(null);
     setCopied(false);
     presignMutation.reset();
+    // Each newly-selected object starts from the persisted share-expiry
+    // default again ("临时改本次" -- the manual override is per-object, not
+    // per-session). settingsQuery.data may still be undefined on first load;
+    // the effect below re-applies the real default once it resolves.
+    expiryTouchedRef.current = false;
+    setExpirySecs(settingsQuery.data?.share_expiry_secs ?? EXPIRY_OPTIONS[0].secs);
     // Only re-run when the selected entry actually changes -- `presignMutation`
     // is a fresh object every render and would otherwise loop this effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
