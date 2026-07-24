@@ -164,6 +164,8 @@
     "partSize": "分片大小",
     "verify": "传输完成后校验",
     "overwrite": "覆盖同名文件",
+    "resumeTransfers": "断点续传",
+    "resumeTransfersHint": "重启后可继续未完成的传输",
     "about": "关于",
     "github": "GitHub 仓库",
     "checkUpdate": "检查更新"

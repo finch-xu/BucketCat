@@ -1,4 +1,5 @@
 import { X } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import logo from "@/assets/logo.png";
 import { Modal } from "@/components/ui/modal";
@@ -6,6 +7,7 @@ import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
 import { setLocale } from "@/i18n";
 import type { AppLocale } from "@/i18n/resolve-locale";
+import { getResumeEnabled, setResumeEnabled } from "@/lib/api";
 import { useApp, type ViewMode } from "@/store/app-store";
 import type { ThemeMode } from "@/lib/theme";
 
@@ -40,6 +42,21 @@ export function SettingsModal() {
     transferSettings,
     setTransferSettings,
   } = useApp();
+  const [resumeEnabled, setResumeEnabledState] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    getResumeEnabled()
+      .then((enabled) => {
+        if (!cancelled) setResumeEnabledState(enabled);
+      })
+      .catch((err) => {
+        console.error("Failed to load resume-transfers setting", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   if (!showSettings) return null;
 
@@ -138,6 +155,24 @@ export function SettingsModal() {
           <Switch
             checked={transferSettings.overwrite}
             onChange={(v) => setTransferSettings({ overwrite: v })}
+          />
+        </Row>
+        <Row
+          label={
+            <div>
+              <div>{t("settings.resumeTransfers")}</div>
+              <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+                {t("settings.resumeTransfersHint")}
+              </div>
+            </div>
+          }
+        >
+          <Switch
+            checked={resumeEnabled}
+            onChange={(v) => {
+              setResumeEnabledState(v);
+              void setResumeEnabled(v);
+            }}
           />
         </Row>
 

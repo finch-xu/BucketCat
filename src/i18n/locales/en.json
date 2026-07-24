@@ -164,6 +164,8 @@
     "partSize": "Part size",
     "verify": "Verify after transfer",
     "overwrite": "Overwrite existing files",
+    "resumeTransfers": "Resumable transfers",
+    "resumeTransfersHint": "Continue unfinished transfers after a restart",
     "about": "About",
     "github": "GitHub repo",
     "checkUpdate": "Check for updates"
