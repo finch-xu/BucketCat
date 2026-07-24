@@ -285,6 +285,28 @@ impl EnqueueSpec {
             total: meta.len(),
         })
     }
+
+    /// Builds a download spec. Unlike `for_upload`, the local file does not
+    /// exist yet, so `total` comes from a prior `head_object` (done in the
+    /// command) rather than from the filesystem.
+    pub fn for_download(
+        connection_id: String,
+        bucket: String,
+        key: String,
+        local_path: PathBuf,
+        total: u64,
+        file_name: String,
+    ) -> Self {
+        Self {
+            direction: Direction::Download,
+            connection_id,
+            bucket,
+            key,
+            local_path: local_path.to_string_lossy().to_string(),
+            file_name,
+            total,
+        }
+    }
 }
 
 struct TaskRecord {

@@ -4,6 +4,7 @@
 //! [`crate::provider::ProviderHub`] -- never on Tauri's `State` -- so it can
 //! run entirely outside the IPC layer (design §3 principle 4).
 
+pub mod dispatch;
 pub mod download;
 pub mod engine;
 pub mod model;
@@ -13,6 +14,7 @@ pub mod progress;
 pub mod retry;
 pub mod upload;
 
+pub use dispatch::DispatchRunner;
 pub use download::DownloadRunner;
 pub use engine::{
     DownloadState, EngineConfig, EnqueueSpec, MultipartState, ProgressHandle, ResumeState,

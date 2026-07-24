@@ -16,8 +16,8 @@ use commands::{
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::transfer::{
-    spawn_aggregator, EngineConfig, ProgressPayload, ProgressSink, TransferEngine, TransferSink,
-    TransferTaskDto, UploadRunner,
+    spawn_aggregator, DispatchRunner, DownloadRunner, EngineConfig, ProgressPayload, ProgressSink,
+    TransferEngine, TransferSink, TransferTaskDto, UploadRunner,
 };
 
 /// Event names. `:` and `/` are both legal in Tauri event names; the
@@ -93,7 +93,10 @@ pub fn run() {
             });
             app.manage(TransferEngine::new(
                 hub,
-                Arc::new(UploadRunner),
+                Arc::new(DispatchRunner {
+                    upload: Arc::new(UploadRunner),
+                    download: Arc::new(DownloadRunner),
+                }),
                 Arc::new(TauriStateSink(handle)),
                 progress_tx,
                 EngineConfig::default(),
