@@ -34,7 +34,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, AppResult};
 use crate::provider::{Provider, UploadedPart};
-use crate::transfer::engine::{MultipartState, RunOutcome, StopKind, TaskContext, TransferRunner};
+use crate::transfer::engine::{
+    MultipartState, ResumeState, RunOutcome, StopKind, TaskContext, TransferRunner,
+};
 use crate::transfer::part::{plan_upload, PartSpec, UploadPlan};
 use crate::transfer::retry::{backoff_delay, is_retryable, MAX_RETRIES};
 
@@ -74,7 +76,7 @@ struct UploadJob {
     token: CancellationToken,
     stop: StopFn,
     progress: ProgressFn,
-    resume: Arc<Mutex<Option<MultipartState>>>,
+    resume: Arc<Mutex<Option<ResumeState>>>,
 }
 
 impl UploadJob {
@@ -149,7 +151,8 @@ where
     // through into the multipart path instead: it reuses the recorded
     // `upload_id`, the spawn loop breaks on its first iteration because the stop
     // is already requested, and the cancel branch issues the abort.
-    if job.stopped().is_some() && job.resume.lock().await.is_none() {
+    if job.stopped().is_some() && !matches!(&*job.resume.lock().await, Some(ResumeState::Upload(_)))
+    {
         return Ok(RunOutcome::Stopped);
     }
 
@@ -208,7 +211,12 @@ async fn upload_multipart<P>(
 where
     P: Provider + Send + Sync + 'static,
 {
-    let existing = job.resume.lock().await.clone().unwrap_or_default();
+    // A `Download` variant here is impossible for an upload runner; treat it
+    // (like an empty slot) as "no upload resume state" rather than panicking.
+    let existing = match job.resume.lock().await.clone() {
+        Some(ResumeState::Upload(ms)) => ms,
+        _ => MultipartState::default(),
+    };
 
     // A recorded completion naming a part this plan does not contain is
     // unusable: `CompleteMultipartUpload` rejects a part number the upload
@@ -227,10 +235,10 @@ where
         let id = provider.multipart_init(&job.bucket, &job.key).await?;
         // Recorded immediately: if everything below fails, a cancel still has
         // an upload id to abort with, so no server-side fragments leak.
-        *job.resume.lock().await = Some(MultipartState {
+        *job.resume.lock().await = Some(ResumeState::Upload(MultipartState {
             upload_id: id.clone(),
             completed: carried.clone(),
-        });
+        }));
         id
     } else {
         existing.upload_id.clone()
@@ -298,10 +306,10 @@ where
     // Persist what landed before deciding anything, so a pause, a permanent
     // failure and a later retry all resume from the same place.
     let done = completed.lock().await.clone();
-    *job.resume.lock().await = Some(MultipartState {
+    *job.resume.lock().await = Some(ResumeState::Upload(MultipartState {
         upload_id: upload_id.clone(),
         completed: done.clone(),
-    });
+    }));
 
     // Read the stop intent once. Anything arriving after this line arrived
     // during the commit, and the contract is explicit that a real completion
@@ -888,7 +896,7 @@ mod tests {
     struct Rig {
         switch: Arc<Switch>,
         provider: Arc<FakeProvider>,
-        resume: Arc<Mutex<Option<MultipartState>>>,
+        resume: Arc<Mutex<Option<ResumeState>>>,
         reported: Arc<AtomicU64>,
         part_limit: usize,
     }
@@ -932,11 +940,14 @@ mod tests {
         }
 
         async fn seed_resume(&self, state: MultipartState) {
-            *self.resume.lock().await = Some(state);
+            *self.resume.lock().await = Some(ResumeState::Upload(state));
         }
 
         async fn resume_state(&self) -> Option<MultipartState> {
-            self.resume.lock().await.clone()
+            match self.resume.lock().await.clone() {
+                Some(ResumeState::Upload(ms)) => Some(ms),
+                _ => None,
+            }
         }
 
         fn reported(&self) -> u64 {

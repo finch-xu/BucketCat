@@ -144,6 +144,24 @@ pub struct MultipartState {
     pub completed: Vec<UploadedPart>,
 }
 
+/// In-flight download bookkeeping for an in-session pause/resume. **Memory
+/// only** -- surviving an app restart (re-`head` + ETag re-check) is M4c.
+#[derive(Debug, Clone, Default)]
+pub struct DownloadState {
+    pub etag: Option<String>,
+    pub completed_parts: Vec<i32>,
+    pub bcpart: std::path::PathBuf,
+}
+
+/// Per-task resume state, one variant per direction. Generalized from the
+/// upload-only `MultipartState` so the cleanup path (and the runner's resume
+/// slot) can serve both directions.
+#[derive(Debug, Clone)]
+pub enum ResumeState {
+    Upload(MultipartState),
+    Download(DownloadState),
+}
+
 /// A runner's handle for reporting bytes.
 ///
 /// It owns the shared counter the engine reads in [`TransferEngine::snapshot`],
@@ -178,7 +196,7 @@ pub struct TaskContext {
     pub control: TaskControl,
     pub part_limit: usize,
     pub progress: ProgressHandle,
-    pub resume: Arc<Mutex<Option<MultipartState>>>,
+    pub resume: Arc<Mutex<Option<ResumeState>>>,
 }
 
 /// What a runner actually did. The engine cannot infer this from a stop
@@ -272,7 +290,7 @@ impl EnqueueSpec {
 struct TaskRecord {
     dto: TransferTaskDto,
     control: TaskControl,
-    resume: Arc<Mutex<Option<MultipartState>>>,
+    resume: Arc<Mutex<Option<ResumeState>>>,
     transferred: Arc<AtomicU64>,
 }
 
@@ -496,7 +514,7 @@ impl EngineInner {
                 let applied = self.apply(task_id, TransferCommand::Cancel, None).await;
                 if applied {
                     self.forget_progress(task_id);
-                    self.abort_orphaned_multipart(task_id).await;
+                    self.cleanup_orphaned_transfer(task_id).await;
                 }
                 applied
             }
@@ -504,19 +522,12 @@ impl EngineInner {
         }
     }
 
-    /// Best-effort abort of a multipart upload orphaned by a cancel that no
-    /// runner handled (a `Paused`/`Failed` task, or a resumed task still
-    /// `Queued` waiting for a permit). The runner clears `resume` to `None`
-    /// after *it* aborts, so a `resume` still holding an `upload_id` here means
-    /// nobody cleaned up and the fragments would bill the user until the
-    /// bucket's lifecycle rules reap them.
-    ///
-    /// Failure is logged, never propagated: a cleanup failure must not turn a
-    /// completed cancellation into an error (the same discipline the runner's
-    /// own cancel branch follows). `take()` on the `resume` mutex makes this
-    /// safe against a racing runner -- whoever takes the `Some` does the abort,
-    /// the other sees `None`.
-    async fn abort_orphaned_multipart(self: &Arc<Self>, task_id: &str) {
+    /// Best-effort cleanup of a transfer cancelled with no live runner to do
+    /// it. The runner clears `resume` after *it* cleans up, so a still-`Some`
+    /// resume here means nobody did -- an upload's server-side multipart is
+    /// aborted, a download's local `.bcpart` is deleted. Failure is logged,
+    /// never propagated; `take()` makes it safe against a racing runner.
+    async fn cleanup_orphaned_transfer(self: &Arc<Self>, task_id: &str) {
         // Clone the coordinates + the resume handle out under the task lock,
         // then release it: the network abort must not run with any lock held
         // (the crate-wide rule -- no lock across a network `.await`).
@@ -532,30 +543,39 @@ impl EngineInner {
                 record.dto.key.clone(),
             )
         };
-
         let Some(state) = resume.lock().await.take() else {
             return;
         };
-        if state.upload_id.is_empty() {
-            return;
-        }
-
-        let provider = match self.hub.provider(&connection_id).await {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::warn!(task = %task_id, "cannot build provider to abort orphaned multipart: {err}");
-                return;
+        match state {
+            ResumeState::Upload(ms) => {
+                if ms.upload_id.is_empty() {
+                    return;
+                }
+                let provider = match self.hub.provider(&connection_id).await {
+                    Ok(p) => p,
+                    Err(err) => {
+                        tracing::warn!(task = %task_id, "cannot build provider to abort orphaned multipart: {err}");
+                        return;
+                    }
+                };
+                match provider.multipart_abort(&bucket, &key, &ms.upload_id).await {
+                    Ok(()) => {
+                        tracing::info!(task = %task_id, "aborted orphaned multipart upload on cancel")
+                    }
+                    Err(err) => {
+                        tracing::warn!(task = %task_id, upload_id = %ms.upload_id, "abort of orphaned multipart failed: {err}")
+                    }
+                }
             }
-        };
-        match provider
-            .multipart_abort(&bucket, &key, &state.upload_id)
-            .await
-        {
-            Ok(()) => {
-                tracing::info!(task = %task_id, "aborted orphaned multipart upload on cancel")
-            }
-            Err(err) => {
-                tracing::warn!(task = %task_id, upload_id = %state.upload_id, "abort of orphaned multipart failed: {err}")
+            ResumeState::Download(ds) => {
+                // No server-side state to reap -- just the local staging file.
+                match std::fs::remove_file(&ds.bcpart) {
+                    Ok(()) => tracing::info!(task = %task_id, "removed orphaned .bcpart on cancel"),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        tracing::warn!(task = %task_id, path = %ds.bcpart.display(), "removing orphaned .bcpart failed: {err}")
+                    }
+                }
             }
         }
     }
@@ -683,7 +703,7 @@ impl TransferEngine {
                 .await
         {
             self.inner.forget_progress(task_id);
-            self.inner.abort_orphaned_multipart(task_id).await;
+            self.inner.cleanup_orphaned_transfer(task_id).await;
         }
         Ok(())
     }
@@ -974,6 +994,18 @@ mod tests {
             bucket: "b".to_string(),
             key: key.to_string(),
             local_path: format!("/tmp/{key}"),
+            file_name: key.to_string(),
+            total: 1024,
+        }
+    }
+
+    fn download_spec(key: &str, local_path: &str) -> EnqueueSpec {
+        EnqueueSpec {
+            direction: Direction::Download,
+            connection_id: "c1".to_string(),
+            bucket: "b".to_string(),
+            key: key.to_string(),
+            local_path: local_path.to_string(),
             file_name: key.to_string(),
             total: 1024,
         }
@@ -1585,7 +1617,7 @@ mod tests {
     /// Reads a task's resume handle straight out of the table. The tests below
     /// stand in for a runner that paused mid-multipart by seeding the slot
     /// themselves -- the fake runner never touches it.
-    async fn resume_handle(h: &Harness, task_id: &str) -> Arc<Mutex<Option<MultipartState>>> {
+    async fn resume_handle(h: &Harness, task_id: &str) -> Arc<Mutex<Option<ResumeState>>> {
         let tasks = h.engine.inner.tasks.lock().await;
         Arc::clone(&tasks.get(task_id).expect("task present").resume)
     }
@@ -1626,7 +1658,7 @@ mod tests {
         .await;
 
         let resume = resume_handle(&h, &paused.id).await;
-        *resume.lock().await = Some(multipart_state("u-1"));
+        *resume.lock().await = Some(ResumeState::Upload(multipart_state("u-1")));
 
         h.engine.cancel(&paused.id).await.unwrap();
         assert_eq!(
@@ -1662,7 +1694,7 @@ mod tests {
         let queued = h.engine.enqueue(spec("b")).await.unwrap();
         // Stand in for a resumed task whose earlier run left multipart state.
         let resume = resume_handle(&h, &queued.id).await;
-        *resume.lock().await = Some(multipart_state("u-2"));
+        *resume.lock().await = Some(ResumeState::Upload(multipart_state("u-2")));
 
         h.engine.cancel(&queued.id).await.unwrap();
         eventually(
@@ -1716,6 +1748,66 @@ mod tests {
             "a Paused single-stream task still cancels cleanly"
         );
         assert!(resume.lock().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_paused_download_removes_its_orphaned_bcpart() {
+        // The download-direction mirror of the upload paths above. A `Paused`
+        // download holds a `.bcpart` staging file in its resume slot; cancelled
+        // with no live runner, `cancel` applies `Canceled` itself and
+        // `cleanup_orphaned_transfer` must delete that staging file -- nobody
+        // else will, and a leaked `.bcpart` is the download-side analogue of a
+        // leaked server-side multipart. The drained slot plus the vanished file
+        // prove the `Download` arm ran (the `take()` discriminator fired before
+        // the removal).
+        let dir = tempfile::tempdir().unwrap();
+        let bcpart = dir.path().join("photo.jpg.bcpart");
+        std::fs::write(&bcpart, b"partial download").unwrap();
+        assert!(bcpart.exists(), "the staging file must exist before cancel");
+
+        let h = harness(1);
+        let local = dir.path().join("photo.jpg");
+        let paused = h
+            .engine
+            .enqueue(download_spec("photo.jpg", &local.to_string_lossy()))
+            .await
+            .unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the download starts",
+        )
+        .await;
+        h.engine.pause(&paused.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&paused.id).last() == Some(&TransferStatus::Paused),
+            "the download reaches Paused",
+        )
+        .await;
+
+        // Stand in for a runner that paused mid-download by seeding the slot.
+        let resume = resume_handle(&h, &paused.id).await;
+        *resume.lock().await = Some(ResumeState::Download(DownloadState {
+            etag: Some("\"e1\"".to_string()),
+            completed_parts: vec![1],
+            bcpart: bcpart.clone(),
+        }));
+
+        h.engine.cancel(&paused.id).await.unwrap();
+        assert_eq!(
+            h.sink.statuses_of(&paused.id).last(),
+            Some(&TransferStatus::Canceled),
+            "cancelling a Paused download must still apply Canceled"
+        );
+        assert!(
+            resume.lock().await.is_none(),
+            "the engine must drain the resume slot on its own cancel-apply; a slot left Some means \
+             the cleanup path never ran"
+        );
+        assert!(
+            !bcpart.exists(),
+            "the orphaned .bcpart must be deleted on cancel; a surviving staging file means the \
+             Download cleanup arm never ran and stale .bcpart files would accumulate"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

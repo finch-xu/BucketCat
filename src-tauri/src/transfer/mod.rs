@@ -13,8 +13,8 @@ pub mod retry;
 pub mod upload;
 
 pub use engine::{
-    EngineConfig, EnqueueSpec, MultipartState, ProgressHandle, RunOutcome, StopKind, TaskContext,
-    TaskControl, TransferEngine, TransferRunner, TransferSink,
+    DownloadState, EngineConfig, EnqueueSpec, MultipartState, ProgressHandle, ResumeState,
+    RunOutcome, StopKind, TaskContext, TaskControl, TransferEngine, TransferRunner, TransferSink,
 };
 pub use model::{next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto};
 pub use part::{plan_upload, PartSpec, UploadPlan};
