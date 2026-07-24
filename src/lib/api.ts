@@ -413,3 +413,41 @@ export function getResumeEnabled(): Promise<boolean> {
 export function setResumeEnabled(enabled: boolean): Promise<void> {
   return invokeCommand<void>("set_resume_enabled", { enabled });
 }
+
+/** The full persisted app settings (M6c). Mirrors `Settings` in
+ * `src-tauri/src/store/settings.rs` field-for-field. `max_tasks`/`max_parts`
+ * are read by the transfer engine only at construction (app restart) --
+ * there is no runtime hot-update. `share_expiry_secs` is frontend-consumed,
+ * used to prefill the Share dialog's expiry field. */
+export interface Settings {
+  resume_enabled: boolean;
+  max_tasks: number;
+  max_parts: number;
+  share_expiry_secs: number;
+}
+
+/** Reads the whole persisted `Settings`, e.g. to initialize the Settings
+ * modal. */
+export function getSettings(): Promise<Settings> {
+  return invokeCommand<Settings>("get_settings");
+}
+
+/** Persists a new max-concurrent-tasks limit. Backend clamps to `[1, 5]`
+ * (`clamp_tasks` in `src-tauri/src/store/settings.rs`); takes effect on the
+ * next app restart. */
+export function setMaxTasks(n: number): Promise<void> {
+  return invokeCommand<void>("set_max_tasks", { n });
+}
+
+/** Persists a new max-parts-per-task limit. Backend clamps to `[1, 8]`
+ * (`clamp_parts`); takes effect on the next app restart. */
+export function setMaxParts(n: number): Promise<void> {
+  return invokeCommand<void>("set_max_parts", { n });
+}
+
+/** Persists a new default Share-link expiry, in seconds. Backend clamps to
+ * `[1, 604800]` (`provider::clamp_expiry`), the same range `presignGet`'s
+ * `expiresSecs` is bounded to. */
+export function setShareExpiry(secs: number): Promise<void> {
+  return invokeCommand<void>("set_share_expiry", { secs });
+}
