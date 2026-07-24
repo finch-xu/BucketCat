@@ -11,7 +11,7 @@ pub use hub::ProviderHub;
 pub use s3::{from_connection, is_aws_endpoint, S3Provider};
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 
@@ -77,8 +77,11 @@ pub struct BatchResult {
 
 /// One part the server has accepted, as needed to complete (or resume) a
 /// multipart upload. `etag` is echoed back verbatim, quotes included -- S3
-/// compares it byte-for-byte on `CompleteMultipartUpload`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// compares it byte-for-byte on `CompleteMultipartUpload`. `Deserialize` is
+/// needed alongside `Serialize` because M4c's checkpoint file embeds a
+/// `Vec<UploadedPart>` (via `MultipartState`) and must read it back on
+/// startup, not just write it out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadedPart {
     pub number: i32,
     pub etag: String,

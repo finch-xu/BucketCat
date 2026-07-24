@@ -53,6 +53,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -136,9 +137,9 @@ impl TaskControl {
 }
 
 /// In-flight multipart bookkeeping, kept so an in-session pause can pick up
-/// where it left off. **Memory only** -- surviving an app restart is M4c's
-/// job (`store/checkpoint.rs`).
-#[derive(Debug, Clone, Default)]
+/// where it left off. Also embedded in [`crate::transfer::checkpoint::Checkpoint`]
+/// (M4c) so it must round-trip through JSON, hence `Serialize`/`Deserialize`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MultipartState {
     pub upload_id: String,
     pub completed: Vec<UploadedPart>,
@@ -152,9 +153,11 @@ pub struct MultipartState {
     pub source_mtime: i64,
 }
 
-/// In-flight download bookkeeping for an in-session pause/resume. **Memory
-/// only** -- surviving an app restart (re-`head` + ETag re-check) is M4c.
-#[derive(Debug, Clone, Default)]
+/// In-flight download bookkeeping for an in-session pause/resume. Also
+/// embedded in the M4c checkpoint file, so it needs the same round-trip
+/// derives as [`MultipartState`]; a cross-restart resume re-`head`s and
+/// checks the ETag before trusting it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DownloadState {
     pub etag: Option<String>,
     pub completed_parts: Vec<i32>,
@@ -163,8 +166,9 @@ pub struct DownloadState {
 
 /// Per-task resume state, one variant per direction. Generalized from the
 /// upload-only `MultipartState` so the cleanup path (and the runner's resume
-/// slot) can serve both directions.
-#[derive(Debug, Clone)]
+/// slot) can serve both directions. Serde derives make it the payload M4c
+/// persists inside a [`crate::transfer::checkpoint::Checkpoint`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResumeState {
     Upload(MultipartState),
     Download(DownloadState),

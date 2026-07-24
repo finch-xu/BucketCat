@@ -4,6 +4,7 @@
 //! [`crate::provider::ProviderHub`] -- never on Tauri's `State` -- so it can
 //! run entirely outside the IPC layer (design §3 principle 4).
 
+pub mod checkpoint;
 pub mod dispatch;
 pub mod download;
 pub mod engine;
@@ -14,6 +15,7 @@ pub mod progress;
 pub mod retry;
 pub mod upload;
 
+pub use checkpoint::{checkpoint_dir, remove, scan, write, Checkpoint};
 pub use dispatch::DispatchRunner;
 pub use download::DownloadRunner;
 pub use engine::{

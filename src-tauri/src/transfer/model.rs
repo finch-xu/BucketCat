@@ -1,11 +1,15 @@
 //! Transfer task model and its state machine (design §5).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Which way the bytes flow. `Download` exists in the model from day one --
 /// the panel, the DTO and the event payloads are direction-agnostic, so M4b
 /// only has to add a runner, not reshape the wire contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` is derived alongside `Serialize` because M4c's checkpoint
+/// file (`transfer::checkpoint::Checkpoint`) embeds this enum and must be
+/// able to read it back from disk, not just write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     Upload,
