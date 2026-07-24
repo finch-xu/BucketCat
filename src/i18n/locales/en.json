@@ -95,7 +95,6 @@
     "toggle": "Transfers",
     "queued": "Queued",
     "paused": "Paused",
-    "failed": "Failed",
     "canceled": "Canceled",
     "pause": "Pause",
     "resume": "Resume",
