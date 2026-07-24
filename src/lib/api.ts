@@ -289,6 +289,23 @@ export function enqueueUploads(
   });
 }
 
+/** Queues a single-file download into `localPath` (an absolute path the
+ * frontend picked via the save dialog). The backend heads the object first,
+ * so the returned task already carries the real `total`. */
+export function enqueueDownload(
+  connectionId: string,
+  bucket: string,
+  key: string,
+  localPath: string,
+): Promise<TransferTask> {
+  return invokeCommand<TransferTask>("enqueue_download", {
+    connectionId,
+    bucket,
+    key,
+    localPath,
+  });
+}
+
 export function listTransfers(): Promise<TransferTask[]> {
   return invokeCommand<TransferTask[]>("list_transfers");
 }

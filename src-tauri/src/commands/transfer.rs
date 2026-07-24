@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use tauri::State;
 
+use crate::commands::AppState;
 use crate::error::AppResult;
+use crate::provider::Provider;
 use crate::transfer::{EnqueueSpec, TransferEngine, TransferTaskDto};
 
 /// JavaScript's `String.prototype.trim` semantics, which are NOT Rust's
@@ -113,6 +115,28 @@ pub async fn enqueue_uploads(
         }
     }
     Ok(queued)
+}
+
+/// Queues a single-file download. Heads the object first so the panel shows
+/// the real size immediately rather than counting up from an unknown total.
+#[tauri::command]
+pub async fn enqueue_download(
+    state: State<'_, AppState>,
+    engine: State<'_, TransferEngine>,
+    connection_id: String,
+    bucket: String,
+    key: String,
+    local_path: String,
+) -> AppResult<TransferTaskDto> {
+    let provider = state.hub().provider(&connection_id).await?;
+    let head = provider.head_object(&bucket, &key).await?;
+    let path = std::path::PathBuf::from(&local_path);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| key.rsplit('/').next().unwrap_or(&key).to_string());
+    let spec = EnqueueSpec::for_download(connection_id, bucket, key, path, head.size, file_name);
+    engine.enqueue(spec).await
 }
 
 /// Every task the engine knows about, newest first. Called once when the
