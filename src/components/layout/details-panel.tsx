@@ -5,7 +5,14 @@ import { useTranslation } from "react-i18next";
 import { fileMeta } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
 import { previewKind, type PreviewKind } from "@/lib/preview";
-import { headObject, presignGet, type AppError, type ObjectHead } from "@/lib/api";
+import {
+  getSettings,
+  headObject,
+  presignGet,
+  type AppError,
+  type ObjectHead,
+  type Settings,
+} from "@/lib/api";
 import { useBrowse } from "@/hooks/use-browse";
 import { useErrorText } from "@/hooks/use-error-text";
 import { useStartDownloads } from "@/hooks/use-start-downloads";
@@ -73,6 +80,27 @@ export function DetailsPanel() {
   const [copied, setCopied] = useState(false);
   const copyTimeoutRef = useRef<number | null>(null);
   const [preview, setPreview] = useState<PreviewState>(EMPTY_PREVIEW);
+
+  // Once the user has touched the expiry dropdown themselves, their choice
+  // wins for the rest of this session -- the settings-derived default below
+  // must never clobber an explicit override.
+  const expiryTouchedRef = useRef(false);
+
+  // Lightweight one-shot fetch of the persisted default (M6c's Settings
+  // modal writes `share_expiry_secs`). Prefills the dropdown below instead
+  // of the hardcoded 1h default; a failed/slow fetch just leaves that
+  // hardcoded default in place.
+  const settingsQuery = useQuery<Settings, AppError>({
+    queryKey: ["settings"],
+    queryFn: getSettings,
+    staleTime: Infinity,
+  });
+
+  useEffect(() => {
+    if (!expiryTouchedRef.current && settingsQuery.data) {
+      setExpirySecs(settingsQuery.data.share_expiry_secs);
+    }
+  }, [settingsQuery.data]);
 
   // Tracks the key of the entry currently on screen so an in-flight presign
   // can tell, once it resolves, whether the user has since switched to a
@@ -304,7 +332,10 @@ export function DetailsPanel() {
               <div className="flex items-center gap-2">
                 <select
                   value={expirySecs}
-                  onChange={(e) => setExpirySecs(Number(e.target.value))}
+                  onChange={(e) => {
+                    expiryTouchedRef.current = true;
+                    setExpirySecs(Number(e.target.value));
+                  }}
                   className="h-[30px] flex-1 rounded-[7px] border border-border bg-background px-2 text-[12px] text-fg2 outline-none focus:border-primary"
                 >
                   {EXPIRY_OPTIONS.map((opt) => (

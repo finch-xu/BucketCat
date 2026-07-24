@@ -7,9 +7,35 @@ import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
 import { setLocale } from "@/i18n";
 import type { AppLocale } from "@/i18n/resolve-locale";
-import { getResumeEnabled, setResumeEnabled } from "@/lib/api";
+import { useErrorText } from "@/hooks/use-error-text";
+import { formatSize } from "@/lib/format";
+import {
+  cleanCheckpointResidue,
+  clearFinishedTransfers,
+  getResumeEnabled,
+  getSettings,
+  setMaxParts,
+  setMaxTasks,
+  setResumeEnabled,
+  setShareExpiry,
+  type AppError,
+  type CleanResult,
+} from "@/lib/api";
+import { useTransferStore } from "@/store/transfer-store";
 import { useApp, type ViewMode } from "@/store/app-store";
 import type { ThemeMode } from "@/lib/theme";
+
+/** Share-link expiry choices, in seconds -- the same fixed set the details
+ * panel's Share dropdown offers (`EXPIRY_OPTIONS` in
+ * `src/components/layout/details-panel.tsx`), reusing its `details.expiry*`
+ * copy rather than duplicating four near-identical i18n keys under
+ * `settings.*`. */
+const SHARE_EXPIRY_OPTIONS: { secs: number; labelKey: string }[] = [
+  { secs: 3600, labelKey: "details.expiry1h" },
+  { secs: 21600, labelKey: "details.expiry6h" },
+  { secs: 86400, labelKey: "details.expiry24h" },
+  { secs: 604800, labelKey: "details.expiry7d" },
+];
 
 function SectionTitle({ children, first }: { children: React.ReactNode; first?: boolean }) {
   return (
@@ -30,6 +56,42 @@ function Row({ label, children }: { label: React.ReactNode; children: React.Reac
   );
 }
 
+/** Bounded +/- numeric stepper shared by the max-tasks and max-parts rows.
+ * `onChange` only ever receives a value already inside `[min, max]` -- the
+ * buttons clamp before calling it -- but callers still clamp again before
+ * persisting, since this is also the value shown optimistically. */
+function Stepper({
+  value,
+  min,
+  max,
+  onChange,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  onChange: (n: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-0.5 overflow-hidden rounded-[9px] border border-border bg-panel">
+      <button
+        type="button"
+        onClick={() => onChange(Math.max(min, value - 1))}
+        className="size-[30px] cursor-pointer text-base text-fg2 hover:bg-hover"
+      >
+        −
+      </button>
+      <span className="w-[34px] text-center text-[13px] font-semibold tabular-nums">{value}</span>
+      <button
+        type="button"
+        onClick={() => onChange(Math.min(max, value + 1))}
+        className="size-[30px] cursor-pointer text-base text-fg2 hover:bg-hover"
+      >
+        +
+      </button>
+    </div>
+  );
+}
+
 export function SettingsModal() {
   const { t, i18n } = useTranslation();
   const {
@@ -42,7 +104,18 @@ export function SettingsModal() {
     transferSettings,
     setTransferSettings,
   } = useApp();
+  const errorText = useErrorText();
   const [resumeEnabled, setResumeEnabledState] = useState(true);
+  // Real backend settings (M6c): fall back to the backend's own defaults
+  // (see `Settings::default()` in `src-tauri/src/store/settings.rs`) until
+  // `getSettings()` resolves below.
+  const [maxTasks, setMaxTasksState] = useState(3);
+  const [maxParts, setMaxPartsState] = useState(4);
+  const [shareExpirySecs, setShareExpirySecsState] = useState(3600);
+  const [cleanResult, setCleanResult] = useState<CleanResult | null>(null);
+  const [cleanError, setCleanError] = useState<AppError | null>(null);
+  const [cleanPending, setCleanPending] = useState(false);
+  const [clearError, setClearError] = useState<AppError | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -58,7 +131,81 @@ export function SettingsModal() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    getSettings()
+      .then((s) => {
+        if (cancelled) return;
+        setMaxTasksState(s.max_tasks);
+        setMaxPartsState(s.max_parts);
+        setShareExpirySecsState(s.share_expiry_secs);
+      })
+      .catch((err) => {
+        console.error("Failed to load settings", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   if (!showSettings) return null;
+
+  function handleMaxTasksChange(n: number) {
+    const clamped = Math.min(5, Math.max(1, n));
+    const previous = maxTasks;
+    setMaxTasksState(clamped);
+    setMaxTasks(clamped).catch((err) => {
+      // Persist rejected: revert the optimistic local state, same pattern
+      // as the resume-transfers switch below.
+      setMaxTasksState(previous);
+      console.error("Failed to persist max tasks", err);
+    });
+  }
+
+  function handleMaxPartsChange(n: number) {
+    const clamped = Math.min(8, Math.max(1, n));
+    const previous = maxParts;
+    setMaxPartsState(clamped);
+    setMaxParts(clamped).catch((err) => {
+      setMaxPartsState(previous);
+      console.error("Failed to persist max parts", err);
+    });
+  }
+
+  function handleShareExpiryChange(secs: number) {
+    const previous = shareExpirySecs;
+    setShareExpirySecsState(secs);
+    setShareExpiry(secs).catch((err) => {
+      setShareExpirySecsState(previous);
+      console.error("Failed to persist share expiry", err);
+    });
+  }
+
+  function handleCleanResidue() {
+    setCleanError(null);
+    setCleanResult(null);
+    setCleanPending(true);
+    cleanCheckpointResidue()
+      .then((result) => setCleanResult(result))
+      .catch((err: AppError) => setCleanError(err))
+      .finally(() => setCleanPending(false));
+  }
+
+  // Drops the known-finished tasks locally from the shared transfer store,
+  // the same pattern `TransferBar.handleClearFinished` uses -- so the
+  // transfer panel reflects the clear immediately instead of waiting on a
+  // `transfer://state` event that terminal tasks never re-emit.
+  function handleClearHistory() {
+    setClearError(null);
+    clearFinishedTransfers()
+      .then(() => {
+        const { tasks, drop } = useTransferStore.getState();
+        for (const [id, task] of Object.entries(tasks)) {
+          if (task.status === "completed" || task.status === "canceled") drop(id);
+        }
+      })
+      .catch((err: AppError) => setClearError(err));
+  }
 
   const locale: AppLocale = i18n.language === "zh-CN" ? "zh-CN" : "en";
 
@@ -107,33 +254,31 @@ export function SettingsModal() {
             ]}
           />
         </Row>
+        <Row label={t("settings.shareExpiry")}>
+          <select
+            value={shareExpirySecs}
+            onChange={(e) => handleShareExpiryChange(Number(e.target.value))}
+            className="h-[30px] rounded-[7px] border border-border bg-background px-2 text-[12.5px] text-fg2 outline-none focus:border-primary"
+          >
+            {SHARE_EXPIRY_OPTIONS.map((opt) => (
+              <option key={opt.secs} value={opt.secs}>
+                {t(opt.labelKey)}
+              </option>
+            ))}
+          </select>
+        </Row>
 
         <SectionTitle>{t("settings.transfers")}</SectionTitle>
         <Row label={t("settings.concurrency")}>
-          <div className="flex items-center gap-0.5 overflow-hidden rounded-[9px] border border-border bg-panel">
-            <button
-              type="button"
-              onClick={() =>
-                setTransferSettings({ concurrency: Math.max(1, transferSettings.concurrency - 1) })
-              }
-              className="size-[30px] cursor-pointer text-base text-fg2 hover:bg-hover"
-            >
-              −
-            </button>
-            <span className="w-[34px] text-center text-[13px] font-semibold tabular-nums">
-              {transferSettings.concurrency}
-            </span>
-            <button
-              type="button"
-              onClick={() =>
-                setTransferSettings({ concurrency: Math.min(16, transferSettings.concurrency + 1) })
-              }
-              className="size-[30px] cursor-pointer text-base text-fg2 hover:bg-hover"
-            >
-              +
-            </button>
-          </div>
+          <Stepper value={maxTasks} min={1} max={5} onChange={handleMaxTasksChange} />
         </Row>
+        <Row label={t("settings.maxParts")}>
+          <Stepper value={maxParts} min={1} max={8} onChange={handleMaxPartsChange} />
+        </Row>
+        <div className="-mt-1 mb-1 text-[11.5px] text-muted-foreground">
+          <div>{t("settings.concurrencyHint", { total: maxTasks * maxParts })}</div>
+          <div>{t("settings.restartHint")}</div>
+        </div>
         <Row label={t("settings.partSize")}>
           <Segmented<number>
             value={transferSettings.partSizeMb}
@@ -179,6 +324,53 @@ export function SettingsModal() {
               });
             }}
           />
+        </Row>
+
+        <SectionTitle>{t("settings.advanced")}</SectionTitle>
+        <Row
+          label={
+            <div>
+              <div>{t("settings.cleanResidue")}</div>
+              {cleanResult && (
+                <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+                  {t("settings.cleanResidueDone", {
+                    count: cleanResult.removed,
+                    size: formatSize(cleanResult.freed_bytes),
+                  })}
+                </div>
+              )}
+              {cleanError && (
+                <div className="mt-0.5 text-[11.5px] text-destructive">{errorText(cleanError)}</div>
+              )}
+            </div>
+          }
+        >
+          <button
+            type="button"
+            onClick={handleCleanResidue}
+            disabled={cleanPending}
+            className="cursor-pointer rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] font-medium text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {t("settings.cleanResidue")}
+          </button>
+        </Row>
+        <Row
+          label={
+            <div>
+              <div>{t("settings.clearHistory")}</div>
+              {clearError && (
+                <div className="mt-0.5 text-[11.5px] text-destructive">{errorText(clearError)}</div>
+              )}
+            </div>
+          }
+        >
+          <button
+            type="button"
+            onClick={handleClearHistory}
+            className="cursor-pointer rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] font-medium text-fg2 hover:bg-hover"
+          >
+            {t("settings.clearHistory")}
+          </button>
         </Row>
 
         <SectionTitle>{t("settings.about")}</SectionTitle>
