@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  basename,
+  dedupeBatchNames,
   isValidObjectName,
   keyToPath,
   listPrefix,
@@ -266,5 +268,74 @@ describe("listingGuard", () => {
   it("still reports a real collision once the listing is trustworthy", () => {
     const fresh = listingGuard({ pages: [page("hero.png")] }, false);
     expect(nameCollides(fresh.entries, "hero.png")).toBe(true);
+  });
+});
+
+describe("basename", () => {
+  it("returns the last segment of a file key", () => {
+    expect(basename("a/b/c.txt")).toBe("c.txt");
+    expect(basename("a.txt")).toBe("a.txt");
+  });
+
+  it("yields the folder's own name for a folder key", () => {
+    expect(basename("photos/")).toBe("photos");
+    expect(basename("a/b/sub/")).toBe("sub");
+  });
+
+  it("is empty for the bucket root", () => {
+    expect(basename("")).toBe("");
+    expect(basename("/")).toBe("");
+  });
+});
+
+describe("dedupeBatchNames", () => {
+  it("passes distinct basenames through untouched, keeping key and order", () => {
+    const out = dedupeBatchNames([
+      { key: "a/one.txt", name: "one.txt" },
+      { key: "b/two.txt", name: "two.txt" },
+    ]);
+    expect(out).toEqual([
+      { key: "a/one.txt", name: "one.txt" },
+      { key: "b/two.txt", name: "two.txt" },
+    ]);
+  });
+
+  it("de-duplicates a shared basename by suffixing before the extension", () => {
+    // The M9.1 case: two objects from different prefixes share a basename and
+    // would otherwise collide on the same local path (and the same .bcpart).
+    const out = dedupeBatchNames([
+      { key: "a/report.pdf", name: "report.pdf" },
+      { key: "b/report.pdf", name: "report.pdf" },
+      { key: "c/report.pdf", name: "report.pdf" },
+    ]);
+    expect(out.map((i) => i.name)).toEqual(["report.pdf", "report (2).pdf", "report (3).pdf"]);
+  });
+
+  it("de-duplicates case-insensitively (macOS/Windows filesystems)", () => {
+    const out = dedupeBatchNames([
+      { key: "a/Report.PDF", name: "Report.PDF" },
+      { key: "b/report.pdf", name: "report.pdf" },
+    ]);
+    expect(out.map((i) => i.name)).toEqual(["Report.PDF", "report (2).pdf"]);
+  });
+
+  it("suffixes an extensionless name at the end", () => {
+    const out = dedupeBatchNames([
+      { key: "a/README", name: "README" },
+      { key: "b/README", name: "README" },
+    ]);
+    expect(out.map((i) => i.name)).toEqual(["README", "README (2)"]);
+  });
+
+  it("strips a path fragment out of a remote-derived name so it can't escape the dir", () => {
+    // A crafted or search-derived name carrying separators or `..` must not
+    // reach `join(dir, name)` as a traversal.
+    expect(dedupeBatchNames([{ key: "k", name: "../../etc/passwd" }])[0].name).toBe("passwd");
+    expect(dedupeBatchNames([{ key: "k", name: "sub\\evil.txt" }])[0].name).toBe("evil.txt");
+  });
+
+  it("falls back to the key's basename, then to 'download', when the name is unusable", () => {
+    expect(dedupeBatchNames([{ key: "a/real.txt", name: ".." }])[0].name).toBe("real.txt");
+    expect(dedupeBatchNames([{ key: "..", name: "." }])[0].name).toBe("download");
   });
 });

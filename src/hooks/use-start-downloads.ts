@@ -12,6 +12,7 @@ import {
   type AppError,
   type ObjectEntry,
 } from "@/lib/api";
+import { dedupeBatchNames } from "@/lib/entries";
 import { useApp } from "@/store/app-store";
 import { useTransferStore } from "@/store/transfer-store";
 
@@ -133,7 +134,10 @@ export function useStartDownloads(): UseStartDownloadsResult {
           // sequentially so a mid-list failure surfaces in the dialog with the
           // earlier files already queued and running (same fail-forward shape
           // as the per-folder path -- the panel just doesn't pop on error).
-          for (const item of items) {
+          // `dedupeBatchNames` makes each local filename safe (no path fragment)
+          // and unique, so two selected objects sharing a basename can't land on
+          // the same `.bcpart` and corrupt each other.
+          for (const item of dedupeBatchNames(items)) {
             const localPath = await join(localDir, item.name);
             await enqueueDownload(activeConn, activeBucket, item.key, localPath);
           }

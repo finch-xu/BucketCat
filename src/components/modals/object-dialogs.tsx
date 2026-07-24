@@ -13,6 +13,7 @@ import {
 import { deletePrefix, type AppError, type BatchResult } from "@/lib/api";
 import { useErrorText } from "@/hooks/use-error-text";
 import {
+  basename,
   isValidObjectName,
   listingGuard,
   nameCollides,
@@ -389,7 +390,7 @@ function DeleteObjectsDialog() {
     handleConfirm();
   }
 
-  const singleName = keys[0].replace(/\/$/, "").split("/").pop() ?? keys[0];
+  const singleName = basename(keys[0]);
 
   return (
     <Modal onClose={handleClose} className="w-[460px]">

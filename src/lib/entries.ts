@@ -79,6 +79,63 @@ export function keyToPath(key: string): string[] {
   return trimmed.length === 0 ? [] : trimmed.split("/");
 }
 
+/** The final path segment of a key: `"a/b/c.txt"` -> `"c.txt"`, `"photos/"` ->
+ * `"photos"` (one trailing slash is stripped first, so a folder key yields the
+ * folder's own name), `"a.txt"` -> `"a.txt"`. Splits on `"/"`, the object-key
+ * separator. */
+export function basename(key: string): string {
+  const stripped = key.endsWith("/") ? key.slice(0, -1) : key;
+  const idx = stripped.lastIndexOf("/");
+  return idx === -1 ? stripped : stripped.slice(idx + 1);
+}
+
+/** A bare, filesystem-safe filename derived from `name`: its last segment after
+ * ANY separator (`/` or `\` -- a remote key can carry either), or `null` when
+ * nothing usable survives (empty, `"."`, `".."`). Used to keep a remote-derived
+ * name from smuggling a path fragment into a local `join`. */
+function safeLocalName(name: string): string | null {
+  const bare = name.split(/[\\/]/).pop() ?? "";
+  return bare === "" || bare === "." || bare === ".." ? null : bare;
+}
+
+/** Inserts ` (n)` before the extension: `withCounter("a.txt", 2)` ->
+ * `"a (2).txt"`, `withCounter("README", 2)` -> `"README (2)"`. A leading dot
+ * (dotfile) is not treated as an extension. */
+function withCounter(base: string, n: number): string {
+  const dot = base.lastIndexOf(".");
+  const suffix = ` (${n})`;
+  return dot > 0 ? `${base.slice(0, dot)}${suffix}${base.slice(dot)}` : `${base}${suffix}`;
+}
+
+/** Assigns each item a safe, collision-free local filename for a batch download
+ * into ONE directory. Two problems this closes, both reachable when a search
+ * listing spanning prefixes is multi-selected:
+ *   1. Safety -- a remote-derived name is reduced to a bare basename with no
+ *      path separators and never `"."`/`".."`, so it can't escape the chosen
+ *      directory via `join`.
+ *   2. Uniqueness -- objects that share a basename (`a/report.pdf` and
+ *      `b/report.pdf`) would otherwise land on the same local path and the same
+ *      `.bcpart`, corrupting each other; duplicates get ` (2)`, ` (3)` ...
+ *      inserted before the extension instead. Dedup is case-insensitive to
+ *      match case-insensitive filesystems (macOS/Windows).
+ * Order is preserved; `key` (the remote identity) is passed through untouched. */
+export function dedupeBatchNames(
+  items: { key: string; name: string }[],
+): { key: string; name: string }[] {
+  const used = new Set<string>();
+  return items.map(({ key, name }) => {
+    const base = safeLocalName(name) ?? safeLocalName(key) ?? "download";
+    let candidate = base;
+    let n = 2;
+    while (used.has(candidate.toLowerCase())) {
+      candidate = withCounter(base, n);
+      n += 1;
+    }
+    used.add(candidate.toLowerCase());
+    return { key, name: candidate };
+  });
+}
+
 /** A single object/folder display name: non-empty after trimming and free
  * of "/" (path separators are navigation, not names). */
 export function isValidObjectName(name: string): boolean {

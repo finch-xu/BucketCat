@@ -23,6 +23,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import { cn } from "@/lib/utils";
 import type { ObjectEntry } from "@/lib/api";
+import { basename } from "@/lib/entries";
 import { fileMeta } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
 import { useBrowse, type BrowseQuery } from "@/hooks/use-browse";
@@ -205,7 +206,7 @@ function SelectionBar({
   const nameByKey = new Map(entries.map((e) => [e.key, e.name]));
   const selectedItems = selectedKeys.map((key) => ({
     key,
-    name: nameByKey.get(key) ?? (key.slice(key.lastIndexOf("/") + 1) || key),
+    name: nameByKey.get(key) ?? basename(key),
   }));
 
   return (
