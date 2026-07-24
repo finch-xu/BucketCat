@@ -85,6 +85,16 @@ pub struct UploadedPart {
     pub size: u64,
 }
 
+/// Result of a `HeadObject` — just what a download needs. `etag` is captured
+/// for M4c's cross-restart resume (it will re-`head` and compare); M4b's
+/// in-session resume does not consult it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObjectHead {
+    pub size: u64,
+    pub etag: Option<String>,
+    pub content_type: Option<String>,
+}
+
 /// Admin-plane operations against an object storage backend.
 ///
 /// Implementations (currently just [`S3Provider`]) must not leak any
@@ -184,6 +194,34 @@ pub trait Provider {
     /// the user cancels (design §5) -- an abandoned upload otherwise keeps
     /// billing for storage indefinitely.
     async fn multipart_abort(&self, bucket: &str, key: &str, upload_id: &str) -> AppResult<()>;
+
+    /// Cheapest possible metadata read: object size (needed to plan the
+    /// download) plus ETag/content-type. `storage/key-not-found` if absent.
+    async fn head_object(&self, bucket: &str, key: &str) -> AppResult<ObjectHead>;
+
+    /// Reads exactly `[offset, offset+length)` of `key`. Returns the bytes
+    /// (bounded by the caller's chunk size — never the whole object at once),
+    /// so no `aws_sdk_s3` stream type crosses this boundary (design §3).
+    async fn get_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> AppResult<Vec<u8>>;
+
+    /// Like `list_objects` but with NO delimiter, so it returns every object
+    /// under `prefix` recursively (each row `is_prefix == false`, including
+    /// the `prefix/` folder-marker object itself). Used for recursive folder
+    /// download and recursive delete. `list_objects`' delimiter-`/` shape is
+    /// pinned to the frontend and is deliberately left untouched.
+    async fn list_objects_flat(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        token: Option<&str>,
+        max_keys: i32,
+    ) -> AppResult<ListPage>;
 }
 
 #[cfg(test)]

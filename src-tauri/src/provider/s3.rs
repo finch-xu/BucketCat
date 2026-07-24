@@ -20,7 +20,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 use crate::error::{AppError, AppResult};
 use crate::provider::{
-    BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, Provider, UploadedPart,
+    BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, ObjectHead, Provider, UploadedPart,
 };
 use crate::store::Connection;
 
@@ -222,6 +222,28 @@ pub(crate) fn display_name(key: &str, is_prefix: bool) -> String {
     trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
 }
 
+/// Maps one `aws_sdk_s3::types::Object` row into a file [`ObjectEntry`]
+/// (`is_prefix` always `false`). Returns `None` when the object has no key
+/// (the SDK models it as optional; in practice ListObjectsV2 always sets
+/// it). Pure field mapping only -- callers that need to filter out a
+/// folder's own zero-byte marker object (as [`to_list_page`] does) do that
+/// filtering themselves before calling this. Shared by [`to_list_page`] and
+/// [`S3Provider::list_objects_flat`] so the mapping exists in exactly one
+/// place.
+fn object_to_entry(obj: &aws_sdk_s3::types::Object) -> Option<ObjectEntry> {
+    let key = obj.key()?;
+    Some(ObjectEntry {
+        key: key.to_string(),
+        name: display_name(key, false),
+        size: obj.size().and_then(|s| u64::try_from(s).ok()),
+        last_modified: obj
+            .last_modified()
+            .and_then(|d| d.fmt(DateTimeFormat::DateTime).ok()),
+        storage_class: obj.storage_class().map(|c| c.as_str().to_string()),
+        is_prefix: false,
+    })
+}
+
 /// Maps one ListObjectsV2 response page into the domain [`ListPage`]:
 /// common prefixes become `is_prefix` entries (listed first), objects
 /// become file entries, and the zero-byte folder-marker object whose key
@@ -253,16 +275,9 @@ fn to_list_page(
         if key == prefix && prefix.ends_with('/') {
             continue;
         }
-        entries.push(ObjectEntry {
-            key: key.to_string(),
-            name: display_name(key, false),
-            size: obj.size().and_then(|s| u64::try_from(s).ok()),
-            last_modified: obj
-                .last_modified()
-                .and_then(|d| d.fmt(DateTimeFormat::DateTime).ok()),
-            storage_class: obj.storage_class().map(|c| c.as_str().to_string()),
-            is_prefix: false,
-        });
+        if let Some(entry) = object_to_entry(obj) {
+            entries.push(entry);
+        }
     }
     ListPage {
         entries,
@@ -442,6 +457,13 @@ async fn body_range(path: &Path, offset: u64, length: u64) -> AppResult<ByteStre
         .build()
         .await
         .map_err(|err| file_io_error(path, err))
+}
+
+/// An inclusive HTTP `Range` header value for `[offset, offset+length)`.
+/// HTTP ranges are inclusive on both ends, so the last byte is
+/// `offset + length - 1`.
+pub fn range_header(offset: u64, length: u64) -> String {
+    format!("bytes={}-{}", offset, offset + length - 1)
 }
 
 #[async_trait]
@@ -708,6 +730,74 @@ impl Provider for S3Provider {
             .await
             .map_err(normalize_s3_error)?;
         Ok(())
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> AppResult<ObjectHead> {
+        let out = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+        Ok(ObjectHead {
+            // A HeadObject with no content length is nonsensical for a real
+            // object; treat a missing one as zero rather than failing.
+            size: out.content_length().unwrap_or(0).max(0) as u64,
+            etag: out.e_tag().map(str::to_string),
+            content_type: out.content_type().map(str::to_string),
+        })
+    }
+
+    async fn get_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> AppResult<Vec<u8>> {
+        let out = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(range_header(offset, length))
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+        let data = out.body.collect().await.map_err(|err| AppError::Internal {
+            message: format!("failed to read object body: {err}"),
+        })?;
+        Ok(data.into_bytes().to_vec())
+    }
+
+    async fn list_objects_flat(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        token: Option<&str>,
+        max_keys: i32,
+    ) -> AppResult<ListPage> {
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .max_keys(max_keys);
+        // No `.delimiter("/")` -- that omission is the whole point: this walks
+        // the entire subtree, where `list_objects` stops at each folder.
+        if let Some(token) = token {
+            req = req.continuation_token(token);
+        }
+        let out = req.send().await.map_err(normalize_s3_error)?;
+        // Reuse the existing object-row mapper, but every row here is a real
+        // object (never a common prefix), so pass an empty prefix list.
+        let entries = out.contents().iter().filter_map(object_to_entry).collect();
+        Ok(ListPage {
+            entries,
+            next_token: out.next_continuation_token().map(str::to_string),
+        })
     }
 }
 
@@ -1403,5 +1493,19 @@ mod tests {
             err.params().get("path").map(String::as_str),
             Some("/tmp/missing.bin")
         );
+    }
+
+    #[test]
+    fn range_header_is_inclusive_byte_range() {
+        // HTTP Range is inclusive on both ends: bytes=0-8388607 is the first
+        // 8MiB, not 8MiB+1. An off-by-one here silently drops or duplicates a
+        // byte at every chunk boundary.
+        assert_eq!(range_header(0, 8 * 1024 * 1024), "bytes=0-8388607");
+        assert_eq!(range_header(8_388_608, 100), "bytes=8388608-8388707");
+    }
+
+    #[test]
+    fn range_header_for_a_single_byte() {
+        assert_eq!(range_header(5, 1), "bytes=5-5");
     }
 }

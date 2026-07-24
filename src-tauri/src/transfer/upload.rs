@@ -482,7 +482,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
-    use crate::provider::{BatchResult, Bucket, ListPage};
+    use crate::provider::{BatchResult, Bucket, ListPage, ObjectHead};
     use crate::transfer::part::MULTIPART_THRESHOLD;
 
     const MB: u64 = 1024 * 1024;
@@ -858,6 +858,30 @@ mod tests {
                 return Err(AppError::Unreachable);
             }
             Ok(())
+        }
+
+        async fn head_object(&self, _bucket: &str, _key: &str) -> AppResult<ObjectHead> {
+            unimplemented!("an upload never heads objects")
+        }
+
+        async fn get_range(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _offset: u64,
+            _length: u64,
+        ) -> AppResult<Vec<u8>> {
+            unimplemented!("an upload never reads object ranges")
+        }
+
+        async fn list_objects_flat(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _token: Option<&str>,
+            _max_keys: i32,
+        ) -> AppResult<ListPage> {
+            unimplemented!("an upload never lists objects")
         }
     }
 
