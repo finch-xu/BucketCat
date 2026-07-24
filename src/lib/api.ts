@@ -363,3 +363,17 @@ export function retryTransfer(taskId: string): Promise<void> {
 export function clearFinishedTransfers(): Promise<void> {
   return invokeCommand<void>("clear_finished_transfers");
 }
+
+/** Current value of the runtime resume/checkpoint flag (`ResumeFlag` in
+ * `src-tauri/src/commands/settings.rs`), which gates whether the transfer
+ * engine writes checkpoints at all. */
+export function getResumeEnabled(): Promise<boolean> {
+  return invokeCommand<boolean>("get_resume_enabled");
+}
+
+/** Sets the runtime resume/checkpoint flag and persists the choice to
+ * `settings.json`, so it also takes effect on the next launch. Backed by
+ * `apply_resume_setting` in `src-tauri/src/commands/settings.rs`. */
+export function setResumeEnabled(enabled: boolean): Promise<void> {
+  return invokeCommand<void>("set_resume_enabled", { enabled });
+}

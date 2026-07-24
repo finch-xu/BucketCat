@@ -8,6 +8,7 @@
 
 pub mod connection;
 pub mod object;
+pub mod settings;
 pub mod transfer;
 
 pub use connection::{
@@ -15,6 +16,7 @@ pub use connection::{
     update_connection, AppState,
 };
 pub use object::{create_folder, delete_objects, delete_prefix, list_objects, rename_object};
+pub use settings::{get_resume_enabled, set_resume_enabled, ResumeFlag};
 pub use transfer::{
     cancel_transfer, clear_finished_transfers, enqueue_download, enqueue_folder_download,
     enqueue_uploads, list_transfers, pause_transfer, resume_transfer, retry_transfer,

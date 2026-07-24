@@ -11,8 +11,9 @@ use std::sync::Arc;
 use commands::{
     add_connection, cancel_transfer, clear_finished_transfers, create_folder, delete_connection,
     delete_objects, delete_prefix, enqueue_download, enqueue_folder_download, enqueue_uploads,
-    list_buckets, list_connections, list_objects, list_transfers, pause_transfer, rename_object,
-    resume_transfer, retry_transfer, test_connection, update_connection, AppState,
+    get_resume_enabled, list_buckets, list_connections, list_objects, list_transfers,
+    pause_transfer, rename_object, resume_transfer, retry_transfer, set_resume_enabled,
+    test_connection, update_connection, AppState, ResumeFlag,
 };
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -99,6 +100,13 @@ pub fn run() {
             // skips rebuilding.
             let settings = store::settings::load(&config_dir.join("settings.json"));
             let resume_enabled = Arc::new(AtomicBool::new(settings.resume_enabled));
+            // `ResumeFlag` wraps a clone of the *same* `Arc` handed to the
+            // engine below -- one atomic, read by the engine's checkpoint
+            // gate and read/written by the `get_resume_enabled`/
+            // `set_resume_enabled` commands, never two independent flags
+            // (see `commands::settings`'s module doc for why that sharing
+            // matters).
+            app.manage(ResumeFlag(resume_enabled.clone()));
             // Checkpoints live under the app data dir.
             let checkpoint_dir = transfer::checkpoint::checkpoint_dir(&app.path().app_data_dir()?);
             let engine = TransferEngine::new(
@@ -178,7 +186,9 @@ pub fn run() {
             resume_transfer,
             cancel_transfer,
             retry_transfer,
-            clear_finished_transfers
+            clear_finished_transfers,
+            get_resume_enabled,
+            set_resume_enabled
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
