@@ -204,7 +204,12 @@ fn classify_error_code(code: &str, message: Option<&str>) -> Option<AppError> {
         "NoSuchBucket" => Some(AppError::BucketNotFound {
             bucket: message.unwrap_or("unknown").to_string(),
         }),
-        "NoSuchKey" => Some(AppError::KeyNotFound {
+        // "NotFound" is what `HeadObject` synthesizes on a 404: that
+        // request has no XML body to carry a real S3 error code, unlike
+        // `GetObject`/`DeleteObject`'s `NoSuchKey`, so `aws-sdk-s3` fills in
+        // this placeholder code instead. Both mean the same thing to the
+        // caller: the key doesn't exist.
+        "NoSuchKey" | "NotFound" => Some(AppError::KeyNotFound {
             key: message.unwrap_or("unknown").to_string(),
         }),
         _ => None,
@@ -463,7 +468,12 @@ async fn body_range(path: &Path, offset: u64, length: u64) -> AppResult<ByteStre
 /// HTTP ranges are inclusive on both ends, so the last byte is
 /// `offset + length - 1`.
 pub fn range_header(offset: u64, length: u64) -> String {
-    format!("bytes={}-{}", offset, offset + length - 1)
+    // Inclusive upper bound. `length` is never 0 in practice (`get_range`
+    // short-circuits that case before calling this), but guard the
+    // subtraction so a stray 0 can't underflow `u64`: an empty range
+    // degenerates to the single start byte, which is never actually sent.
+    let end = offset + length.saturating_sub(1);
+    format!("bytes={}-{}", offset, end)
 }
 
 #[async_trait]
@@ -757,6 +767,13 @@ impl Provider for S3Provider {
         offset: u64,
         length: u64,
     ) -> AppResult<Vec<u8>> {
+        // A zero-length range is malformed HTTP (and `range_header` would
+        // have to guard against underflowing `offset + length - 1`); a
+        // 0-byte object is a real case (a single zero-length chunk from
+        // `plan_upload(0)`), so answer it here without a request.
+        if length == 0 {
+            return Ok(Vec::new());
+        }
         let out = self
             .client
             .get_object()
@@ -1443,6 +1460,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn classify_error_code_maps_not_found_to_key_not_found() {
+        // `HeadObject` is a HEAD request: a 404 has no XML body, so
+        // `aws-sdk-s3` synthesizes the metadata code "NotFound" instead of
+        // the "NoSuchKey" that GetObject/DeleteObject's XML-bodied 404s
+        // produce. Both must classify the same way.
+        let app_err = classify_error_code("NotFound", Some("some-key"));
+        assert!(matches!(
+            app_err,
+            Some(AppError::KeyNotFound { ref key }) if key == "some-key"
+        ));
+    }
+
     // --- transfer plane helpers (pure) --------------------------------------
 
     #[test]
@@ -1507,5 +1537,16 @@ mod tests {
     #[test]
     fn range_header_for_a_single_byte() {
         assert_eq!(range_header(5, 1), "bytes=5-5");
+    }
+
+    #[test]
+    fn range_header_zero_length_does_not_underflow() {
+        // `length == 0` used to compute `offset + length - 1`, underflowing
+        // `u64` at offset 0. The saturating form must not panic, and
+        // degenerates to the single start byte (this value is never
+        // actually sent: `get_range` short-circuits length 0 before this
+        // is ever called).
+        assert_eq!(range_header(0, 0), "bytes=0-0");
+        assert_eq!(range_header(5, 0), "bytes=5-5");
     }
 }
