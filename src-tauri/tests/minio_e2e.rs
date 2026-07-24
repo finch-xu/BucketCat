@@ -77,6 +77,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use sha2::{Digest, Sha256};
 
+use bucketcat_lib::commands::transfer::local_target;
 use bucketcat_lib::provider::{from_connection, Provider, ProviderHub, S3Provider, UploadedPart};
 use bucketcat_lib::store::{Connection, SecureStore};
 use bucketcat_lib::transfer::part::MULTIPART_THRESHOLD;
@@ -1983,25 +1984,13 @@ async fn folder_download_via_engine(
 
     let mut ids = Vec::new();
     for entry in entries {
-        // A key ending in `/` is a 0-byte folder placeholder (the `prefix/`
-        // marker or a nested empty-folder marker), never a file: downloading
-        // one would write a spurious empty file named after the folder.
-        if entry.key.ends_with('/') {
-            continue;
-        }
-        // Rebuild the relative path from only its Normal components, exactly as
-        // the command's `local_target` does, so a crafted key can't escape.
-        let relative = entry.key.strip_prefix(prefix).unwrap_or(&entry.key);
-        let mut sanitized = PathBuf::new();
-        for component in Path::new(relative).components() {
-            if let std::path::Component::Normal(part) = component {
-                sanitized.push(part);
-            }
-        }
-        if sanitized.as_os_str().is_empty() {
-            continue;
-        }
-        let target = local_dir.join(&sanitized);
+        // Drive the command's REAL path policy (folder-name preservation,
+        // Normal-only traversal sanitization, and folder-marker skip via
+        // `None`) rather than a copy -- so this e2e actually pins the shipped
+        // behavior and can't silently drift from it.
+        let Some(target) = local_target(prefix, &entry.key, local_dir) else {
+            continue; // a `/`-terminated marker, or nothing normal survived
+        };
         let file_name = target
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2724,15 +2713,22 @@ async fn folder_download_reconstructs_the_tree() {
         .await;
     }
 
-    let a_dst = dl_dir.path().join("a.txt");
-    let b_dst = dl_dir.path().join("sub").join("b.txt");
-    assert!(a_dst.exists(), "p/a.txt must land at <dir>/a.txt");
+    // The downloaded folder's own name (`p`) is recreated as the top directory,
+    // then the subtree beneath it -- not spilled loose into `dl_dir`.
+    let p_dir = dl_dir.path().join("p");
+    let a_dst = p_dir.join("a.txt");
+    let b_dst = p_dir.join("sub").join("b.txt");
+    assert!(
+        p_dir.is_dir(),
+        "the downloaded folder's own name must be recreated as <dir>/p"
+    );
+    assert!(a_dst.exists(), "p/a.txt must land at <dir>/p/a.txt");
     assert!(
         b_dst.exists(),
-        "p/sub/b.txt must reconstruct the nested <dir>/sub/b.txt"
+        "p/sub/b.txt must reconstruct the nested <dir>/p/sub/b.txt"
     );
     assert!(
-        dl_dir.path().join("sub").is_dir(),
+        p_dir.join("sub").is_dir(),
         "the intermediate folder must exist as a real directory"
     );
     assert_eq!(
@@ -2745,14 +2741,17 @@ async fn folder_download_reconstructs_the_tree() {
         hex(&sha256_file(&b_src)),
         "sub/b.txt contents must match the source"
     );
-    // The folder markers must NOT have been written as files.
+    // The folder markers must NOT have been written as files. `p/` now
+    // legitimately exists as the recreated directory, so the check is that it
+    // is not a *file*; a broken skip of the nested `p/empty/` marker would now
+    // land at `<dir>/p/empty`, so that is where the empty-marker check points.
     assert!(
-        !dl_dir.path().join("empty").exists(),
-        "the nested empty-folder marker must be skipped, not written as an 'empty' file"
+        !p_dir.join("empty").is_file(),
+        "the nested empty-folder marker must be skipped, not written as a 'p/empty' file"
     );
     assert!(
-        !dl_dir.path().join("p").exists(),
-        "the folder's own marker must never appear as a local file"
+        !dl_dir.path().join("p").is_file(),
+        "the folder's own marker must never appear as a local file -- only the recreated directory"
     );
 
     cleanup_bucket(&client, &provider, &bucket).await;

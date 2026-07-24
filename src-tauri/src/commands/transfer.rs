@@ -161,8 +161,31 @@ pub async fn enqueue_download(
 /// with `prefix` (defensive; `list_objects_flat` only returns keys under
 /// `prefix`) is treated as its own relative path and still sanitized, so it
 /// can never escape either.
-fn local_target(prefix: &str, key: &str, local_dir: &Path) -> Option<PathBuf> {
-    let relative = key.strip_prefix(prefix).unwrap_or(key);
+/// Maps a remote object `key` under `prefix` to its local download path,
+/// preserving the folder's own name and sanitizing against path traversal.
+/// `pub` so the live folder-download e2e can drive the *real* policy instead of
+/// a copy that could silently drift from it.
+pub fn local_target(prefix: &str, key: &str, local_dir: &Path) -> Option<PathBuf> {
+    // A `/`-terminated key is a folder marker, not a file (the command already
+    // skips these before calling; the guard keeps the helper self-contained and
+    // stops the folder's own marker from producing a bogus target).
+    if key.ends_with('/') {
+        return None;
+    }
+    // Keep the downloaded folder's own name as the top local directory: strip
+    // only the prefix's PARENT, not the prefix itself. For "photos/" the parent
+    // is "" so "photos/cat1.txt" stays "photos/cat1.txt" (-> <dir>/photos/...);
+    // for "a/b/photos/" the parent is "a/b/" so the same object becomes
+    // "photos/cat1.txt" (-> <dir>/photos/..., not the whole a/b/ path).
+    // Downloading a folder should reproduce that folder under `local_dir`, not
+    // spill its contents loose into it -- and namespacing by the folder name
+    // stops two folders downloaded into one directory from colliding.
+    let trimmed = prefix.strip_suffix('/').unwrap_or(prefix);
+    let parent = match trimmed.rfind('/') {
+        Some(i) => &prefix[..i + 1], // up to and including the parent's slash
+        None => "",
+    };
+    let relative = key.strip_prefix(parent).unwrap_or(key);
     let mut sanitized = PathBuf::new();
     for component in Path::new(relative).components() {
         if let Component::Normal(part) = component {
@@ -187,8 +210,11 @@ fn local_target(prefix: &str, key: &str, local_dir: &Path) -> Option<PathBuf> {
 /// the folder.
 ///
 /// Each object's local target is `local_dir` joined with its path relative to
-/// `prefix`, sanitized by [`local_target`] so a crafted key can never escape
-/// `local_dir`. The size comes straight from the listing (which already
+/// the *parent* of `prefix` -- so the downloaded folder's own name becomes the
+/// top local directory (`photos/` -> `<local_dir>/photos/...`) rather than its
+/// contents spilling loose into `local_dir`. The path is sanitized by
+/// [`local_target`] so a crafted key can never escape `local_dir`. The size
+/// comes straight from the listing (which already
 /// carries it); only when the server omitted it does this fall back to a
 /// per-object `head_object`, avoiding a wasted round-trip otherwise.
 ///
@@ -482,17 +508,31 @@ mod tests {
 
     #[test]
     fn local_target_preserves_the_subtree_under_the_prefix() {
+        // The folder's own name (`docs`) is kept as the top directory, then the
+        // subtree beneath it.
         assert_eq!(
             local_target("docs/", "docs/sub/a.txt", Path::new("/D")),
-            Some(PathBuf::from("/D/sub/a.txt"))
+            Some(PathBuf::from("/D/docs/sub/a.txt"))
         );
     }
 
     #[test]
-    fn local_target_of_a_direct_child_lands_at_the_root_of_local_dir() {
+    fn local_target_of_a_direct_child_lands_under_the_folder() {
+        // A direct child lands under the recreated folder, not loose in
+        // `local_dir` -- downloading "docs/" gives you a "docs" directory.
         assert_eq!(
             local_target("docs/", "docs/a.txt", Path::new("/D")),
-            Some(PathBuf::from("/D/a.txt"))
+            Some(PathBuf::from("/D/docs/a.txt"))
+        );
+    }
+
+    #[test]
+    fn local_target_keeps_only_the_folder_name_for_a_nested_prefix() {
+        // Downloading a folder that itself lives under other prefixes keeps only
+        // the folder's own name, not the whole path to it.
+        assert_eq!(
+            local_target("a/b/photos/", "a/b/photos/cat.png", Path::new("/D")),
+            Some(PathBuf::from("/D/photos/cat.png"))
         );
     }
 
@@ -515,8 +555,9 @@ mod tests {
             "sanitized path must stay under local_dir: {}",
             target.display()
         );
-        // Concretely: the `..` is dropped, not resolved.
-        assert_eq!(target, PathBuf::from("/D/secret"));
+        // Concretely: the `..` is dropped, not resolved -- the folder name is
+        // kept, so it lands under `/D/docs`, never above it.
+        assert_eq!(target, PathBuf::from("/D/docs/secret"));
     }
 
     #[test]
@@ -525,17 +566,18 @@ mod tests {
             .expect("normal components survive");
         assert!(target.components().all(|c| c != Component::ParentDir));
         assert!(target.starts_with("/D"));
-        assert_eq!(target, PathBuf::from("/D/etc/passwd"));
+        assert_eq!(target, PathBuf::from("/D/docs/etc/passwd"));
     }
 
     #[test]
-    fn local_target_strips_an_absolute_root_component() {
-        // A prefix without a trailing slash makes the relative part begin with
-        // `/`; the RootDir component must be dropped, not honoured, or the
-        // join would jump to the filesystem root.
+    fn local_target_handles_a_prefix_without_a_trailing_slash() {
+        // Real folder prefixes always end in `/`, but the helper must still be
+        // sane without one: the parent of "docs" is empty, so the folder name
+        // is kept and the object lands under `/D/docs`. (RootDir-dropping for a
+        // genuinely absolute key is covered by the bare-absolute test below.)
         let target =
             local_target("docs", "docs/etc", Path::new("/D")).expect("normal components survive");
-        assert_eq!(target, PathBuf::from("/D/etc"));
+        assert_eq!(target, PathBuf::from("/D/docs/etc"));
         assert!(target.starts_with("/D"));
     }
 
