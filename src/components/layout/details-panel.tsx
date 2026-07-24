@@ -1,18 +1,34 @@
+import { useEffect, useRef, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Download, Link2, Share2, Trash2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { fileMeta, isImageExt } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
+import { headObject, presignGet, type AppError, type ObjectHead } from "@/lib/api";
 import { useBrowse } from "@/hooks/use-browse";
+import { useErrorText } from "@/hooks/use-error-text";
 import { useStartDownloads } from "@/hooks/use-start-downloads";
 import { useApp } from "@/store/app-store";
 
-/** Shows the single selected file's real metadata. Copy-link/share stay
- * visual placeholders until M6 (presign); download and delete are wired --
- * download queues a transfer via the shared `useStartDownloads`, delete via
- * the object dialogs. ETag/head_object detail arrives in M6. */
+/** Expiry choices offered by the Share dropdown, in seconds. Default (first
+ * entry) is 1 hour -- the shortest-lived option, so a link that's forgotten
+ * about doesn't stay valid for long. */
+const EXPIRY_OPTIONS: { secs: number; labelKey: string }[] = [
+  { secs: 3600, labelKey: "details.expiry1h" },
+  { secs: 21600, labelKey: "details.expiry6h" },
+  { secs: 86400, labelKey: "details.expiry24h" },
+  { secs: 604800, labelKey: "details.expiry7d" },
+];
+
+/** Shows the single selected file's real metadata. Download and delete are
+ * wired (download queues a transfer via `useStartDownloads`, delete via the
+ * object dialogs); ETag/Content-Type come from a `head_object` query and
+ * Share generates a real presigned URL via `presign_get`. The `copyLink`
+ * button stays a visual placeholder -- Share is the marquee action here. */
 export function DetailsPanel() {
   const { t } = useTranslation();
-  const { selectedKeys, clearSelection, openDeleteObjects } = useApp();
+  const errorText = useErrorText();
+  const { selectedKeys, clearSelection, openDeleteObjects, activeConn, activeBucket } = useApp();
   const { entries } = useBrowse();
   const { startFileDownload, dialog } = useStartDownloads();
 
@@ -20,11 +36,66 @@ export function DetailsPanel() {
     selectedKeys.length === 1
       ? entries.find((e) => e.key === selectedKeys[0] && !e.is_prefix)
       : undefined;
+
+  // Every hook below must run on every render (entry can be undefined) so
+  // the early `return null` below it never changes the hook order.
+  const [shareOpen, setShareOpen] = useState(false);
+  const [expirySecs, setExpirySecs] = useState(EXPIRY_OPTIONS[0].secs);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const copyTimeoutRef = useRef<number | null>(null);
+
+  const headQuery = useQuery<ObjectHead, AppError>({
+    queryKey: ["head", activeConn, activeBucket, entry?.key ?? ""],
+    queryFn: () => headObject(activeConn, activeBucket, entry?.key ?? ""),
+    enabled: entry !== undefined,
+  });
+
+  // The presigned URL only ever lives in this piece of state -- never
+  // persisted, never logged. Switching to a different entry (or clearing
+  // the selection) below discards it along with the rest of the share UI.
+  const presignMutation = useMutation<string, AppError, number>({
+    mutationFn: (secs) => presignGet(activeConn, activeBucket, entry?.key ?? "", secs),
+    onSuccess: (url) => setShareUrl(url),
+  });
+
+  useEffect(() => {
+    setShareOpen(false);
+    setShareUrl(null);
+    setCopied(false);
+    presignMutation.reset();
+    // Only re-run when the selected entry actually changes -- `presignMutation`
+    // is a fresh object every render and would otherwise loop this effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entry?.key]);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimeoutRef.current !== null) window.clearTimeout(copyTimeoutRef.current);
+    };
+  }, []);
+
   if (!entry) return null;
 
   const ext = extFromName(entry.name);
   const meta = fileMeta("file", ext);
   const BigIcon = meta.icon;
+
+  const handleCopy = () => {
+    if (!shareUrl) return;
+    navigator.clipboard
+      .writeText(shareUrl)
+      .then(() => {
+        setCopied(true);
+        if (copyTimeoutRef.current !== null) window.clearTimeout(copyTimeoutRef.current);
+        copyTimeoutRef.current = window.setTimeout(() => setCopied(false), 2000);
+      })
+      .catch(() => {
+        // Clipboard write failed (e.g. no permission granted in this
+        // webview) -- the URL is still visible for manual selection, so
+        // this is a silent no-op rather than a surfaced error.
+      });
+  };
 
   return (
     <aside className="flex w-[300px] shrink-0 flex-col border-l border-border bg-background">
@@ -68,7 +139,10 @@ export function DetailsPanel() {
           </button>
           <button
             type="button"
-            className="inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] border border-border bg-background text-[12.5px] font-medium text-fg2 hover:bg-hover"
+            onClick={() => setShareOpen((open) => !open)}
+            className={`inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] border text-[12.5px] font-medium hover:bg-hover ${
+              shareOpen ? "border-primary text-primary" : "border-border bg-background text-fg2"
+            }`}
           >
             <Share2 className="size-3.5" />
             {t("details.share")}
@@ -82,6 +156,58 @@ export function DetailsPanel() {
             {t("details.delete")}
           </button>
         </div>
+        {shareOpen && (
+          <div className="mb-4 flex flex-col gap-2.5 rounded-[9px] border border-border bg-panel p-3">
+            <div>
+              <div className="mb-[5px] text-[10.5px] tracking-[0.4px] text-muted-foreground uppercase">
+                {t("details.shareExpiry")}
+              </div>
+              <div className="flex items-center gap-2">
+                <select
+                  value={expirySecs}
+                  onChange={(e) => setExpirySecs(Number(e.target.value))}
+                  className="h-[30px] flex-1 rounded-[7px] border border-border bg-background px-2 text-[12px] text-fg2 outline-none focus:border-primary"
+                >
+                  {EXPIRY_OPTIONS.map((opt) => (
+                    <option key={opt.secs} value={opt.secs}>
+                      {t(opt.labelKey)}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => presignMutation.mutate(expirySecs)}
+                  disabled={presignMutation.isPending}
+                  className="h-[30px] shrink-0 cursor-pointer rounded-[7px] bg-primary px-3 text-[12px] font-semibold text-primary-foreground hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {presignMutation.isPending ? t("details.generating") : t("details.generateLink")}
+                </button>
+              </div>
+            </div>
+            {shareUrl && (
+              <div className="flex items-center gap-2">
+                <div
+                  className="min-w-0 flex-1 truncate rounded-[7px] border border-border bg-background px-2 py-1.5 font-mono text-[11px] text-fg2"
+                  title={shareUrl}
+                >
+                  {shareUrl}
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCopy}
+                  className="h-[30px] shrink-0 cursor-pointer rounded-[7px] border border-border bg-background px-2.5 text-[12px] font-medium text-fg2 hover:bg-hover"
+                >
+                  {copied ? t("details.copied") : t("details.copy")}
+                </button>
+              </div>
+            )}
+            {presignMutation.isError && (
+              <p className="text-[11.5px] text-destructive">
+                {t("details.shareFailed")}: {errorText(presignMutation.error)}
+              </p>
+            )}
+          </div>
+        )}
         <div className="flex flex-col gap-3 border-t border-border2 pt-3.5">
           <div>
             <div className="mb-[3px] text-[10.5px] tracking-[0.4px] text-muted-foreground uppercase">
@@ -103,6 +229,33 @@ export function DetailsPanel() {
               {formatDate(entry.last_modified)}
             </span>
           </div>
+          {/* ETag/Content-Type come from `head_object`, not the list response.
+              A failed head degrades silently -- the rows above (from the
+              already-loaded listing) still render either way. */}
+          {headQuery.isLoading || headQuery.data ? (
+            <>
+              <div className="flex justify-between gap-3">
+                <span className="shrink-0 text-xs text-muted-foreground">{t("details.etag")}</span>
+                <span
+                  className="truncate font-mono text-[11.5px] text-fg2"
+                  title={headQuery.data?.etag ?? undefined}
+                >
+                  {headQuery.isLoading ? "—" : (headQuery.data?.etag ?? "—")}
+                </span>
+              </div>
+              <div className="flex justify-between gap-3">
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {t("details.contentType")}
+                </span>
+                <span
+                  className="truncate text-[12.5px] text-fg2"
+                  title={headQuery.data?.content_type ?? undefined}
+                >
+                  {headQuery.isLoading ? "—" : (headQuery.data?.content_type ?? "—")}
+                </span>
+              </div>
+            </>
+          ) : null}
         </div>
       </div>
       {dialog}

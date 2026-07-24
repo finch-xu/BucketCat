@@ -46,7 +46,19 @@
     "objectKey": "Object key",
     "size": "Size",
     "storageClass": "Storage class",
-    "modified": "Modified"
+    "modified": "Modified",
+    "etag": "ETag",
+    "contentType": "Content type",
+    "shareExpiry": "Link expires in",
+    "expiry1h": "1 hour",
+    "expiry6h": "6 hours",
+    "expiry24h": "24 hours",
+    "expiry7d": "7 days",
+    "generateLink": "Generate link",
+    "generating": "Generating…",
+    "copy": "Copy",
+    "copied": "Copied",
+    "shareFailed": "Couldn't generate the link"
   },
   "objects": {
     "newFolder": "New folder",

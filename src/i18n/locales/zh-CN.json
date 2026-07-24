@@ -46,7 +46,19 @@
     "objectKey": "对象键",
     "size": "大小",
     "storageClass": "存储类别",
-    "modified": "修改时间"
+    "modified": "修改时间",
+    "etag": "ETag",
+    "contentType": "内容类型",
+    "shareExpiry": "有效期",
+    "expiry1h": "1 小时",
+    "expiry6h": "6 小时",
+    "expiry24h": "24 小时",
+    "expiry7d": "7 天",
+    "generateLink": "生成链接",
+    "generating": "生成中…",
+    "copy": "复制",
+    "copied": "已复制",
+    "shareFailed": "生成链接失败"
   },
   "objects": {
     "newFolder": "新建文件夹",
