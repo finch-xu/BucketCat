@@ -1,8 +1,16 @@
 import { useMemo, useState, type FormEvent } from "react";
 import { AlertTriangle, FolderPlus, Loader2, Pencil } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useMutation, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
 import { Modal } from "@/components/ui/modal";
-import { useCreateFolder, useDeleteObjects, useObjects, useRenameObject } from "@/hooks/use-objects";
+import {
+  objectsRootKey,
+  useCreateFolder,
+  useDeleteObjects,
+  useObjects,
+  useRenameObject,
+} from "@/hooks/use-objects";
+import { deletePrefix, type AppError, type BatchResult } from "@/lib/api";
 import { useErrorText } from "@/hooks/use-error-text";
 import {
   isValidObjectName,
@@ -297,21 +305,48 @@ function RenameObjectDialog() {
   );
 }
 
+/** Recursive folder delete as a mutation, mirroring `useDeleteObjects` but
+ * targeting a whole prefix via `delete_prefix`. Lives here (not in
+ * `use-objects.ts`) beside its only caller, and invalidates the same
+ * `objectsRootKey` so the deleted folder disappears from every listing. */
+function useDeletePrefix(
+  connectionId: string,
+  bucket: string,
+): UseMutationResult<BatchResult, AppError, string> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (prefix: string) => deletePrefix(connectionId, bucket, prefix),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: objectsRootKey(connectionId, bucket) });
+    },
+  });
+}
+
 /** Batch delete with design §7's partial-failure contract: the command
  * resolves (never rejects) with `{ succeeded, failed }`, so a mixed outcome
  * turns this dialog into a report -- 「成功 N / 失败 M」plus the per-key
  * failure list rendered through the same `errors.*` dictionary as top-level
  * errors -- instead of silently closing or pretending the whole batch
- * failed. A clean run closes immediately. */
+ * failed. A clean run closes immediately.
+ *
+ * A single `prefix/` target (folders never multi-select, and only folder
+ * keys end in "/") is a *folder* delete: it routes to the recursive
+ * `deletePrefix` command and shows the distinct "folder and everything in
+ * it, irreversibly" confirmation. Every other case is an ordinary file
+ * batch delete. The design §7 report shape (「成功 N / 失败 M」) is identical
+ * for both, so the report branch is shared. */
 function DeleteObjectsDialog() {
   const { t } = useTranslation();
   const errorText = useErrorText();
   const { activeConn, activeBucket, deleteTargets, closeDeleteObjects, clearSelection } = useApp();
   const deleteMutation = useDeleteObjects(activeConn, activeBucket);
+  const deletePrefixMutation = useDeletePrefix(activeConn, activeBucket);
 
   if (!deleteTargets || deleteTargets.length === 0) return null;
   const keys = deleteTargets;
-  const result = deleteMutation.data;
+  const isFolder = keys.length === 1 && keys[0].endsWith("/");
+  const mutation = isFolder ? deletePrefixMutation : deleteMutation;
+  const result = mutation.data;
   // Non-null exactly when the batch came back with per-key failures. This is
   // what flips the dialog from "confirm" to "report" mode -- and, unlike a
   // boolean flag, it keeps the narrowing TypeScript needs to read
@@ -319,14 +354,20 @@ function DeleteObjectsDialog() {
   const report = result && result.failed.length > 0 ? result : null;
 
   function handleConfirm() {
-    deleteMutation.mutate(keys, {
-      onSuccess: (batch) => {
-        if (batch.failed.length === 0) {
-          clearSelection();
-          closeDeleteObjects();
-        }
-      },
-    });
+    const onSuccess = (batch: BatchResult) => {
+      if (batch.failed.length === 0) {
+        clearSelection();
+        closeDeleteObjects();
+      }
+    };
+    // A recursive folder delete takes the single prefix; a file batch takes
+    // the whole key list. Fired on the concrete mutation (not the `mutation`
+    // union) so each gets its own argument type.
+    if (isFolder) {
+      deletePrefixMutation.mutate(keys[0], { onSuccess });
+    } else {
+      deleteMutation.mutate(keys, { onSuccess });
+    }
   }
 
   function handleClose() {
@@ -344,7 +385,7 @@ function DeleteObjectsDialog() {
       handleClose();
       return;
     }
-    if (deleteMutation.isPending) return;
+    if (mutation.isPending) return;
     handleConfirm();
   }
 
@@ -361,9 +402,11 @@ function DeleteObjectsDialog() {
             <div className="text-[15px] font-bold">
               {report
                 ? t("objects.partialTitle")
-                : keys.length === 1
-                  ? t("objects.deleteTitleOne")
-                  : t("objects.deleteTitleMany", { count: keys.length })}
+                : isFolder
+                  ? t("objects.deleteFolderTitle")
+                  : keys.length === 1
+                    ? t("objects.deleteTitleOne")
+                    : t("objects.deleteTitleMany", { count: keys.length })}
             </div>
             {report ? (
               <>
@@ -386,15 +429,15 @@ function DeleteObjectsDialog() {
               </>
             ) : (
               <p className="mt-1.5 text-[13px] text-fg2">
-                {keys.length === 1
-                  ? t("objects.deleteBodyOne", { name: singleName })
-                  : t("objects.deleteBodyMany", { count: keys.length })}
+                {isFolder
+                  ? t("objects.deleteFolderBody", { name: singleName })
+                  : keys.length === 1
+                    ? t("objects.deleteBodyOne", { name: singleName })
+                    : t("objects.deleteBodyMany", { count: keys.length })}
               </p>
             )}
-            {deleteMutation.isError && (
-              <p className="mt-1.5 text-[12px] text-destructive">
-                {errorText(deleteMutation.error)}
-              </p>
+            {mutation.error && (
+              <p className="mt-1.5 text-[12px] text-destructive">{errorText(mutation.error)}</p>
             )}
           </div>
         </div>
@@ -408,14 +451,14 @@ function DeleteObjectsDialog() {
               <button
                 type="button"
                 onClick={handleClose}
-                disabled={deleteMutation.isPending}
+                disabled={mutation.isPending}
                 className={CANCEL_CLASS}
               >
                 {t("objects.cancel")}
               </button>
-              <button type="submit" autoFocus disabled={deleteMutation.isPending} className={DANGER_CLASS}>
-                {deleteMutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
-                {deleteMutation.isPending ? t("objects.deleting") : t("objects.delete")}
+              <button type="submit" autoFocus disabled={mutation.isPending} className={DANGER_CLASS}>
+                {mutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
+                {mutation.isPending ? t("objects.deleting") : t("objects.delete")}
               </button>
             </>
           )}

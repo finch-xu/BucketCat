@@ -135,6 +135,19 @@ pub trait Provider {
     /// returned [`BatchResult`] carries success count + per-key failures.
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> AppResult<BatchResult>;
 
+    /// Recursively deletes every object under `prefix` — **including** the
+    /// zero-byte `prefix/` folder-marker object itself — by walking
+    /// `list_objects_flat` to enumerate the whole subtree, then batching
+    /// the keys through [`Provider::delete_objects`] (≤1000 per request) and
+    /// aggregating one [`BatchResult`] (design §7: partial failures reported,
+    /// never abort). `prefix` must be non-empty: a `""` prefix would
+    /// enumerate and delete the entire bucket, which is never a UI gesture,
+    /// so implementations reject it. This is the only path that can remove an
+    /// *empty* in-app folder: `list_objects` (delimiter `/`) rolls that
+    /// folder's marker into a CommonPrefix and filters it, while
+    /// `list_objects_flat` surfaces it as a real key (closes M3 gap I4).
+    async fn delete_prefix(&self, bucket: &str, prefix: &str) -> AppResult<BatchResult>;
+
     /// Renames one object as copy-then-delete (object stores have no
     /// native rename). A missing `from_key` fails with
     /// `storage/key-not-found`; the source is only deleted after the copy

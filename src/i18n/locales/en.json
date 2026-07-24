@@ -65,6 +65,8 @@
     "deleteTitleMany": "Delete {{count}} objects?",
     "deleteBodyOne": "Are you sure you want to delete \"{{name}}\"? This can't be undone.",
     "deleteBodyMany": "Are you sure you want to delete the {{count}} selected objects? This can't be undone.",
+    "deleteFolderTitle": "Delete this folder?",
+    "deleteFolderBody": "Are you sure you want to delete the folder \"{{name}}\" and everything inside it? Every object under this folder will be removed, and this can't be undone.",
     "deleting": "Deleting…",
     "cancel": "Cancel",
     "invalidName": "A name can't be empty or contain \"/\"",

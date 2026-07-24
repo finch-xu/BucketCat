@@ -56,6 +56,23 @@ pub async fn delete_objects(
     provider.delete_objects(&bucket, &keys).await
 }
 
+/// Recursively deletes a folder: every object under `prefix` plus the
+/// folder's own zero-byte marker object, reporting per-key partial failures
+/// instead of aborting (design §7). The provider rejects an empty `prefix`
+/// -- a recursive delete of the bucket root is not a gesture this command
+/// exposes. This is also the only way to remove an *empty* in-app folder,
+/// whose marker the delimiter listing hides (M3 gap I4).
+#[tauri::command]
+pub async fn delete_prefix(
+    state: State<'_, AppState>,
+    connection_id: String,
+    bucket: String,
+    prefix: String,
+) -> AppResult<BatchResult> {
+    let provider = state.hub().provider(&connection_id).await?;
+    provider.delete_prefix(&bucket, &prefix).await
+}
+
 /// Renames one object (copy + delete under the hood).
 #[tauri::command]
 pub async fn rename_object(

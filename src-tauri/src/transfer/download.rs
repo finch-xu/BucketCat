@@ -676,6 +676,10 @@ mod tests {
             unimplemented!("a download never deletes objects")
         }
 
+        async fn delete_prefix(&self, _bucket: &str, _prefix: &str) -> AppResult<BatchResult> {
+            unimplemented!("a download never deletes prefixes")
+        }
+
         async fn rename_object(
             &self,
             _bucket: &str,

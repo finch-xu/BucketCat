@@ -199,6 +199,19 @@ export function deleteObjects(
   return invokeCommand<BatchResult>("delete_objects", { connectionId, bucket, keys });
 }
 
+/** Recursively deletes a folder: every object under `prefix` plus the
+ * folder's own zero-byte marker object. Resolves (not rejects) with per-key
+ * partial failures in `BatchResult.failed`, same design §7 contract as
+ * `deleteObjects`. The backend rejects an empty `prefix` (a recursive delete
+ * of the bucket root is never a UI gesture). */
+export function deletePrefix(
+  connectionId: string,
+  bucket: string,
+  prefix: string,
+): Promise<BatchResult> {
+  return invokeCommand<BatchResult>("delete_prefix", { connectionId, bucket, prefix });
+}
+
 /** Renames one object (backend implements copy + delete). */
 export function renameObject(
   connectionId: string,

@@ -82,15 +82,36 @@ function useEntryHandlers(orderedFileKeys: string[]) {
 /** Per-row hover actions, revealed on hover and kept keyboard-reachable via
  * `group-focus-within` (same affordance the sidebar's connection row uses).
  *
- * Folders deliberately get no actions: renaming a prefix means copying every
- * key underneath it and deleting one means a recursive delete -- both need
- * M4's batch engine, and offering a button that silently touched only the
- * zero-byte marker object would be worse than offering nothing. */
+ * Folders get a delete action (recursive: it removes the `prefix/` marker and
+ * every object underneath, via `delete_prefix`) but deliberately NO rename:
+ * renaming a prefix means copying every key beneath it, which isn't wired
+ * yet. The folder delete routes through the same delete dialog as files --
+ * the dialog detects the trailing "/" and switches to the recursive path and
+ * its own "folder and all its contents" confirmation copy. This is what
+ * finally makes an *empty* in-app folder deletable (M3 left its zero-byte
+ * marker unreachable from any UI gesture). */
 function RowActions({ entry }: { entry: ObjectEntry }) {
   const { t } = useTranslation();
   const { openRename, openDeleteObjects } = useApp();
 
-  if (entry.is_prefix) return <span className="w-[64px] shrink-0" />;
+  if (entry.is_prefix) {
+    return (
+      <span className="flex w-[64px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            openDeleteObjects([entry.key]);
+          }}
+          title={t("objects.delete")}
+          aria-label={t("objects.delete")}
+          className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+        >
+          <Trash2 className="size-3.5" />
+        </button>
+      </span>
+    );
+  }
 
   return (
     <span className="flex w-[64px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">

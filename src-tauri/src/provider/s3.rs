@@ -294,6 +294,20 @@ fn to_list_page(
 /// larger batches are split client-side.
 const DELETE_BATCH_MAX: usize = 1000;
 
+/// Keys per page while `delete_prefix` walks a subtree. 1000 is
+/// ListObjectsV2's own server-side maximum, so this minimizes the number of
+/// round-trips needed to enumerate a large folder before deleting it.
+const FLAT_WALK_PAGE_SIZE: i32 = 1000;
+
+/// Splits `keys` into consecutive sub-slices of at most `size` elements, the
+/// final chunk carrying the remainder. `size` must be non-zero (the only
+/// caller passes the compile-time constant [`DELETE_BATCH_MAX`]). Extracted
+/// as a pure fn so `delete_prefix`'s ≤1000 batching is unit-testable without
+/// a live store. Pure, unit-tested below.
+pub(crate) fn chunk_keys(keys: &[String], size: usize) -> Vec<&[String]> {
+    keys.chunks(size).collect()
+}
+
 /// Characters percent-encoded in an `x-amz-copy-source` value: everything
 /// except RFC 3986 unreserved characters and `/` (the bucket/key
 /// separator). The SDK does NOT encode this header itself, and unencoded
@@ -587,6 +601,56 @@ impl Provider for S3Provider {
                     failed.extend(chunk_failure_keys(chunk, &normalize_s3_error(e)));
                 }
             }
+        }
+        Ok(BatchResult { succeeded, failed })
+    }
+
+    async fn delete_prefix(&self, bucket: &str, prefix: &str) -> AppResult<BatchResult> {
+        // An empty prefix would enumerate (and delete) every object in the
+        // bucket. That is never a UI gesture -- the only "empty the bucket"
+        // path is the deliberate, separately-guarded delete-bucket flow -- so
+        // reject it outright rather than silently wiping the bucket. Mapped
+        // to `Internal` (like `folder_marker_key`/`from_connection`): the
+        // frontend only ever calls this with a real `prefix/` folder key, so
+        // an empty one reaching here is an upstream bug, not a storage
+        // condition the user caused.
+        if prefix.is_empty() {
+            return Err(AppError::Internal {
+                message: "delete_prefix requires a non-empty prefix".to_string(),
+            });
+        }
+
+        // Walk the entire subtree with the delimiter-less listing,
+        // accumulating every key -- INCLUDING the `prefix/` zero-byte
+        // folder-marker object, which `list_objects_flat` returns as a real
+        // row (unlike the delimiter-`/` `list_objects`, which rolls it into a
+        // CommonPrefix and filters it). Surfacing that marker is exactly what
+        // makes an *empty* in-app folder deletable (closes M3 gap I4).
+        let mut keys: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .list_objects_flat(bucket, prefix, token.as_deref(), FLAT_WALK_PAGE_SIZE)
+                .await?;
+            keys.extend(page.entries.into_iter().map(|entry| entry.key));
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+
+        // Fold every ≤1000-key batch's outcome into a single BatchResult:
+        // sum successes, concatenate per-key failures. Each `chunk` is
+        // already ≤1000, so `delete_objects` issues exactly one DeleteObjects
+        // request per chunk, and its own design-§7 handling turns a
+        // whole-chunk request failure into per-key failures rather than
+        // aborting the walk.
+        let mut succeeded: u32 = 0;
+        let mut failed: Vec<FailedKey> = Vec::new();
+        for chunk in chunk_keys(&keys, DELETE_BATCH_MAX) {
+            let batch = self.delete_objects(bucket, chunk).await?;
+            succeeded += batch.succeeded;
+            failed.extend(batch.failed);
         }
         Ok(BatchResult { succeeded, failed })
     }
@@ -1447,6 +1511,57 @@ mod tests {
     #[test]
     fn chunk_failure_keys_empty_chunk_yields_empty_vec() {
         assert!(chunk_failure_keys(&[], &AppError::Unreachable).is_empty());
+    }
+
+    // --- chunk_keys (pure) --------------------------------------------------
+    //
+    // These pin the ≤1000 batching `delete_prefix` feeds into `delete_objects`
+    // one batch at a time. The assertions check chunk *sizes and boundaries*,
+    // not just the chunk count, so an off-by-one chunker (e.g. one that split
+    // at 999 or 1001, or dropped/duplicated a key across a boundary) fails
+    // them instead of sliding through on a matching count alone.
+
+    fn numbered_keys(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("k{i}")).collect()
+    }
+
+    #[test]
+    fn chunk_keys_of_zero_keys_is_no_chunks() {
+        assert!(chunk_keys(&[], DELETE_BATCH_MAX).is_empty());
+    }
+
+    #[test]
+    fn chunk_keys_of_exactly_one_batch_is_a_single_full_chunk() {
+        let keys = numbered_keys(1000);
+        let chunks = chunk_keys(&keys, DELETE_BATCH_MAX);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1000);
+        assert_eq!(chunks[0].first().map(String::as_str), Some("k0"));
+        assert_eq!(chunks[0].last().map(String::as_str), Some("k999"));
+    }
+
+    #[test]
+    fn chunk_keys_of_one_over_a_batch_splits_into_1000_plus_1() {
+        let keys = numbered_keys(1001);
+        let chunks = chunk_keys(&keys, DELETE_BATCH_MAX);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 1000);
+        assert_eq!(chunks[1].len(), 1);
+        // Boundary must fall between k999 and k1000, with nothing lost.
+        assert_eq!(chunks[0].last().map(String::as_str), Some("k999"));
+        assert_eq!(chunks[1].first().map(String::as_str), Some("k1000"));
+    }
+
+    #[test]
+    fn chunk_keys_of_two_batches_splits_into_1000_plus_1000() {
+        let keys = numbered_keys(2000);
+        let chunks = chunk_keys(&keys, DELETE_BATCH_MAX);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 1000);
+        assert_eq!(chunks[1].len(), 1000);
+        assert_eq!(chunks[0].first().map(String::as_str), Some("k0"));
+        assert_eq!(chunks[1].first().map(String::as_str), Some("k1000"));
+        assert_eq!(chunks[1].last().map(String::as_str), Some("k1999"));
     }
 
     // --- classify_error_code: NoSuchKey -------------------------------------

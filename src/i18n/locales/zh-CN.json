@@ -65,6 +65,8 @@
     "deleteTitleMany": "删除 {{count}} 个对象？",
     "deleteBodyOne": "确定要删除「{{name}}」吗？此操作无法撤销。",
     "deleteBodyMany": "确定要删除选中的 {{count}} 个对象吗？此操作无法撤销。",
+    "deleteFolderTitle": "删除这个文件夹？",
+    "deleteFolderBody": "确定要删除文件夹「{{name}}」及其中的全部内容吗？该文件夹下的所有对象都会被删除，此操作无法撤销。",
     "deleting": "正在删除…",
     "cancel": "取消",
     "invalidName": "名称不能为空，且不能包含「/」",

@@ -753,6 +753,10 @@ mod tests {
             unimplemented!("an upload never deletes objects")
         }
 
+        async fn delete_prefix(&self, _bucket: &str, _prefix: &str) -> AppResult<BatchResult> {
+            unimplemented!("an upload never deletes prefixes")
+        }
+
         async fn rename_object(
             &self,
             _bucket: &str,
