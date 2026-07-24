@@ -451,3 +451,20 @@ export function setMaxParts(n: number): Promise<void> {
 export function setShareExpiry(secs: number): Promise<void> {
   return invokeCommand<void>("set_share_expiry", { secs });
 }
+
+/** Result of `cleanCheckpointResidue`: how many orphan checkpoints were
+ * removed, and how many bytes that (plus any staged `.bcpart`) freed. Mirrors
+ * `CleanResult` in `src-tauri/src/commands/settings.rs`. */
+export interface CleanResult {
+  removed: number;
+  freed_bytes: number;
+}
+
+/** Advanced-settings cleanup action (closes an M4c follow-up): removes every
+ * checkpoint whose connection has been deleted -- and, for a download, its
+ * staging `.bcpart` -- reusing the same orphan decision the startup restore
+ * makes. Backed by `clean_checkpoint_residue` in
+ * `src-tauri/src/commands/settings.rs`. */
+export function cleanCheckpointResidue(): Promise<CleanResult> {
+  return invokeCommand<CleanResult>("clean_checkpoint_residue");
+}

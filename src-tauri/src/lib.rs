@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use commands::{
-    add_connection, cancel_transfer, clear_finished_transfers, create_folder, delete_connection,
-    delete_objects, delete_prefix, enqueue_download, enqueue_folder_download, enqueue_uploads,
-    get_resume_enabled, get_settings, head_object, list_buckets, list_connections, list_objects,
-    list_transfers, pause_transfer, presign_get, rename_object, resume_transfer, retry_transfer,
-    set_max_parts, set_max_tasks, set_resume_enabled, set_share_expiry, test_connection,
-    update_connection, AppState, ResumeFlag,
+    add_connection, cancel_transfer, clean_checkpoint_residue, clear_finished_transfers,
+    create_folder, delete_connection, delete_objects, delete_prefix, enqueue_download,
+    enqueue_folder_download, enqueue_uploads, get_resume_enabled, get_settings, head_object,
+    list_buckets, list_connections, list_objects, list_transfers, pause_transfer, presign_get,
+    rename_object, resume_transfer, retry_transfer, set_max_parts, set_max_tasks,
+    set_resume_enabled, set_share_expiry, test_connection, update_connection, AppState, ResumeFlag,
 };
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -174,7 +174,8 @@ pub fn run() {
             get_settings,
             set_max_tasks,
             set_max_parts,
-            set_share_expiry
+            set_share_expiry,
+            clean_checkpoint_residue
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
