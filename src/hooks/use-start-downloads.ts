@@ -68,7 +68,13 @@ export function useStartDownloads(): UseStartDownloadsResult {
   const { t } = useTranslation();
   const errorText = useErrorText();
   const { activeConn, activeBucket } = useApp();
-  const applyState = useTransferStore((s) => s.applyState);
+  // Deliberately NOT subscribing to `applyState`: the enqueue commands return
+  // the task's *Queued* snapshot, but the engine already emits that (and the
+  // subsequent Running) as `transfer://state` events, which `useTransferEvents`
+  // applies in order. Re-applying the stale returned snapshot here would race
+  // the Running event and regress the row to "queued" for the whole transfer
+  // (a Running->Running non-transition emits no correcting event), which hides
+  // the pause control. The event stream is the single source of truth.
   const setPanelOpen = useTransferStore((s) => s.setPanelOpen);
 
   const [error, setError] = useState<AppError | null>(null);
@@ -83,15 +89,14 @@ export function useStartDownloads(): UseStartDownloadsResult {
           const defaultPath = await join(await downloadDir(), entry.name);
           const localPath = await save({ defaultPath });
           if (!localPath) return; // user cancelled the save dialog
-          const task = await enqueueDownload(activeConn, activeBucket, entry.key, localPath);
-          applyState(task);
+          await enqueueDownload(activeConn, activeBucket, entry.key, localPath);
           setPanelOpen(true);
         } catch (reason) {
           setError(toAppError(reason));
         }
       })();
     },
-    [activeConn, activeBucket, applyState, setPanelOpen],
+    [activeConn, activeBucket, setPanelOpen],
   );
 
   const startFolderDownload = useCallback(
@@ -106,15 +111,15 @@ export function useStartDownloads(): UseStartDownloadsResult {
             entry.key,
             localDir,
           );
-          // A folder can expand into many objects -- push every returned task.
-          for (const task of tasks) applyState(task);
+          // A folder can expand into many objects; each appears via its own
+          // transfer://state event (see the note on the removed applyState).
           if (tasks.length > 0) setPanelOpen(true);
         } catch (reason) {
           setError(toAppError(reason));
         }
       })();
     },
-    [activeConn, activeBucket, applyState, setPanelOpen],
+    [activeConn, activeBucket, setPanelOpen],
   );
 
   const startBatchDownload = useCallback(
@@ -130,8 +135,7 @@ export function useStartDownloads(): UseStartDownloadsResult {
           // as the per-folder path -- the panel just doesn't pop on error).
           for (const item of items) {
             const localPath = await join(localDir, item.name);
-            const task = await enqueueDownload(activeConn, activeBucket, item.key, localPath);
-            applyState(task);
+            await enqueueDownload(activeConn, activeBucket, item.key, localPath);
           }
           setPanelOpen(true);
         } catch (reason) {
@@ -139,7 +143,7 @@ export function useStartDownloads(): UseStartDownloadsResult {
         }
       })();
     },
-    [activeConn, activeBucket, applyState, setPanelOpen],
+    [activeConn, activeBucket, setPanelOpen],
   );
 
   // Plain `createElement`, not JSX -- this is a `.ts` file (same reasoning as

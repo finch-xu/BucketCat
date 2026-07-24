@@ -102,7 +102,12 @@ export interface UseStartUploadsResult {
 export function useStartUploads(): UseStartUploadsResult {
   const { activeConn, activeBucket, path } = useApp();
   const queryClient = useQueryClient();
-  const applyState = useTransferStore((s) => s.applyState);
+  // Not subscribing to `applyState`: the enqueue command returns each task's
+  // *Queued* snapshot, but those (and the subsequent Running) already arrive as
+  // `transfer://state` events via `useTransferEvents`. Re-applying the stale
+  // returned snapshot here races the Running event and pins the row at "queued"
+  // for the whole upload (a Running->Running non-transition emits no correcting
+  // event), hiding the pause control. Events are the single source of truth.
   const setPanelOpen = useTransferStore((s) => s.setPanelOpen);
 
   const prefix = pathToPrefix(path);
@@ -150,7 +155,6 @@ export function useStartUploads(): UseStartUploadsResult {
       void (async () => {
         try {
           const tasks = await enqueueUploads(activeConn, activeBucket, targetPrefix, paths);
-          for (const task of tasks) applyState(task);
           // The backend silently skips anything that isn't a readable file
           // (a dropped *directory* is the common case), so a short result is
           // the only evidence the user has that part of the gesture went
@@ -170,7 +174,7 @@ export function useStartUploads(): UseStartUploadsResult {
         }
       })();
     },
-    [activeConn, activeBucket, applyState, setPanelOpen, reportError],
+    [activeConn, activeBucket, setPanelOpen, reportError],
   );
 
   const startUploads = useCallback(
