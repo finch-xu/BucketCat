@@ -558,4 +558,36 @@ mod tests {
         assert_eq!(target, PathBuf::from("/D/other/a.txt"));
         assert!(target.starts_with("/D"));
     }
+
+    #[test]
+    fn local_target_of_a_bare_absolute_key_stays_contained() {
+        // The brief's literal example: a key that is itself an absolute path.
+        // `strip_prefix` fails, the whole key becomes the relative part, and
+        // the RootDir component is dropped -- so it lands under `local_dir`,
+        // never at the real filesystem root.
+        let target = local_target("docs/", "/etc/passwd", Path::new("/D"))
+            .expect("normal components survive");
+        assert_eq!(target, PathBuf::from("/D/etc/passwd"));
+        assert!(target.starts_with("/D"));
+        // The only RootDir is `local_dir`'s own leading `/`; the key's
+        // absolute component was dropped, so no `..` and no jump to the real
+        // root survived.
+        assert!(target.components().all(|c| c != Component::ParentDir));
+    }
+
+    #[test]
+    fn local_target_of_a_backslash_key_is_contained_on_every_platform() {
+        // Object keys use `/`, but a crafted key could carry `\`. On Windows
+        // `\` is also a separator, so `..\..\etc` decomposes into ParentDir/
+        // ParentDir/Normal and is stripped like the `/` case; on Unix `\` is
+        // an ordinary filename character, so it stays one opaque Normal
+        // component. Either way the result is contained under `local_dir` and
+        // carries no `..` component -- this test pins that on whichever
+        // platform runs it (and verifies the real separator semantics on a
+        // Windows CI).
+        let target = local_target("docs/", "docs/..\\..\\etc", Path::new("/D"))
+            .expect("at least one normal component survives");
+        assert!(target.starts_with("/D"));
+        assert!(target.components().all(|c| c != Component::ParentDir));
+    }
 }
