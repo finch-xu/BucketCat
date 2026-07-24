@@ -38,7 +38,9 @@
   },
   "details": {
     "title": "Details",
-    "imagePreview": "Image preview",
+    "previewLoading": "Loading preview…",
+    "previewUnavailable": "Preview unavailable",
+    "previewTooLarge": "File too large to preview",
     "download": "Download",
     "copyLink": "Copy link",
     "share": "Share",

@@ -38,7 +38,9 @@
   },
   "details": {
     "title": "详情",
-    "imagePreview": "图片预览",
+    "previewLoading": "预览加载中…",
+    "previewUnavailable": "预览不可用",
+    "previewTooLarge": "文件过大，不预览",
     "download": "下载",
     "copyLink": "复制链接",
     "share": "分享",

@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Download, Link2, Share2, Trash2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { fileMeta, isImageExt } from "@/lib/file-meta";
+import { fileMeta } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
+import { previewKind, type PreviewKind } from "@/lib/preview";
 import { headObject, presignGet, type AppError, type ObjectHead } from "@/lib/api";
 import { useBrowse } from "@/hooks/use-browse";
 import { useErrorText } from "@/hooks/use-error-text";
@@ -19,6 +20,25 @@ const EXPIRY_OPTIONS: { secs: number; labelKey: string }[] = [
   { secs: 86400, labelKey: "details.expiry24h" },
   { secs: 604800, labelKey: "details.expiry7d" },
 ];
+
+/** Fixed expiry for inline preview URLs -- deliberately independent of the
+ * Share dropdown's `expirySecs` state. The preview never leaves this screen,
+ * so 1 hour is plenty and never varies with what the user picked for Share. */
+const PREVIEW_EXPIRY_SECS = 3600;
+
+/** In-flight/last-resolved state for the inline preview (image/video/audio/
+ * text). Keyed by the entry it belongs to so a stale render (before the
+ * effect below has caught up with a just-changed `entry`) can tell its own
+ * `url`/`text` apart from a different entry's leftover state -- see the
+ * `preview.key === entry.key` check at the call site. */
+type PreviewState = {
+  key: string;
+  phase: "loading" | "ready" | "error";
+  url: string | null;
+  text: string | null;
+};
+
+const EMPTY_PREVIEW: PreviewState = { key: "", phase: "loading", url: null, text: null };
 
 /** Shows the single selected file's real metadata. Download and delete are
  * wired (download queues a transfer via `useStartDownloads`, delete via the
@@ -37,6 +57,14 @@ export function DetailsPanel() {
       ? entries.find((e) => e.key === selectedKeys[0] && !e.is_prefix)
       : undefined;
 
+  // Pure classification, safe to compute even when `entry` is undefined --
+  // drives both the preview-fetch effect below and the render dispatch
+  // after the early return.
+  // `entry.size` is `number | null` in the type (null for prefixes), but the
+  // `find` above already filters those out -- the `?? 0` is just to satisfy
+  // the type, not a real fallback.
+  const kind: PreviewKind = entry ? previewKind(entry.name, entry.size ?? 0) : "none";
+
   // Every hook below must run on every render (entry can be undefined) so
   // the early `return null` below it never changes the hook order.
   const [shareOpen, setShareOpen] = useState(false);
@@ -44,6 +72,7 @@ export function DetailsPanel() {
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const copyTimeoutRef = useRef<number | null>(null);
+  const [preview, setPreview] = useState<PreviewState>(EMPTY_PREVIEW);
 
   // Tracks the key of the entry currently on screen so an in-flight presign
   // can tell, once it resolves, whether the user has since switched to a
@@ -89,6 +118,46 @@ export function DetailsPanel() {
     };
   }, []);
 
+  // Auto-fetches the inline preview for previewable kinds. Presigns a GET
+  // URL (fixed 1h expiry, independent of the Share dropdown) and, for text,
+  // follows up with a `fetch` of its content. Neither the URL nor the text
+  // is ever logged or persisted -- both live only in `preview` state and are
+  // discarded the moment `entry` changes or this component unmounts.
+  //
+  // Guards against the same race the Share flow guards against: this effect
+  // captures `key` at the time it starts, and every `.then`/`.catch` checks
+  // `currentKeyRef.current === key` before calling `setPreview` -- so a slow
+  // presign/fetch for entry A that resolves after the user has already
+  // switched to entry B is dropped instead of landing on B's screen.
+  useEffect(() => {
+    if (!entry || kind === "none") return;
+    const key = entry.key;
+    setPreview({ key, phase: "loading", url: null, text: null });
+
+    presignGet(activeConn, activeBucket, key, PREVIEW_EXPIRY_SECS)
+      .then((url) => {
+        if (currentKeyRef.current !== key) return;
+        if (kind !== "text") {
+          setPreview({ key, phase: "ready", url, text: null });
+          return;
+        }
+        return fetch(url)
+          .then((res) => (res.ok ? res.text() : Promise.reject(new Error("preview fetch failed"))))
+          .then((text) => {
+            if (currentKeyRef.current !== key) return;
+            setPreview({ key, phase: "ready", url: null, text });
+          });
+      })
+      .catch(() => {
+        if (currentKeyRef.current !== key) return;
+        setPreview({ key, phase: "error", url: null, text: null });
+      });
+    // `kind` is derived from `entry` and only changes together with it, so
+    // it doesn't need its own re-run trigger; `activeConn`/`activeBucket`
+    // are stable for the lifetime of a given entry selection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entry?.key, kind]);
+
   if (!entry) return null;
 
   const ext = extFromName(entry.name);
@@ -111,6 +180,68 @@ export function DetailsPanel() {
       });
   };
 
+  // `preview` can briefly still hold a previous entry's (or a stale
+  // in-flight) result the render right after `entry` changes, before the
+  // effect above has caught up -- checking the key here (in addition to the
+  // effect's own `currentKeyRef` guard) means that render never shows it.
+  const previewData = preview.key === entry.key ? preview : null;
+  const handlePreviewMediaError = () => {
+    setPreview((p) => (p.key === entry.key ? { ...p, phase: "error" } : p));
+  };
+
+  let previewBody: ReactNode;
+  if (kind === "none") {
+    previewBody = <BigIcon className="size-[46px]" style={{ color: meta.color }} />;
+  } else if (!previewData || previewData.phase === "loading") {
+    previewBody = (
+      <span className="rounded-[7px] border border-border bg-background px-[11px] py-1.5 font-mono text-[11px] text-muted-foreground">
+        {t("details.previewLoading")}
+      </span>
+    );
+  } else if (previewData.phase === "error") {
+    previewBody = (
+      <div className="flex flex-col items-center gap-1.5">
+        <BigIcon className="size-[46px]" style={{ color: meta.color }} />
+        <span className="text-[10.5px] text-muted-foreground">{t("details.previewUnavailable")}</span>
+      </div>
+    );
+  } else if (kind === "image") {
+    previewBody = (
+      <img
+        src={previewData.url ?? undefined}
+        loading="lazy"
+        alt={entry.name}
+        onError={handlePreviewMediaError}
+        className="max-h-full max-w-full object-contain"
+      />
+    );
+  } else if (kind === "video") {
+    previewBody = (
+      <video
+        controls
+        preload="metadata"
+        src={previewData.url ?? undefined}
+        onError={handlePreviewMediaError}
+        className="max-h-full max-w-full"
+      />
+    );
+  } else if (kind === "audio") {
+    previewBody = (
+      <audio
+        controls
+        src={previewData.url ?? undefined}
+        onError={handlePreviewMediaError}
+        className="w-full px-3"
+      />
+    );
+  } else {
+    previewBody = (
+      <pre className="h-full w-full overflow-auto bg-background p-2 font-mono text-[11px] whitespace-pre-wrap break-all text-fg2">
+        {previewData.text}
+      </pre>
+    );
+  }
+
   return (
     <aside className="flex w-[300px] shrink-0 flex-col border-l border-border bg-background">
       <div className="flex h-[46px] shrink-0 items-center justify-between border-b border-border pr-3 pl-4">
@@ -125,13 +256,7 @@ export function DetailsPanel() {
       </div>
       <div className="flex-1 overflow-y-auto p-4">
         <div className="flex h-[148px] w-full items-center justify-center overflow-hidden rounded-xl border border-border bg-[repeating-linear-gradient(45deg,var(--panel),var(--panel)_11px,var(--border2)_11px,var(--border2)_22px)]">
-          {isImageExt(ext) ? (
-            <span className="rounded-[7px] border border-border bg-background px-[11px] py-1.5 font-mono text-[11px] text-muted-foreground">
-              {t("details.imagePreview")}
-            </span>
-          ) : (
-            <BigIcon className="size-[46px]" style={{ color: meta.color }} />
-          )}
+          {previewBody}
         </div>
         <div className="mt-3.5 text-[15px] leading-[1.35] font-semibold break-all">{entry.name}</div>
         <div className="mt-[3px] text-xs text-muted-foreground">{t(meta.labelKey)}</div>
