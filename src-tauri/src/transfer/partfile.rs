@@ -132,14 +132,19 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes_at_offsets_assemble_the_whole_file() {
         // The whole point of positioned writes: four tasks writing different
-        // 4-byte regions of the same file, concurrently, must not corrupt each
-        // other (a shared seek cursor would).
+        // regions of the same file, concurrently on real OS threads, must not
+        // corrupt each other (a shared seek cursor would interleave their
+        // writes). Each region is large enough (64 KiB) that, run on a
+        // multi-thread runtime, the four writes genuinely overlap in
+        // wall-clock time instead of completing one-at-a-time -- which is
+        // what actually exercises the positioned-write guarantee.
+        const CHUNK: usize = 64 * 1024;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("out.bin");
-        let pf = std::sync::Arc::new(PartFile::create(&target, 16).unwrap());
+        let pf = std::sync::Arc::new(PartFile::create(&target, (CHUNK * 4) as u64).unwrap());
         assert!(target.with_extension("bin.bcpart").exists());
         assert!(!target.exists(), "target must not appear until finish");
 
@@ -148,7 +153,7 @@ mod tests {
             let pf = std::sync::Arc::clone(&pf);
             set.spawn(async move {
                 let byte = b'a' + i as u8;
-                pf.write_at(i * 4, &[byte; 4]).unwrap();
+                pf.write_at(i * CHUNK as u64, &vec![byte; CHUNK]).unwrap();
             });
         }
         while set.join_next().await.is_some() {}
@@ -157,7 +162,12 @@ mod tests {
         assert!(target.exists(), "finish must rename into place");
         assert!(!target.with_extension("bin.bcpart").exists(), "bcpart gone");
         let body = std::fs::read(&target).unwrap();
-        assert_eq!(&body, b"aaaabbbbccccdddd");
+
+        let mut expected = Vec::with_capacity(CHUNK * 4);
+        for i in 0..4u64 {
+            expected.extend(std::iter::repeat_n(b'a' + i as u8, CHUNK));
+        }
+        assert_eq!(body, expected);
     }
 
     #[test]
