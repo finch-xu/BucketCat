@@ -124,42 +124,18 @@ pub fn run() {
 
             // Startup restore (M4c Task 6): rebuild each unfinished transfer as
             // a `Paused` row, offline, and discard any whose connection is gone.
+            // Delegated to `transfer::restore_all` -- the single shared entry
+            // point the e2e's cross-restart tests also route through, so the
+            // two can never diverge on the safety-critical error path (a read
+            // failure leaves every checkpoint untouched rather than mistaking
+            // them all for orphans and deleting them).
+            //
             // Same `block_on` reason as `spawn_aggregator` above: `setup` runs
-            // before Tauri's runtime is entered, and `restore_paused` awaits the
-            // task lock. A read failure leaves every checkpoint untouched rather
-            // than mistaking them all for orphans and deleting them.
+            // before Tauri's runtime is entered, and the restore awaits the
+            // task lock. Gated by `resume_enabled`, exactly as before.
             if resume_enabled.load(Ordering::Relaxed) {
                 tauri::async_runtime::block_on(async {
-                    match hub.connection_ids().await {
-                        Ok(ids) => {
-                            let known: std::collections::HashSet<String> =
-                                ids.into_iter().collect();
-                            for (id, cp) in transfer::checkpoint::scan(&checkpoint_dir) {
-                                if !known.contains(&cp.connection_id) {
-                                    // Orphan: its connection was deleted. Drop the
-                                    // checkpoint, and a download's staging file too
-                                    // -- nobody will ever resume it.
-                                    if cp.direction == transfer::Direction::Download {
-                                        let _ = std::fs::remove_file(
-                                            transfer::partfile::bcpart_path(std::path::Path::new(
-                                                &cp.local_path,
-                                            )),
-                                        );
-                                    }
-                                    transfer::checkpoint::remove(&checkpoint_dir, &id);
-                                    tracing::warn!(task = %id, conn = %cp.connection_id, "orphan checkpoint discarded");
-                                    continue;
-                                }
-                                engine.restore_paused(id, cp).await;
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                "cannot read connections for checkpoint restore; leaving \
-                                 checkpoints in place: {err}"
-                            );
-                        }
-                    }
+                    transfer::restore_all(&engine, &hub, &checkpoint_dir).await;
                 });
             }
 

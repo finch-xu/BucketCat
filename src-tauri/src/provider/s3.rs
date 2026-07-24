@@ -843,11 +843,18 @@ impl Provider for S3Provider {
                     size: p.size().unwrap_or_default().max(0) as u64,
                 });
             }
-            if resp.is_truncated().unwrap_or(false) {
-                marker = resp.next_part_number_marker().map(|s| s.to_string());
-            } else {
+            if !resp.is_truncated().unwrap_or(false) {
                 break;
             }
+            // A truncated response is contractually obliged to carry a next
+            // marker. Guard against an SDK that ever violates that (truncated
+            // == true, marker == None): without advancing `marker`, the next
+            // request would re-list from the start and loop forever. Continue
+            // only when both truncated AND a next marker are present.
+            let Some(next) = resp.next_part_number_marker() else {
+                break;
+            };
+            marker = Some(next.to_string());
         }
         Ok(out)
     }

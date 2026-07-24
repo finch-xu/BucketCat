@@ -83,7 +83,7 @@ use bucketcat_lib::provider::{from_connection, Provider, ProviderHub, S3Provider
 use bucketcat_lib::store::{Connection, SecureStore};
 use bucketcat_lib::transfer::part::MULTIPART_THRESHOLD;
 use bucketcat_lib::transfer::{
-    bcpart_path, checkpoint, plan_upload, spawn_aggregator, Direction, DispatchRunner,
+    bcpart_path, checkpoint, plan_upload, restore_all, spawn_aggregator, Direction, DispatchRunner,
     DownloadRunner, EngineConfig, EnqueueSpec, MultipartState, ProgressPayload, ProgressSink,
     ResumeState, TransferEngine, TransferSink, TransferStatus, TransferTaskDto, UploadPlan,
     UploadRunner,
@@ -2846,30 +2846,16 @@ async fn folder_download_reconstructs_the_tree() {
 // instant-after-enqueue no-op a faked test would settle for. All `#[ignore]`d.
 // ===========================================================================
 
-/// The simulated-restart startup scan: a faithful, self-contained replica of
-/// the loop `lib.rs`'s `setup` runs (it cannot be called directly -- it is an
-/// inline block behind a Tauri `App`), so this exercises the exact policy the
-/// shipped app applies on launch. For every checkpoint in `cp_dir`: if its
-/// connection is gone from the hub it is an orphan -- drop the checkpoint (and,
-/// for a download, the staging `.bcpart` nobody will ever resume); otherwise
-/// rebuild it as a `Paused` row via the engine's real `restore_paused`.
+/// The simulated-restart startup scan. Delegates to the exact same
+/// `bucketcat_lib::transfer::restore_all` that `lib.rs`'s `setup` calls on
+/// launch (the `setup` block itself cannot be invoked directly -- it lives
+/// behind a Tauri `App`), so these cross-restart tests exercise the shipped
+/// policy rather than a hand-rolled replica that could drift from it. In
+/// particular the safety-critical `connection_ids() == Err` branch (leave
+/// every checkpoint in place, never mass-discard) is now shared, not
+/// re-implemented here with an `unwrap_or_default()` that inverted it.
 async fn restore_from_checkpoints(engine: &TransferEngine, hub: &ProviderHub, cp_dir: &Path) {
-    let known: std::collections::HashSet<String> = hub
-        .connection_ids()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    for (id, cp) in checkpoint::scan(cp_dir) {
-        if !known.contains(&cp.connection_id) {
-            if cp.direction == Direction::Download {
-                let _ = std::fs::remove_file(bcpart_path(Path::new(&cp.local_path)));
-            }
-            checkpoint::remove(cp_dir, &id);
-        } else {
-            engine.restore_paused(id, cp).await;
-        }
-    }
+    restore_all(engine, hub, cp_dir).await;
 }
 
 /// Test 1: a large multipart upload paused mid-flight survives an engine drop

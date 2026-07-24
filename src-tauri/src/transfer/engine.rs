@@ -47,8 +47,8 @@
 //! currently promise, at the cost of a second coordination point in the one
 //! part of the engine whose invariants are hardest to keep.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,6 +66,7 @@ use crate::transfer::model::{
     next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto,
 };
 use crate::transfer::part::{plan_upload, PartSpec, UploadPlan};
+use crate::transfer::partfile::bcpart_path;
 use crate::transfer::progress::ProgressMsg;
 
 /// Concurrency limits (design §5). Runtime hot-update belongs to the settings
@@ -1037,6 +1038,98 @@ impl TransferEngine {
     pub async fn clear_finished(&self) {
         let mut tasks = self.inner.tasks.lock().await;
         tasks.retain(|_, r| !r.dto.status.is_terminal());
+    }
+}
+
+/// One decision [`plan_restore`] reached for a single scanned checkpoint.
+///
+/// Split out from the side effects on purpose: the *decision* (restore vs.
+/// discard, or -- when the connection store is unreadable -- do nothing at all)
+/// is the safety-critical part and is unit-tested against the pure
+/// [`plan_restore`], while [`restore_all`] is the thin layer that maps each
+/// action to its I/O.
+#[derive(Debug)]
+pub enum RestoreAction {
+    /// The checkpoint's connection still exists: rebuild it as a `Paused` row.
+    Restore(String, Checkpoint),
+    /// The checkpoint's connection is gone: drop the checkpoint (and, for a
+    /// download, its staging `.bcpart`) -- nobody will ever resume it.
+    DiscardOrphan(String, Checkpoint),
+}
+
+/// Pure restore policy: decides what to do with each scanned checkpoint, given
+/// the set of connection ids currently known to the hub.
+///
+/// This is the safety-critical branch of startup restore, factored out so it
+/// can be tested without a live Tauri app or a real hub:
+///
+/// - **`known == Err`** (the connection store could not be read) yields an
+///   **empty** plan -- restore *nothing*, discard *nothing*, leave every
+///   checkpoint on disk. A read error must never be mistaken for "no
+///   connections exist", which would discard/delete every checkpoint: the
+///   exact opposite of the intended safety property.
+/// - **`known == Ok(set)`**: a checkpoint whose `connection_id` is in `set` is
+///   a [`RestoreAction::Restore`]; one whose connection is absent is a
+///   [`RestoreAction::DiscardOrphan`].
+pub fn plan_restore(
+    scanned: Vec<(String, Checkpoint)>,
+    known: &AppResult<HashSet<String>>,
+) -> Vec<RestoreAction> {
+    let Ok(known) = known else {
+        // Unreadable store: leave everything untouched. Never treat this as
+        // "all orphans" -- that would delete every checkpoint on a transient
+        // read failure.
+        return Vec::new();
+    };
+    scanned
+        .into_iter()
+        .map(|(id, cp)| {
+            if known.contains(&cp.connection_id) {
+                RestoreAction::Restore(id, cp)
+            } else {
+                RestoreAction::DiscardOrphan(id, cp)
+            }
+        })
+        .collect()
+}
+
+/// Startup restore (M4c Task 6): rebuild each unfinished transfer as a `Paused`
+/// row, offline, and discard any whose connection is gone.
+///
+/// The single shared entry point for both `lib.rs`'s `setup` and the e2e's
+/// cross-restart tests, so the two can never diverge on the safety-critical
+/// error path. The decision is delegated to the pure [`plan_restore`]; this
+/// function only performs the side effects the plan calls for:
+///
+/// - a read failure from [`ProviderHub::connection_ids`] is logged (never a
+///   credential -- only the error) and yields an empty plan, so **every**
+///   checkpoint is left in place rather than mistaken for an orphan;
+/// - an orphan's checkpoint (and, for a download, its `.bcpart`) is removed;
+/// - a known checkpoint is rebuilt via [`TransferEngine::restore_paused`].
+///
+/// Best-effort throughout, and holds no lock across an `.await`.
+pub async fn restore_all(engine: &TransferEngine, hub: &ProviderHub, dir: &Path) {
+    let known = hub
+        .connection_ids()
+        .await
+        .map(|ids| ids.into_iter().collect::<HashSet<String>>());
+    if let Err(err) = &known {
+        tracing::warn!(
+            "cannot read connections for checkpoint restore; leaving checkpoints in place: {err}"
+        );
+    }
+    for action in plan_restore(checkpoint::scan(dir), &known) {
+        match action {
+            RestoreAction::Restore(id, cp) => engine.restore_paused(id, cp).await,
+            RestoreAction::DiscardOrphan(id, cp) => {
+                if cp.direction == Direction::Download {
+                    // Drop the staging file too -- nobody will ever resume it.
+                    let _ = std::fs::remove_file(bcpart_path(Path::new(&cp.local_path)));
+                }
+                checkpoint::remove(dir, &id);
+                tracing::warn!(task = %id, conn = %cp.connection_id, "orphan checkpoint discarded");
+            }
+        }
     }
 }
 
@@ -2342,6 +2435,106 @@ mod tests {
             h.task("t-restored").await.status,
             TransferStatus::Paused,
             "with no driver the task can only stay Paused"
+        );
+    }
+
+    // --- plan_restore: the pure startup-restore decision -------------------
+    //
+    // The safety-critical branch of startup restore, tested without a live
+    // Tauri app or hub. `restore_all` maps this plan to its side effects
+    // (restore_paused / remove files), but the *decision* is here.
+
+    /// A minimal upload checkpoint tagged with `conn` as its connection id --
+    /// enough for `plan_restore`, which only ever reads `connection_id`.
+    fn cp_for(conn: &str) -> Checkpoint {
+        Checkpoint {
+            direction: Direction::Upload,
+            connection_id: conn.to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            local_path: "/tmp/k".to_string(),
+            file_name: "k".to_string(),
+            total: 100,
+            resume: ResumeState::Upload(MultipartState {
+                upload_id: "u1".to_string(),
+                completed: vec![],
+                source_size: 100,
+                source_mtime: 0,
+            }),
+        }
+    }
+
+    /// THE regression guard for the safety property: when the connection store
+    /// cannot be read (`known == Err`), the plan is EMPTY -- nothing is
+    /// restored and, crucially, nothing is discarded. Treating an unreadable
+    /// store as "no connections exist" would discard/delete every checkpoint
+    /// on a transient read failure, the exact catastrophic inversion this
+    /// factoring exists to prevent.
+    #[test]
+    fn plan_restore_on_read_error_leaves_everything() {
+        let scanned = vec![
+            ("t1".to_string(), cp_for("c1")),
+            ("t2".to_string(), cp_for("cX")),
+        ];
+        let known: AppResult<HashSet<String>> = Err(AppError::Internal {
+            message: "store unreadable".to_string(),
+        });
+        let plan = plan_restore(scanned, &known);
+        assert!(
+            plan.is_empty(),
+            "a read error must produce an empty plan: restore nothing, discard nothing, got {plan:?}"
+        );
+    }
+
+    /// With a readable store, a checkpoint whose connection still exists is
+    /// restored, and one whose connection is gone is discarded as an orphan.
+    #[test]
+    fn plan_restore_restores_known_and_discards_orphan() {
+        let scanned = vec![
+            ("t-known".to_string(), cp_for("c1")),
+            ("t-orphan".to_string(), cp_for("cX")),
+        ];
+        let known: AppResult<HashSet<String>> = Ok(HashSet::from(["c1".to_string()]));
+        let plan = plan_restore(scanned, &known);
+        assert_eq!(plan.len(), 2, "both scanned checkpoints must be planned");
+
+        match &plan[0] {
+            RestoreAction::Restore(id, cp) => {
+                assert_eq!(id, "t-known");
+                assert_eq!(cp.connection_id, "c1");
+            }
+            other => panic!("a checkpoint for a known connection must be Restore, got {other:?}"),
+        }
+        match &plan[1] {
+            RestoreAction::DiscardOrphan(id, cp) => {
+                assert_eq!(id, "t-orphan");
+                assert_eq!(cp.connection_id, "cX");
+            }
+            other => {
+                panic!(
+                    "a checkpoint for an unknown connection must be DiscardOrphan, got {other:?}"
+                )
+            }
+        }
+    }
+
+    /// An empty known-set (every connection was deleted, but the store read
+    /// SUCCEEDED) is distinct from a read error: here every checkpoint is a
+    /// genuine orphan and must be discarded -- proving `plan_restore` keys the
+    /// "leave everything" behaviour on `Err`, not on emptiness.
+    #[test]
+    fn plan_restore_with_empty_known_set_discards_all_as_orphans() {
+        let scanned = vec![
+            ("t1".to_string(), cp_for("c1")),
+            ("t2".to_string(), cp_for("c2")),
+        ];
+        let known: AppResult<HashSet<String>> = Ok(HashSet::new());
+        let plan = plan_restore(scanned, &known);
+        assert_eq!(plan.len(), 2);
+        assert!(
+            plan.iter()
+                .all(|a| matches!(a, RestoreAction::DiscardOrphan(_, _))),
+            "a successful read of an empty store makes every checkpoint an orphan: {plan:?}"
         );
     }
 }

@@ -171,7 +171,12 @@ export function SettingsModal() {
             checked={resumeEnabled}
             onChange={(v) => {
               setResumeEnabledState(v);
-              void setResumeEnabled(v);
+              setResumeEnabled(v).catch((err) => {
+                // The persist was rejected: revert the optimistic local state so
+                // the switch never shows a value the backend/file did not take.
+                setResumeEnabledState(!v);
+                console.error("Failed to persist resume-transfers setting", err);
+              });
             }}
           />
         </Row>
