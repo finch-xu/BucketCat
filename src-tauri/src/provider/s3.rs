@@ -128,6 +128,33 @@ pub fn s3_compat_endpoint(provider: &str, endpoint: &str) -> String {
     result
 }
 
+/// Prefixes a schemeless endpoint with `https://`.
+///
+/// `aws_sdk_s3::Config::endpoint_url` requires an absolute URI (a scheme);
+/// bare hostnames -- which is what a user types, and what most of
+/// `src/lib/providers.ts`'s wizard defaults prefill -- are rejected outright,
+/// which otherwise surfaces to the user as `AppError::Unreachable`. Defaults
+/// to `https://` rather than `http://`: every cloud endpoint this app
+/// targets is HTTPS, and the one plaintext backend (a local MinIO dev
+/// instance) already spells out `http://` explicitly.
+///
+/// An endpoint that already carries *any* scheme (`https://`, `http://`, or
+/// otherwise) is returned unchanged -- in particular, `http://` is never
+/// silently upgraded to `https://`, since the local MinIO dev endpoint and
+/// the live e2e suite depend on plaintext working as configured. Input is
+/// trimmed first (`from_connection` already rejects an empty/blank endpoint
+/// before this is ever reached; trimming here is normalization only, not
+/// validation). An empty input (only reachable by calling this fn directly,
+/// e.g. from a test) returns the bare scheme `"https://"`.
+pub fn with_scheme(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
 /// A constructed S3 (or S3-compatible) admin-plane client for one saved
 /// [`Connection`].
 #[derive(Debug)]
@@ -160,12 +187,16 @@ pub struct S3Provider {
 ///   rejects path-style requests outright -- while MinIO, R2 and other
 ///   self-hosted backends still need path-style addressing (no wildcard DNS
 ///   for bucket subdomains).
-/// - The endpoint handed to the SDK is [`s3_compat_endpoint`]'s output, not
-///   `conn.endpoint` directly: Aliyun's *native* OSS endpoint (what the
-///   frontend prefills, and what later M5 tasks' native ListBuckets call
-///   needs) is a different host from its *S3-compatible* endpoint (needs an
-///   `s3.` prefix), and only the latter accepts S3 API calls. `conn.endpoint`
-///   itself is never mutated -- only this local conversion.
+/// - The endpoint handed to the SDK is [`s3_compat_endpoint`]'s output, run
+///   through [`with_scheme`], not `conn.endpoint` directly: Aliyun's
+///   *native* OSS endpoint (what the frontend prefills, and what later M5
+///   tasks' native ListBuckets call needs) is a different host from its
+///   *S3-compatible* endpoint (needs an `s3.` prefix), and only the latter
+///   accepts S3 API calls; separately, `aws_sdk_s3::Config::endpoint_url`
+///   requires an absolute URI, so [`with_scheme`] adds `https://` to
+///   whichever of the schemeless wizard defaults (`s3`/`oss`/`r2`/`cos`/`b2`
+///   in `providers.ts`) the user saved verbatim. `conn.endpoint` itself is
+///   never mutated -- only these local conversions.
 /// - For every non-AWS endpoint (this already includes OSS, since
 ///   [`is_aws_endpoint`] is false for `*.aliyuncs.com`), `request_checksum_calculation`
 ///   and `response_checksum_validation` are both explicitly set to
@@ -212,7 +243,10 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
 
     let mut config_builder = aws_sdk_s3::Config::builder()
         .behavior_version_latest()
-        .endpoint_url(s3_compat_endpoint(&conn.provider, &conn.endpoint))
+        .endpoint_url(with_scheme(&s3_compat_endpoint(
+            &conn.provider,
+            &conn.endpoint,
+        )))
         .region(Region::new(region))
         .credentials_provider(credentials)
         .force_path_style(uses_path_style(&conn.provider, &conn.endpoint));
@@ -1231,6 +1265,52 @@ mod tests {
         );
     }
 
+    // --- with_scheme (pure) -------------------------------------------------
+
+    #[test]
+    fn with_scheme_adds_https_when_missing() {
+        assert_eq!(with_scheme("s3.amazonaws.com"), "https://s3.amazonaws.com");
+        assert_eq!(
+            with_scheme("oss-cn-hangzhou.aliyuncs.com"),
+            "https://oss-cn-hangzhou.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn with_scheme_leaves_an_existing_scheme_alone() {
+        assert_eq!(
+            with_scheme("https://s3.amazonaws.com"),
+            "https://s3.amazonaws.com"
+        );
+        // Plaintext must survive -- the local MinIO dev endpoint (and the
+        // live e2e suite) depend on it never being silently upgraded.
+        assert_eq!(
+            with_scheme("http://127.0.0.1:9000"),
+            "http://127.0.0.1:9000"
+        );
+    }
+
+    #[test]
+    fn with_scheme_trims_surrounding_whitespace() {
+        assert_eq!(
+            with_scheme("  s3.amazonaws.com  "),
+            "https://s3.amazonaws.com"
+        );
+        assert_eq!(
+            with_scheme("  https://s3.amazonaws.com  "),
+            "https://s3.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn with_scheme_of_empty_string_returns_bare_https_scheme() {
+        // `from_connection` already rejects an empty/blank endpoint before
+        // this is ever called in practice; pinned here only to document the
+        // chosen (harmless) behavior of this function in isolation.
+        assert_eq!(with_scheme(""), "https://");
+        assert_eq!(with_scheme("   "), "https://");
+    }
+
     // --- from_connection ---------------------------------------------------
 
     #[test]
@@ -1298,33 +1378,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oss_connection_without_a_scheme_is_a_known_pre_existing_gap() {
-        // PINS A KNOWN, PRE-EXISTING, OUT-OF-SCOPE GAP (not introduced or
-        // worsened by this task): `aws_sdk_s3::Config::endpoint_url` requires
-        // an absolute URI (a scheme), and neither `s3_compat_endpoint` (per
-        // this task's exact spec) nor anything else in `from_connection`
-        // adds one. `src/lib/providers.ts`'s OSS default endpoint
-        // ("oss-cn-hangzhou.aliyuncs.com") has no scheme, and the
-        // add-connection wizard prefills that value verbatim into the form
-        // -- so an OSS connection saved without manually adding "https://"
-        // to the endpoint field will fail here.
-        //
-        // This is NOT OSS-specific: the same failure reproduces for
-        // `aws_connection()`'s bare AWS default ("s3.amazonaws.com", also
-        // schemeless in `providers.ts`), so it predates and is orthogonal
-        // to this task's 3 required fixes. Left unfixed here per the brief's
-        // exact `s3_compat_endpoint` contract (no scheme injection) and
-        // "don't touch other providers' behavior" constraint -- flagged in
-        // the task report as a follow-up.
+    async fn oss_connection_without_a_scheme_gets_https() {
+        // Companion to `oss_connection_presigned_url_is_virtual_hosted_on_the_s3_compat_host`
+        // above, but exercising the actual schemeless default the
+        // add-connection wizard prefills from `providers.ts`
+        // ("oss-cn-hangzhou.aliyuncs.com", no scheme). This used to fail --
+        // `aws_sdk_s3::Config::endpoint_url` requires an absolute URI and
+        // rejected the bare hostname with `AppError::Unreachable` -- until
+        // `from_connection` started running the endpoint through
+        // `with_scheme`.
         let conn = oss_connection();
         assert_eq!(conn.endpoint, "oss-cn-hangzhou.aliyuncs.com");
 
         let provider = from_connection(&conn).unwrap();
-        let result = provider
+        let url = provider
             .presign_get("my-bucket", "docs/readme.md", 60)
-            .await;
+            .await
+            .expect("schemeless endpoint must get https:// so the SDK accepts it");
 
-        assert!(matches!(result, Err(AppError::Unreachable)));
+        // Virtual-hosted, on the https-defaulted S3-compat host.
+        assert!(
+            url.starts_with("https://my-bucket.s3.oss-cn-hangzhou.aliyuncs.com/"),
+            "unexpected presigned URL: {url}"
+        );
+        // The stored connection itself must never be mutated.
+        assert_eq!(conn.endpoint, "oss-cn-hangzhou.aliyuncs.com");
+    }
+
+    #[tokio::test]
+    async fn aws_connection_without_a_scheme_gets_https() {
+        // Same gap, but for the flagship AWS S3 provider: `providers.ts`'s
+        // "s3" default endpoint is also schemeless ("s3.amazonaws.com").
+        let mut conn = aws_connection();
+        conn.endpoint = "s3.amazonaws.com".to_string();
+
+        let provider = from_connection(&conn).unwrap();
+        let url = provider
+            .presign_get("my-bucket", "docs/readme.md", 60)
+            .await
+            .expect("schemeless endpoint must get https:// so the SDK accepts it");
+
+        assert!(
+            url.starts_with("https://my-bucket.s3.amazonaws.com/"),
+            "unexpected presigned URL: {url}"
+        );
+        assert_eq!(conn.endpoint, "s3.amazonaws.com");
     }
 
     #[test]
