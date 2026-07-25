@@ -177,12 +177,25 @@ pub fn with_scheme(endpoint: &str) -> String {
 /// Aliyun OSS mandates a `Content-MD5` header on that request, but
 /// aws-sdk-s3 1.139 only ever sends `x-amz-checksum-*` flexible checksums --
 /// it has no way to send `Content-MD5` -- so the endpoint is unusable there
-/// (confirmed live: `400 MissingArgument`/`Content-MD5`). Connections this
-/// returns `false` for fall back to one `DeleteObject` per key instead:
-/// single-object delete has no request body, so it's never subject to this
-/// requirement.
+/// (confirmed live: `400 MissingArgument`/`Content-MD5`).
+///
+/// Rainyun ROS (`provider` case-insensitively `"rainyun"`, a MinIO backend
+/// fronted by an APISIX gateway) has the identical requirement. Confirmed
+/// live against a real `cn-nb1.rains3.com` endpoint on 2026-07-25 by trying
+/// all three request shapes `DeleteObjects` can be sent with: a request
+/// carrying `Content-MD5` succeeds (`200`); one with no checksum header at
+/// all is rejected (`400 MissingContentMD5`); and -- critically -- one
+/// carrying `x-amz-checksum-crc32`, which is exactly what aws-sdk-s3 sends
+/// by default, is *also* rejected with the same `400 MissingContentMD5`.
+/// So, like OSS, Rainyun is unusable via aws-sdk-s3's batch path: both
+/// backends hard-require the legacy `Content-MD5` header on this endpoint,
+/// and aws-sdk-s3 simply has no way to send it.
+///
+/// Connections this returns `false` for fall back to one `DeleteObject` per
+/// key instead: single-object delete has no request body, so it's never
+/// subject to this requirement.
 pub fn supports_batch_delete(provider: &str) -> bool {
-    !provider.eq_ignore_ascii_case("oss")
+    !(provider.eq_ignore_ascii_case("oss") || provider.eq_ignore_ascii_case("rainyun"))
 }
 
 /// Rewrites an OSS endpoint from one region to another.
@@ -298,9 +311,10 @@ impl fmt::Debug for OssNativeAuth {
 pub struct S3Provider {
     client: aws_sdk_s3::Client,
     /// Whether this connection's backend supports S3's Multi-Object Delete
-    /// (see [`supports_batch_delete`]) -- `false` only for Aliyun OSS today.
-    /// A plain capability flag computed once in [`from_connection`]; never
-    /// the [`Connection`] itself, and never credentials.
+    /// (see [`supports_batch_delete`]) -- `false` for Aliyun OSS and Rainyun
+    /// ROS today. A plain capability flag computed once in
+    /// [`from_connection`]; never the [`Connection`] itself, and never
+    /// credentials.
     batch_delete: bool,
     /// `Some` only for Aliyun OSS connections -- see [`OssNativeAuth`].
     /// `S3Provider` keeps `#[derive(Debug)]` safely because this field's own
@@ -652,12 +666,13 @@ fn to_list_page(
 const DELETE_BATCH_MAX: usize = 1000;
 
 /// Maximum concurrent single-key `DeleteObject` requests when a connection
-/// can't use Multi-Object Delete (see [`supports_batch_delete`] -- OSS
-/// today). Deleting one key per request instead of one request per ≤1000
-/// keys multiplies the round-trips a `delete_prefix` walk needs; running
-/// them fully sequentially would make deleting a large OSS folder painfully
-/// slow. 8 bounds the fan-out to something that still meaningfully
-/// parallelizes without looking like a burst to the storage backend.
+/// can't use Multi-Object Delete (see [`supports_batch_delete`] -- OSS and
+/// Rainyun ROS today). Deleting one key per request instead of one request
+/// per ≤1000 keys multiplies the round-trips a `delete_prefix` walk needs;
+/// running them fully sequentially would make deleting a large OSS folder
+/// painfully slow. 8 bounds the fan-out to something that still
+/// meaningfully parallelizes without looking like a burst to the storage
+/// backend.
 const SINGLE_DELETE_CONCURRENCY: usize = 8;
 
 /// Keys per page while `delete_prefix` walks a subtree. 1000 is
@@ -1022,10 +1037,10 @@ impl S3Provider {
     /// Deletes `keys` one `DeleteObject` at a time, in batches of up to
     /// [`SINGLE_DELETE_CONCURRENCY`] concurrent requests -- the fallback
     /// [`Provider::delete_objects`] dispatches to when `self.batch_delete`
-    /// is `false` (OSS today; see [`supports_batch_delete`]). `DeleteObject`
-    /// (`DELETE /bucket/key`) has no request body, so unlike Multi-Object
-    /// Delete it never needs the `Content-MD5` header OSS demands and
-    /// aws-sdk-s3 has no way to send.
+    /// is `false` (OSS and Rainyun ROS today; see [`supports_batch_delete`]).
+    /// `DeleteObject` (`DELETE /bucket/key`) has no request body, so unlike
+    /// Multi-Object Delete it never needs the `Content-MD5` header these
+    /// backends demand and aws-sdk-s3 has no way to send.
     ///
     /// Takes an already-resolved `client` (the caller, [`Provider::delete_objects`],
     /// resolves it once via [`S3Provider::client_for`]) rather than resolving
@@ -1655,6 +1670,19 @@ mod tests {
         }
     }
 
+    fn rainyun_connection() -> Connection {
+        Connection {
+            id: "c4".to_string(),
+            provider: "rainyun".to_string(),
+            name: "rainyun".to_string(),
+            endpoint: "https://cn-nb1.rains3.com".to_string(),
+            region: "cn-nb1".to_string(),
+            access_key_id: "rainyun-ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            default_bucket: None,
+        }
+    }
+
     // --- is_aws_endpoint -------------------------------------------------
 
     #[test]
@@ -1861,6 +1889,15 @@ mod tests {
         assert!(!supports_batch_delete("OSS"));
     }
     #[test]
+    fn rainyun_cannot_use_multi_object_delete() {
+        // Confirmed live 2026-07-25 against a real cn-nb1.rains3.com
+        // endpoint: aws-sdk-s3's default `x-amz-checksum-crc32` gets
+        // `400 MissingContentMD5`, same as sending no checksum header at
+        // all -- only a request carrying legacy `Content-MD5` succeeds.
+        assert!(!supports_batch_delete("rainyun"));
+        assert!(!supports_batch_delete("RAINYUN"));
+    }
+    #[test]
     fn other_backends_keep_batch_delete() {
         assert!(supports_batch_delete("s3"));
         assert!(supports_batch_delete("minio"));
@@ -2001,12 +2038,15 @@ mod tests {
     }
 
     #[test]
-    fn from_connection_sets_batch_delete_false_only_for_oss() {
-        // OSS can't use Multi-Object Delete (see `supports_batch_delete`) --
-        // `from_connection` must record that so `delete_objects` knows to
-        // fall back to one `DeleteObject` per key for this connection.
+    fn from_connection_sets_batch_delete_false_for_oss_and_rainyun() {
+        // OSS and Rainyun ROS can't use Multi-Object Delete (see
+        // `supports_batch_delete`) -- `from_connection` must record that so
+        // `delete_objects` knows to fall back to one `DeleteObject` per key
+        // for these connections.
         let oss = from_connection(&oss_connection()).unwrap();
         assert!(!oss.batch_delete);
+        let rainyun = from_connection(&rainyun_connection()).unwrap();
+        assert!(!rainyun.batch_delete);
 
         // Every other backend keeps the batch path.
         let aws = from_connection(&aws_connection()).unwrap();
