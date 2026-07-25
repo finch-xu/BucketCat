@@ -28,6 +28,8 @@ pub enum AppError {
     BucketNotFound { bucket: String },
     #[error("bucket already exists: {bucket}")]
     BucketExists { bucket: String },
+    #[error("bucket is in a different region")]
+    WrongRegion { bucket: String },
 
     #[error("object key not found: {key}")]
     KeyNotFound { key: String },
@@ -62,6 +64,7 @@ impl AppError {
             AppError::Unreachable => "network/unreachable",
             AppError::BucketNotFound { .. } => "storage/bucket-not-found",
             AppError::BucketExists { .. } => "storage/bucket-exists",
+            AppError::WrongRegion { .. } => "storage/wrong-region",
             AppError::KeyNotFound { .. } => "storage/key-not-found",
             AppError::ConnectionNotFound { .. } => "storage/connection-not-found",
             AppError::TaskNotFound { .. } => "storage/task-not-found",
@@ -77,7 +80,9 @@ impl AppError {
     pub fn params(&self) -> HashMap<String, String> {
         let mut p = HashMap::new();
         match self {
-            AppError::BucketNotFound { bucket } | AppError::BucketExists { bucket } => {
+            AppError::BucketNotFound { bucket }
+            | AppError::BucketExists { bucket }
+            | AppError::WrongRegion { bucket } => {
                 p.insert("bucket".to_string(), bucket.clone());
             }
             AppError::KeyNotFound { key } => {
@@ -236,6 +241,17 @@ mod tests {
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["code"], "storage/bucket-not-found");
         assert_eq!(v["params"]["bucket"], "photos");
+    }
+
+    #[test]
+    fn wrong_region_maps_code_and_params() {
+        let e = AppError::WrongRegion {
+            bucket: "mybucket".into(),
+        };
+        assert_eq!(e.code(), "storage/wrong-region");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "storage/wrong-region");
+        assert_eq!(v["params"]["bucket"], "mybucket");
     }
 
     #[test]

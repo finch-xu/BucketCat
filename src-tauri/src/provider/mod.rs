@@ -5,6 +5,8 @@
 //! "a bucket store" without depending on `aws-sdk-s3` types directly.
 
 pub mod hub;
+pub mod oss_admin;
+pub mod oss_sign;
 pub mod s3;
 
 pub use hub::ProviderHub;
@@ -32,10 +34,20 @@ pub fn clamp_expiry(secs: u64) -> u64 {
 /// boundary. `creation_date` is a pre-formatted string (RFC 3339) rather
 /// than an SDK `DateTime`/`chrono` value so the frontend never needs an
 /// AWS-flavored date parser.
+///
+/// `region` is `Some(..)` only for Aliyun OSS connections, whose native
+/// `ListBuckets` API (see [`oss_admin::list_buckets`]) reports each
+/// bucket's own region -- unlike every other provider here, where a
+/// connection's buckets are all implicitly in the connection's configured
+/// region, so there's nothing per-bucket to report. `Some("")` is possible
+/// (an OSS bucket whose `<Region>`/`<Location>` were both absent) and is
+/// distinct from `None` ("this provider doesn't report per-bucket region at
+/// all").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Bucket {
     pub name: String,
     pub creation_date: Option<String>,
+    pub region: Option<String>,
 }
 
 /// One row in an object listing: a real object (`is_prefix == false`) or a

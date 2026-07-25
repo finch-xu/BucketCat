@@ -6,6 +6,7 @@
 //! [`Provider`] trait and [`Bucket`] DTO in [`crate::provider`] keep every
 //! other caller (in particular `crate::commands`) free of an SDK dependency.
 
+use std::fmt;
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -21,8 +22,8 @@ use tokio::task::JoinSet;
 
 use crate::error::{AppError, AppResult};
 use crate::provider::{
-    clamp_expiry, BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, ObjectHead, Provider,
-    UploadedPart,
+    clamp_expiry, oss_admin, BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, ObjectHead,
+    Provider, UploadedPart,
 };
 use crate::store::Connection;
 
@@ -182,6 +183,36 @@ pub fn supports_batch_delete(provider: &str) -> bool {
     !provider.eq_ignore_ascii_case("oss")
 }
 
+/// Native (non-S3-compatible) OSS admin-plane endpoint + credentials,
+/// captured only for Aliyun OSS connections so [`S3Provider::list_buckets`]
+/// can call [`oss_admin::list_buckets`] -- OSS's *native* `ListBuckets` API,
+/// the only one that reports each bucket's own region (see
+/// [`crate::provider::Bucket::region`]).
+///
+/// `Debug` is hand-written (not derived), mirroring `store::Connection`'s
+/// own manual `impl`, so that `S3Provider`'s derived `Debug` -- which
+/// includes this field -- can never print `secret_access_key` in the clear.
+struct OssNativeAuth {
+    /// Native endpoint with scheme, e.g. `https://oss-cn-hangzhou.aliyuncs.com`
+    /// -- NOT the `s3.`-prefixed [`s3_compat_endpoint`] form `self.client`
+    /// talks to.
+    endpoint: String,
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl fmt::Debug for OssNativeAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OssNativeAuth")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A constructed S3 (or S3-compatible) admin-plane client for one saved
 /// [`Connection`].
 #[derive(Debug)]
@@ -192,6 +223,10 @@ pub struct S3Provider {
     /// A plain capability flag computed once in [`from_connection`]; never
     /// the [`Connection`] itself, and never credentials.
     batch_delete: bool,
+    /// `Some` only for Aliyun OSS connections -- see [`OssNativeAuth`].
+    /// `S3Provider` keeps `#[derive(Debug)]` safely because this field's own
+    /// `Debug` impl is hand-redacted.
+    oss_native: Option<OssNativeAuth>,
 }
 
 /// Builds an [`S3Provider`] from a saved connection profile.
@@ -273,6 +308,21 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
         "bucketcat",
     );
 
+    // Captured before `region` is moved into `Region::new` below -- `None`
+    // for every non-OSS connection, since only OSS's native `ListBuckets`
+    // (called from `S3Provider::list_buckets`) needs the *native* endpoint
+    // (pre `s3_compat_endpoint` rewrite) alongside the plain credentials.
+    let oss_native = if conn.provider.eq_ignore_ascii_case("oss") {
+        Some(OssNativeAuth {
+            endpoint: with_scheme(&conn.endpoint),
+            region: region.clone(),
+            access_key_id: conn.access_key_id.clone(),
+            secret_access_key: conn.secret_access_key.clone(),
+        })
+    } else {
+        None
+    };
+
     let mut config_builder = aws_sdk_s3::Config::builder()
         .behavior_version_latest()
         .endpoint_url(with_scheme(&s3_compat_endpoint(
@@ -298,6 +348,7 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
     Ok(S3Provider {
         client: aws_sdk_s3::Client::from_conf(config),
         batch_delete: supports_batch_delete(&conn.provider),
+        oss_native,
     })
 }
 
@@ -363,7 +414,12 @@ fn classify_sdk_error<E, R>(err: &SdkError<E, R>) -> Option<AppError> {
 /// Pure string -> variant mapping, deliberately factored out (rather than
 /// threaded through `SdkError`'s generics) so it's directly testable with
 /// plain string literals, no SDK error construction required.
-fn classify_error_code(code: &str, message: Option<&str>) -> Option<AppError> {
+///
+/// `pub(crate)` (not private): [`crate::provider::oss_admin::list_buckets`]
+/// reuses this same mapping for OSS's native `ListBuckets` API's own error
+/// XML (`<Code>...</Code>`), rather than re-deriving a second, possibly
+/// drifting, code -> `AppError` table.
+pub(crate) fn classify_error_code(code: &str, message: Option<&str>) -> Option<AppError> {
     match code {
         "SignatureDoesNotMatch" | "InvalidAccessKeyId" => Some(AppError::InvalidCredentials),
         "AccessDenied" | "AccessDeniedException" => Some(AppError::AccessDenied),
@@ -377,6 +433,18 @@ fn classify_error_code(code: &str, message: Option<&str>) -> Option<AppError> {
         // caller: the key doesn't exist.
         "NoSuchKey" | "NotFound" => Some(AppError::KeyNotFound {
             key: message.unwrap_or("unknown").to_string(),
+        }),
+        // Aliyun OSS doesn't route cross-region requests: hitting a bucket
+        // that lives in a different region than the one this connection is
+        // configured for fails with this code (confirmed live -- see the
+        // M5b task-1 brief), not `NoSuchBucket`. `message` isn't guaranteed
+        // to actually be the bucket name (OSS's error body doesn't echo it
+        // any more reliably than S3's does for the codes above), but the
+        // `bucket` param is treated as best-effort context here, mirroring
+        // `NoSuchBucket`/`NoSuchKey`'s own `message.unwrap_or("unknown")`
+        // convention above.
+        "PermanentRedirect" => Some(AppError::WrongRegion {
+            bucket: message.unwrap_or("unknown").to_string(),
         }),
         _ => None,
     }
@@ -774,6 +842,29 @@ impl Provider for S3Provider {
     }
 
     async fn list_buckets(&self) -> AppResult<Vec<Bucket>> {
+        // OSS connections list through the *native* `ListBuckets` API
+        // instead of the S3-compatible one `self.client` calls: it's the
+        // only one that reports each bucket's own region (see
+        // `crate::provider::Bucket::region`'s doc comment). Every other
+        // provider is unaffected -- `oss_native` is `None` for all of them.
+        if let Some(native) = &self.oss_native {
+            let oss_buckets = oss_admin::list_buckets(
+                &native.endpoint,
+                &native.region,
+                &native.access_key_id,
+                &native.secret_access_key,
+            )
+            .await?;
+            return Ok(oss_buckets
+                .into_iter()
+                .map(|b| Bucket {
+                    name: b.name,
+                    creation_date: b.creation_date,
+                    region: Some(b.region),
+                })
+                .collect());
+        }
+
         let output = self
             .client
             .list_buckets()
@@ -789,6 +880,7 @@ impl Provider for S3Provider {
                 creation_date: b
                     .creation_date()
                     .and_then(|d| d.fmt(DateTimeFormat::DateTime).ok()),
+                region: None,
             })
             .collect())
     }
@@ -1544,6 +1636,63 @@ mod tests {
         assert!(minio.batch_delete);
     }
 
+    #[test]
+    fn from_connection_captures_oss_native_auth_only_for_oss() {
+        // OSS's native `ListBuckets` (called from `S3Provider::list_buckets`)
+        // needs the *native* endpoint -- pre `s3_compat_endpoint` rewrite,
+        // but still with a scheme -- alongside the plain credentials.
+        let oss = from_connection(&oss_connection()).unwrap();
+        let native = oss
+            .oss_native
+            .as_ref()
+            .expect("oss connections must capture native auth");
+        assert_eq!(native.endpoint, "https://oss-cn-hangzhou.aliyuncs.com");
+        assert_eq!(native.region, "cn-hangzhou");
+        assert_eq!(native.access_key_id, "LTAIexample");
+        assert_eq!(native.secret_access_key, "secret");
+
+        // Every other backend has nothing to capture.
+        assert!(from_connection(&aws_connection())
+            .unwrap()
+            .oss_native
+            .is_none());
+        assert!(from_connection(&minio_connection())
+            .unwrap()
+            .oss_native
+            .is_none());
+    }
+
+    #[test]
+    fn oss_native_auth_debug_redacts_secret_access_key() {
+        let mut conn = oss_connection();
+        conn.secret_access_key = "super-secret-value".to_string();
+        let oss = from_connection(&conn).unwrap();
+        let native = oss.oss_native.as_ref().unwrap();
+
+        let debugged = format!("{native:?}");
+
+        assert!(!debugged.contains("super-secret-value"));
+        assert!(debugged.contains("<redacted>"));
+        // Sanity: other fields still show up normally.
+        assert!(debugged.contains("LTAIexample"));
+    }
+
+    #[test]
+    fn s3_provider_debug_never_leaks_the_oss_secret_through_its_derived_impl() {
+        // `S3Provider` keeps `#[derive(Debug)]` -- this proves that's safe:
+        // the derive calls `OssNativeAuth`'s own hand-redacted `Debug`, so
+        // the secret can't leak even though nothing here special-cases
+        // `S3Provider`'s own impl.
+        let mut conn = oss_connection();
+        conn.secret_access_key = "super-secret-value".to_string();
+        let oss = from_connection(&conn).unwrap();
+
+        let debugged = format!("{oss:?}");
+
+        assert!(!debugged.contains("super-secret-value"));
+        assert!(debugged.contains("<redacted>"));
+    }
+
     // `aws_sdk_s3::Config` has no public getter for `force_path_style` or
     // `endpoint_url` (only `region`/the two checksum settings are exposed,
     // per the vendored 1.139.0 source), so the wiring is instead verified
@@ -1812,6 +1961,18 @@ mod tests {
     #[test]
     fn classify_error_code_returns_none_for_unrecognized_code() {
         assert!(classify_error_code("SomeOtherCode", None).is_none());
+    }
+
+    #[test]
+    fn classify_error_code_maps_permanent_redirect_to_wrong_region() {
+        // Real OSS behavior (see the M5b task-1 brief): a cross-region
+        // request against the wrong region's endpoint fails with
+        // `PermanentRedirect`, not `NoSuchBucket`.
+        let app_err = classify_error_code("PermanentRedirect", Some("mybucket"));
+        assert!(matches!(
+            app_err,
+            Some(AppError::WrongRegion { ref bucket }) if bucket == "mybucket"
+        ));
     }
 
     // --- normalize_s3_error metadata-code fallback (pure, no network) -------

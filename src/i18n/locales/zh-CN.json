@@ -9,6 +9,7 @@
     "loadingBuckets": "正在加载存储桶…",
     "retry": "重试",
     "noBuckets": "没有存储桶",
+    "bucketRegionHint": "该存储桶位于 {{region}}，与当前连接的区域不同",
     "emptyTitle": "还没有连接",
     "emptyHint": "点击右上角的 + 添加第一个连接"
   },
@@ -199,6 +200,7 @@
     "network/unreachable": "无法连接到该 Endpoint",
     "storage/bucket-not-found": "存储桶不存在",
     "storage/bucket-exists": "存储桶名称已被占用",
+    "storage/wrong-region": "该存储桶不在当前连接配置的区域，请检查连接的区域设置",
     "storage/key-not-found": "对象不存在，可能已被删除",
     "storage/connection-not-found": "连接不存在，可能已被删除",
     "storage/task-not-found": "传输任务不存在",

@@ -35,6 +35,7 @@ function BucketRowSkeleton() {
 
 interface BucketListProps {
   connId: string;
+  connRegion: string;
   isOpen: boolean;
   activeConn: string;
   activeBucket: string;
@@ -44,7 +45,14 @@ interface BucketListProps {
 /** Renders a connection's bucket list. `useBuckets` only actually fires the
  * IPC call once `isOpen` flips true (see its `enabled` param), so collapsed
  * connections never pay the round-trip. */
-function BucketList({ connId, isOpen, activeConn, activeBucket, onSelect }: BucketListProps) {
+function BucketList({
+  connId,
+  connRegion,
+  isOpen,
+  activeConn,
+  activeBucket,
+  onSelect,
+}: BucketListProps) {
   const { t } = useTranslation();
   const errorText = useErrorText();
   const bucketsQuery = useBuckets(connId, isOpen);
@@ -93,10 +101,27 @@ function BucketList({ connId, isOpen, activeConn, activeBucket, onSelect }: Buck
             >
               <Folder className={cn("size-3.5", active ? "text-primary" : "text-muted-foreground")} />
               <span
-                className={cn("truncate text-[12.5px]", active ? "font-semibold" : "font-medium")}
+                className={cn(
+                  "min-w-0 flex-1 truncate text-[12.5px]",
+                  active ? "font-semibold" : "font-medium",
+                )}
               >
                 {bucket.name}
               </span>
+              {/* Cross-region hint (design: M5b task-1) -- a bucket whose
+               * OSS-reported region differs from this connection's
+               * configured region will fail with `storage/wrong-region`
+               * if opened; surfaced here as a passive, non-interactive
+               * label only. No new accent color, no click-behavior
+               * change (auto-routing is a follow-up task). */}
+              {bucket.region && bucket.region !== connRegion && (
+                <span
+                  className="shrink-0 text-[10.5px] text-muted-foreground"
+                  title={t("sidebar.bucketRegionHint", { region: bucket.region })}
+                >
+                  {bucket.region}
+                </span>
+              )}
             </div>
           );
         })}
@@ -184,6 +209,7 @@ function ConnectionRow({
       </div>
       <BucketList
         connId={conn.id}
+        connRegion={conn.region}
         isOpen={isOpen}
         activeConn={activeConn}
         activeBucket={activeBucket}

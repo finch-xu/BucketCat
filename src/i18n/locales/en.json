@@ -9,6 +9,7 @@
     "loadingBuckets": "Loading buckets…",
     "retry": "Retry",
     "noBuckets": "No buckets",
+    "bucketRegionHint": "This bucket is in {{region}}, a different region than this connection",
     "emptyTitle": "No connections yet",
     "emptyHint": "Click the + above to add your first connection"
   },
@@ -199,6 +200,7 @@
     "network/unreachable": "Could not reach that endpoint",
     "storage/bucket-not-found": "Bucket not found",
     "storage/bucket-exists": "Bucket name already taken",
+    "storage/wrong-region": "This bucket is not in this connection's configured region -- check the connection's region setting",
     "storage/key-not-found": "Object not found -- it may have been removed",
     "storage/connection-not-found": "Connection not found -- it may have been removed",
     "storage/task-not-found": "Transfer task not found",

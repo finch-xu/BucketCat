@@ -34,6 +34,34 @@ machine-uid = "0.6.0"
 async-trait = "0.1.91"
 uuid = { version = "1.24.0", features = ["v4"] }
 percent-encoding = "2.3"
+hmac = "0.13.0"
+quick-xml = "0.41"
+# --- OSS native ListBuckets transport (see `provider::oss_admin`) ---
+#
+# Deliberately NOT `reqwest`: `reqwest` 0.13.4 (as already resolved in
+# Cargo.lock, pulled in transitively as a *target-specific* dependency of
+# `tauri` for Android/iOS only) cannot get TLS support without its `rustls`
+# or `rustls-no-provider` feature, and BOTH of those unconditionally require
+# the `rustls-platform-verifier` optional dependency -- confirmed by actually
+# enabling each and inspecting `Cargo.lock`: it adds 7 new `[[package]]`
+# nodes (`rustls-platform-verifier`, `rustls-platform-verifier-android`,
+# `jni`, `jni-macros`, `simd_cesu8`, `simdutf8`, `webpki-root-certs`), none
+# of which exist in the lock today. That violates this task's hard
+# "zero new dependency-graph nodes" requirement. The crates below give the
+# same capability (build one signed HTTPS GET, read the response) using only
+# packages already resolved in Cargo.lock -- `hyper-rustls` 0.27.9 is already
+# pulled in by `aws-smithy-http-client` (aws-sdk-s3's own transport), with
+# `rustls-native-certs` and `aws-lc-rs` already active on that exact
+# `rustls` 0.23.42 instance -- so promoting these to direct dependencies adds
+# zero new lock entries (verified: `git diff Cargo.lock | grep -c '^+name = '`
+# is 0).
+rustls = "0.23"
+hyper-rustls = "0.27"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2.5"
