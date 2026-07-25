@@ -11,8 +11,22 @@ export function Modal({
   children: ReactNode;
 }) {
   useEffect(() => {
+    // An Escape already consumed by an overlay *inside* the modal (a Radix
+    // Select's dropdown, say) must dismiss only that overlay, never the whole
+    // modal -- closing it would throw away everything the user has typed.
+    //
+    // Radix's `DismissableLayer` registers its keydown on `document` with
+    // `{ capture: true }` and, on Escape, calls `preventDefault()` + dismisses
+    // WITHOUT calling `stopPropagation()`. Since the capture phase (window ->
+    // document -> ... -> target) fully precedes the bubble phase (target ->
+    // ... -> document -> window), that handler has always run by the time this
+    // bubble-phase window listener fires, so `defaultPrevented` is reliably
+    // `true` here for an Escape some layer already handled.
+    //
+    // Nothing else in this app calls `preventDefault()` on a keydown, so for a
+    // modal with no open overlay Escape still closes it exactly as before.
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape" && !e.defaultPrevented) onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
