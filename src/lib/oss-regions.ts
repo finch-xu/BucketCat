@@ -10,14 +10,10 @@
  * Building endpoints by concatenating `oss-${id}.aliyuncs.com` would silently
  * produce a wrong (unreachable) host for every finance-cloud region.
  */
-export interface OssRegion {
-  /** Region ID, e.g. "cn-beijing". */
-  id: string;
-  /** Chinese region label, e.g. "华北2（北京）". */
-  label: string;
-  /** Public (internet) endpoint, no scheme. */
-  endpoint: string;
-  /** Internal (VPC) endpoint, no scheme. */
+import type { RegionCatalog, RegionOption } from "./regions";
+
+export interface OssRegion extends RegionOption {
+  /** Internal (VPC) endpoint, no scheme. Always present for OSS. */
   internal: string;
   group: "public" | "finance" | "gov";
 }
@@ -126,3 +122,16 @@ export function ossFormStateFromConnection(
     unknownEndpoint: !found,
   };
 }
+
+/** OSS 的区域分组，顺序即选择器里的显示顺序。 */
+const OSS_REGION_GROUPS = [
+  { key: "public", labelKey: "addConn.regionGroupPublic" },
+  { key: "finance", labelKey: "addConn.regionGroupFinance" },
+  { key: "gov", labelKey: "addConn.regionGroupGov" },
+];
+
+export const OSS_CATALOG: RegionCatalog = {
+  regions: OSS_REGIONS,
+  groups: OSS_REGION_GROUPS,
+  hasInternalNetwork: true,
+};
