@@ -52,7 +52,15 @@
 //!   refuses (via `assert!`) to run against anything that isn't a real,
 //!   non-empty `bucketcat-e2e/` prefix, so a coding mistake that produced an
 //!   empty or wrong prefix can never cascade into deleting unrelated
-//!   objects.
+//!   objects. Its reach is real but not total, though: `delete_prefix`
+//!   enumerates via `ListObjectsV2`, which never lists an **in-progress**
+//!   multipart upload -- so `cleanup_prefix` alone can never reach or abort
+//!   one. `multipart_upload_round_trip` is the one test that can leave one
+//!   behind (a failure between `multipart_init` and `multipart_complete`),
+//!   and it guards that path itself: any failure in that window explicitly
+//!   calls `multipart_abort` before `cleanup_prefix` runs, so the two
+//!   together -- not `cleanup_prefix` alone -- are what keep this file's
+//!   footprint really bounded.
 //! - **Credentials never touch disk or a log line.** They're read from
 //!   environment variables at process start and handed straight to the SDK;
 //!   nothing in this file prints, formats, or persists them. (The presigned
@@ -337,6 +345,18 @@ async fn small_object_round_trip() {
         "head_object must fail after delete_objects reported success -- if it still succeeds, \
          the delete was acknowledged but did not actually remove the object",
     );
+    // `expect_err` alone accepts ANY error -- a transient 500, DNS hiccup, or
+    // mid-test credential failure would pass it just as well as a real
+    // "gone" response, and be indistinguishable from a successful delete.
+    // Assert the specific not-found code instead.
+    assert_eq!(
+        err.code(),
+        "storage/key-not-found",
+        "head_object failed after delete, as expected, but with code `{}` instead of the \
+         expected `storage/key-not-found` -- this could be a transient error unrelated to the \
+         delete rather than proof the object is actually gone: {err}",
+        err.code()
+    );
     eprintln!("post-delete head_object failed as expected for `{key}`: {err}");
 
     cleanup_prefix(&provider, &bucket, &prefix).await;
@@ -358,6 +378,20 @@ async fn small_object_round_trip() {
 /// end-to-end against real OSS: init -> 2 parts -> `multipart_list` sees
 /// both -> complete -> head (size) -> get_range (whole object) -> SHA-256
 /// match -> delete -> prefix cleanup.
+///
+/// Everything between `multipart_init` and the end of the test runs inside
+/// a `Result`-returning block rather than using `expect`/`assert_eq!`
+/// directly. That's not stylistic: an in-progress multipart upload is
+/// invisible to `ListObjectsV2` (so `delete_prefix`/`cleanup_prefix` can
+/// never reach or abort one) and its already-uploaded parts keep billing
+/// until explicitly aborted. This test runs against a real, production
+/// Aliyun account -- a mid-test `panic!` unwinding straight past
+/// `multipart_abort` would leave exactly that: a billed, console-invisible
+/// upload with no cleanup path except the human running this suite noticing
+/// and aborting it by hand. Every check below (part count, completed size,
+/// SHA-256, and the post-delete disappearance code) keeps its original
+/// strength -- only the failure *plumbing* changed, from `panic!` to
+/// `Err(String)`, so it can be caught and turned into an abort first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn multipart_upload_round_trip() {
@@ -378,88 +412,205 @@ async fn multipart_upload_round_trip() {
         .await
         .expect("multipart_init should succeed against live OSS");
 
-    let mut done: Vec<UploadedPart> = Vec::with_capacity(2);
-    for (number, offset) in [(1i32, 0u64), (2i32, part_size)] {
-        let etag = provider
-            .upload_part_from_file(&bucket, &key, &upload_id, number, &path, offset, part_size)
+    // From here on, ANY failure -- an `Err` return or a failed check -- must
+    // go through `multipart_abort` before this test exits. See the doc
+    // comment above for why: an in-progress multipart upload is invisible
+    // to `delete_prefix` and keeps billing until aborted.
+    let outcome: Result<(), String> = async {
+        let mut done: Vec<UploadedPart> = Vec::with_capacity(2);
+        for (number, offset) in [(1i32, 0u64), (2i32, part_size)] {
+            let etag = provider
+                .upload_part_from_file(&bucket, &key, &upload_id, number, &path, offset, part_size)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "upload_part_from_file (part {number}) should succeed against live OSS \
+                         -- a failure here, especially `InvalidArgument`, most likely means the \
+                         client sent `aws-chunked` transfer encoding, which OSS's S3-compatible \
+                         endpoint does not support (see this file's and provider::s3's module \
+                         doc comments): {e}"
+                    )
+                })?;
+            done.push(UploadedPart {
+                number,
+                etag,
+                size: part_size,
+            });
+        }
+
+        let listed = provider
+            .multipart_list(&bucket, &key, &upload_id)
+            .await
+            .map_err(|e| format!("multipart_list should succeed against live OSS: {e}"))?;
+        if listed.len() != 2 {
+            return Err(format!(
+                "the server must report exactly the 2 parts uploaded, got: {listed:?}"
+            ));
+        }
+
+        provider
+            .multipart_complete(&bucket, &key, &upload_id, &done)
+            .await
+            .map_err(|e| format!("multipart_complete should succeed against live OSS: {e}"))?;
+
+        let head = provider
+            .head_object(&bucket, &key)
+            .await
+            .map_err(|e| format!("head_object should succeed after multipart_complete: {e}"))?;
+        if head.size != total {
+            return Err(format!(
+                "the completed object's size must equal the source file's total size: got \
+                 {}, want {total}",
+                head.size
+            ));
+        }
+
+        let downloaded = provider
+            .get_range(&bucket, &key, 0, total)
+            .await
+            .map_err(|e| format!("get_range should succeed reading the whole object back: {e}"))?;
+        let got_hash = hex(&sha256_bytes(&downloaded));
+        let want_hash = hex(&sha256_file(&path));
+        if got_hash != want_hash {
+            return Err(format!(
+                "round-tripped bytes must match the source file's SHA-256 -- a mismatch would \
+                 mean a part landed at the wrong offset: got {got_hash}, want {want_hash}"
+            ));
+        }
+
+        let deleted = provider
+            .delete_objects(&bucket, std::slice::from_ref(&key))
+            .await
+            .map_err(|e| format!("delete_objects should succeed against live OSS: {e}"))?;
+        if (deleted.succeeded, deleted.failed.len()) != (1, 0) {
+            return Err(format!(
+                "delete_objects must report exactly one success and no per-key failures, got: \
+                 {deleted:?}"
+            ));
+        }
+
+        // Asserting the call's return value is NOT enough. `delete_objects`
+        // counts a key as deleted whenever the batch response reports no
+        // error for it, so a backend that accepts the request and quietly
+        // drops it still looks like success. Assert the object is actually
+        // gone -- an earlier revision of these tests checked only the
+        // return value and passed against live OSS while every object they
+        // "deleted" survived. And a bare `expect_err` isn't enough either:
+        // it accepts ANY error (a transient 500, DNS hiccup, mid-test
+        // credential failure), so pin the specific not-found code.
+        match provider.head_object(&bucket, &key).await {
+            Ok(_) => Err(format!(
+                "head_object must fail after delete_objects reported success for `{key}` -- if \
+                 it still succeeds, the delete was acknowledged but did not actually remove the \
+                 object"
+            )),
+            Err(e) if e.code() != "storage/key-not-found" => Err(format!(
+                "head_object failed after delete, as expected, but with code `{}` instead of \
+                 the expected `storage/key-not-found`: {e}",
+                e.code()
+            )),
+            Err(e) => {
+                eprintln!("post-delete head_object failed as expected for `{key}`: {e}");
+                Ok(())
+            }
+        }
+    }
+    .await;
+
+    if let Err(msg) = outcome {
+        // Best-effort: if the abort itself also fails, there is nothing
+        // more this test can do about it beyond what `cleanup_prefix`'s own
+        // WARNING would already surface -- and an abort failure here must
+        // not mask the real assertion failure in `msg` below.
+        let _ = provider.multipart_abort(&bucket, &key, &upload_id).await;
+        cleanup_prefix(&provider, &bucket, &prefix).await;
+        panic!("{msg}");
+    }
+    cleanup_prefix(&provider, &bucket, &prefix).await;
+}
+
+// --- 5: delete_prefix removes a multi-object nested tree ---------------------
+
+/// Proves `delete_prefix` actually deletes multiple objects in one call --
+/// not just that its return value claims to.
+///
+/// Every other writing test in this file uploads exactly **one** object and
+/// deletes it individually via `delete_objects` *before* calling
+/// `cleanup_prefix` at the end. That meant `cleanup_prefix`'s own call to
+/// `delete_prefix` always ran against an already-empty prefix: 0 keys
+/// listed, 0 chunks, `delete_objects` never invoked with more than a single
+/// key. OSS's per-key delete fallback (`delete_objects_one_by_one`, bounded
+/// by `SINGLE_DELETE_CONCURRENCY = 8`) and `delete_prefix`'s own
+/// walk-then-batch-delete logic were therefore never exercised against real
+/// OSS with a >1-key fan-out, and `delete_prefix` had never been proven to
+/// actually delete anything on OSS at all.
+///
+/// This test uploads 3 objects under one prefix -- one nested two levels
+/// deep, to also exercise `delete_prefix`'s delimiter-less walk -- then
+/// calls `delete_prefix` directly (never deleting the objects individually)
+/// and asserts both the returned `BatchResult` AND, more importantly, that
+/// `list_objects_flat` shows the prefix is actually empty afterward.
+/// Asserting only the return value is exactly the shape of bug M5's
+/// deletion regression hid behind (see this file's other post-delete
+/// assertions).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn delete_prefix_removes_every_object_under_it() {
+    let conn = oss_connection();
+    let bucket = oss_bucket();
+    let provider = from_connection(&conn).expect("a valid OSS connection profile should build");
+    let prefix = test_prefix();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let keys = [
+        format!("{prefix}a.bin"),
+        format!("{prefix}nested/b.bin"),
+        format!("{prefix}nested/deep/c.bin"),
+    ];
+    for (i, key) in keys.iter().enumerate() {
+        let path = dir.path().join(format!("obj{i}.bin"));
+        let size = 4 * 1024; // a few KB is plenty; this test is about fan-out, not payload size
+        write_pseudo_random_file(&path, size, 0x0555_0010 + i as u64);
+        provider
+            .put_object_from_file(&bucket, key, &path, size)
             .await
             .unwrap_or_else(|e| {
-                panic!(
-                    "upload_part_from_file (part {number}) should succeed against live OSS -- \
-                     a failure here, especially `InvalidArgument`, most likely means the \
-                     client sent `aws-chunked` transfer encoding, which OSS's S3-compatible \
-                     endpoint does not support (see this file's and provider::s3's module doc \
-                     comments): {e}"
-                )
+                panic!("put_object_from_file for `{key}` should succeed against live OSS: {e}")
             });
-        done.push(UploadedPart {
-            number,
-            etag,
-            size: part_size,
-        });
     }
 
-    let listed = provider
-        .multipart_list(&bucket, &key, &upload_id)
-        .await
-        .expect("multipart_list should succeed against live OSS");
-    assert_eq!(
-        listed.len(),
-        2,
-        "the server must report exactly the 2 parts uploaded, got: {listed:?}"
-    );
-
-    provider
-        .multipart_complete(&bucket, &key, &upload_id, &done)
-        .await
-        .expect("multipart_complete should succeed against live OSS");
-
-    let head = provider
-        .head_object(&bucket, &key)
-        .await
-        .expect("head_object should succeed after multipart_complete");
-    assert_eq!(
-        head.size, total,
-        "the completed object's size must equal the source file's total size"
-    );
-
-    let downloaded = provider
-        .get_range(&bucket, &key, 0, total)
-        .await
-        .expect("get_range should succeed reading the whole object back");
-    assert_eq!(
-        hex(&sha256_bytes(&downloaded)),
-        hex(&sha256_file(&path)),
-        "round-tripped bytes must match the source file's SHA-256 -- a mismatch would mean a \
-         part landed at the wrong offset"
-    );
-
+    // Deliberately NOT deleting the 3 objects individually here -- the whole
+    // point of this test is to exercise `delete_prefix`'s own multi-key
+    // fan-out, which every other test in this file accidentally skips (see
+    // the doc comment above).
     let deleted = provider
-        .delete_objects(&bucket, std::slice::from_ref(&key))
+        .delete_prefix(&bucket, &prefix)
         .await
-        .expect("delete_objects should succeed against live OSS");
+        .expect("delete_prefix should succeed against live OSS");
     assert_eq!(
         (deleted.succeeded, deleted.failed.len()),
-        (1, 0),
-        "delete_objects must report exactly one success and no per-key failures, got: {deleted:?}"
+        (3, 0),
+        "delete_prefix must report exactly 3 successes and no per-key failures, got: {deleted:?}"
     );
 
-    // Asserting the call's return value is NOT enough. `delete_objects`
-    // counts a key as deleted whenever the batch response reports no error
-    // for it, so a backend that accepts the request and quietly drops it
-    // still looks like success. Assert the object is actually gone -- an
-    // earlier revision of these tests checked only the return value and
-    // passed against live OSS while every object they "deleted" survived.
-    let err = provider.head_object(&bucket, &key).await.expect_err(
-        "head_object must fail after delete_objects reported success -- if it still succeeds, \
-         the delete was acknowledged but did not actually remove the object",
+    // Asserting the return value is NOT enough -- see this file's other
+    // post-delete assertions for why. List the prefix back and confirm the
+    // objects are actually gone, not just acknowledged.
+    let remaining = provider
+        .list_objects_flat(&bucket, &prefix, None, 10)
+        .await
+        .expect("list_objects_flat should succeed against live OSS");
+    assert!(
+        remaining.entries.is_empty(),
+        "delete_prefix reported 3 successes, but list_objects_flat still shows objects under \
+         `{prefix}`: {:?}",
+        remaining.entries
     );
-    eprintln!("post-delete head_object failed as expected for `{key}`: {err}");
 
     cleanup_prefix(&provider, &bucket, &prefix).await;
 }
 
-// --- 5: presigned GET (resolves an open design question) --------------------
+// --- 6: presigned GET (resolves an open design question) --------------------
 
 /// Resolves an open design-doc question: does OSS's S3-compatible endpoint
 /// honor presigned GET URLs the way `aws-sdk-s3` signs them? This matters
@@ -541,6 +692,18 @@ async fn presigned_get_works() {
     let err = provider.head_object(&bucket, &key).await.expect_err(
         "head_object must fail after delete_objects reported success -- if it still succeeds, \
          the delete was acknowledged but did not actually remove the object",
+    );
+    // `expect_err` alone accepts ANY error -- a transient 500, DNS hiccup, or
+    // mid-test credential failure would pass it just as well as a real
+    // "gone" response, and be indistinguishable from a successful delete.
+    // Assert the specific not-found code instead.
+    assert_eq!(
+        err.code(),
+        "storage/key-not-found",
+        "head_object failed after delete, as expected, but with code `{}` instead of the \
+         expected `storage/key-not-found` -- this could be a transient error unrelated to the \
+         delete rather than proof the object is actually gone: {err}",
+        err.code()
     );
     eprintln!("post-delete head_object failed as expected for `{key}`: {err}");
 

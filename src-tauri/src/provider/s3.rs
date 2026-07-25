@@ -88,6 +88,14 @@ pub fn uses_path_style(provider: &str, endpoint: &str) -> bool {
 /// It is idempotent: a host that already starts with `s3.oss-` is left
 /// alone, so calling this twice (or on an endpoint the user already saved
 /// in S3-compatible form) never produces `s3.s3....`.
+///
+/// The `oss-` match is case-insensitive and tolerant of leading whitespace
+/// on the host, mirroring [`is_aws_endpoint`]'s own case-insensitive match --
+/// without that, an endpoint like `OSS-cn-hangzhou.aliyuncs.com` would fail
+/// this check while [`uses_path_style`] (case-insensitive on `provider`)
+/// still picked virtual-hosted addressing, pointing the SDK at OSS's
+/// *native* (non-S3) endpoint. Only the match is lenient: the returned
+/// string is still built from the original, un-lowercased input.
 pub fn s3_compat_endpoint(provider: &str, endpoint: &str) -> String {
     if !provider.eq_ignore_ascii_case("oss") {
         return endpoint.to_string();
@@ -111,7 +119,11 @@ pub fn s3_compat_endpoint(provider: &str, endpoint: &str) -> String {
         _ => authority,
     };
 
-    if !host.starts_with("oss-") {
+    // Case-insensitive and tolerant of leading whitespace, mirroring
+    // `is_aws_endpoint`'s own `to_ascii_lowercase()` match -- but only the
+    // MATCH is lenient; `result` below is still built from `authority`
+    // (the original, un-lowercased input), never a lowercased copy.
+    if !host.trim_start().to_ascii_lowercase().starts_with("oss-") {
         return endpoint.to_string();
     }
 
@@ -1377,6 +1389,35 @@ mod tests {
         assert_eq!(
             s3_compat_endpoint("oss", "https://s3.oss-cn-hangzhou.aliyuncs.com"),
             "https://s3.oss-cn-hangzhou.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn s3_compat_endpoint_host_match_is_case_insensitive() {
+        // `is_aws_endpoint` lowercases before matching; this host check must
+        // not be stricter than that sibling function. An upper/mixed-case
+        // `OSS-` host must still get the `s3.` rewrite -- built from the
+        // ORIGINAL (non-lowercased) input, not a lowercased copy.
+        assert_eq!(
+            s3_compat_endpoint("oss", "OSS-cn-hangzhou.aliyuncs.com"),
+            "s3.OSS-cn-hangzhou.aliyuncs.com"
+        );
+        assert_eq!(
+            s3_compat_endpoint("oss", "https://OSS-cn-beijing.aliyuncs.com"),
+            "https://s3.OSS-cn-beijing.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn s3_compat_endpoint_host_match_tolerates_leading_whitespace() {
+        // A schemeless host with leading whitespace must still be recognized
+        // as an OSS host -- the detection is lenient, but the rewrite still
+        // prefixes the ORIGINAL (whitespace-and-all) authority, since this
+        // function's contract is "detection only" leniency, not input
+        // normalization.
+        assert_eq!(
+            s3_compat_endpoint("oss", " oss-cn-hangzhou.aliyuncs.com"),
+            "s3. oss-cn-hangzhou.aliyuncs.com"
         );
     }
 
