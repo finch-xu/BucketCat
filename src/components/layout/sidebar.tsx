@@ -108,12 +108,13 @@ function BucketList({
               >
                 {bucket.name}
               </span>
-              {/* Cross-region hint (design: M5b task-1) -- a bucket whose
-               * OSS-reported region differs from this connection's
-               * configured region will fail with `storage/wrong-region`
-               * if opened; surfaced here as a passive, non-interactive
-               * label only. No new accent color, no click-behavior
-               * change (auto-routing is a follow-up task). */}
+              {/* Cross-region label (design: M5b task-1, auto-routed since
+               * M5b task-2) -- a bucket whose OSS-reported region differs
+               * from this connection's configured region is still fully
+               * reachable: `S3Provider::client_for` picks a client for the
+               * bucket's own region automatically. Purely informational,
+               * neutral styling only (no accent/warning color, no
+               * click-behavior change). */}
               {bucket.region && bucket.region !== connRegion && (
                 <span
                   className="shrink-0 text-[10.5px] text-muted-foreground"

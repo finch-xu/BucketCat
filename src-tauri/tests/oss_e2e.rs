@@ -75,7 +75,7 @@
 //! nothing here creates or deletes the bucket itself, but writes/deletes
 //! happen for real under that prefix.
 //!
-//! Set all five required environment variables, then run with `--ignored`:
+//! Set all six required environment variables, then run with `--ignored`:
 //!
 //! ```bash
 //! export BUCKETCAT_OSS_ENDPOINT="https://oss-cn-beijing.aliyuncs.com"  # NATIVE form;
@@ -86,6 +86,12 @@
 //! export BUCKETCAT_OSS_BUCKET="your-disposable-sandbox-bucket"
 //! export BUCKETCAT_OSS_AK="..."
 //! export BUCKETCAT_OSS_SK="..."
+//! # A valid OSS region the account has NO bucket in -- e.g. if every real
+//! # bucket lives in cn-beijing/cn-shanghai/cn-hangzhou, "cn-shenzhen" (or
+//! # any other region the account has never used) works. Only
+//! # `cross_region_bucket_is_routed_automatically` reads this; see that
+//! # test's doc comment for why it must be a bucket-less region.
+//! export BUCKETCAT_OSS_WRONG_REGION="cn-shenzhen"
 //! cargo test --test oss_e2e -- --ignored
 //! ```
 //!
@@ -98,6 +104,7 @@
 //! is exactly the behavior [`list_objects_on_the_test_bucket_succeeds`]
 //! proves, mirroring what a real user pastes from the Aliyun console.
 
+use bucketcat_lib::provider::s3::oss_endpoint_for_region;
 use bucketcat_lib::provider::{from_connection, Provider, S3Provider, UploadedPart};
 use bucketcat_lib::store::Connection;
 use sha2::{Digest, Sha256};
@@ -139,6 +146,42 @@ fn oss_connection() -> Connection {
         name: "e2e oss".to_string(),
         endpoint: required_env("BUCKETCAT_OSS_ENDPOINT"),
         region: required_env("BUCKETCAT_OSS_REGION"),
+        access_key_id: required_env("BUCKETCAT_OSS_AK"),
+        secret_access_key: required_env("BUCKETCAT_OSS_SK"),
+        default_bucket: None,
+    }
+}
+
+/// A `Connection` deliberately pointed at a region the account has **no
+/// bucket in** (`BUCKETCAT_OSS_WRONG_REGION`), while the caller still
+/// targets the real sandbox bucket (which actually lives in
+/// `BUCKETCAT_OSS_REGION`). This is the fixture
+/// [`cross_region_bucket_is_routed_automatically`] uses to prove
+/// `S3Provider::client_for` routes each request to the bucket's *own*
+/// region rather than the connection's configured one.
+///
+/// The endpoint is derived from the real one via [`oss_endpoint_for_region`]
+/// -- the same function `client_for` itself uses -- rather than hand-built,
+/// so this fixture can never drift from what production code actually does
+/// with a real console-pasted endpoint.
+fn oss_wrong_region_connection() -> Connection {
+    let real_endpoint = required_env("BUCKETCAT_OSS_ENDPOINT");
+    let real_region = required_env("BUCKETCAT_OSS_REGION");
+    let wrong_region = required_env("BUCKETCAT_OSS_WRONG_REGION");
+    assert_ne!(
+        wrong_region, real_region,
+        "BUCKETCAT_OSS_WRONG_REGION must differ from BUCKETCAT_OSS_REGION -- it exists \
+         specifically to misconfigure this connection's own region away from the sandbox \
+         bucket's real one"
+    );
+    let wrong_endpoint = oss_endpoint_for_region(&real_endpoint, &real_region, &wrong_region);
+
+    Connection {
+        id: "e2e-oss-wrong-region".to_string(),
+        provider: "oss".to_string(),
+        name: "e2e oss (deliberately wrong region)".to_string(),
+        endpoint: wrong_endpoint,
+        region: wrong_region,
         access_key_id: required_env("BUCKETCAT_OSS_AK"),
         secret_access_key: required_env("BUCKETCAT_OSS_SK"),
         default_bucket: None,
@@ -733,6 +776,109 @@ async fn presigned_get_works() {
         "head_object failed after delete, as expected, but with code `{}` instead of the \
          expected `storage/key-not-found` -- this could be a transient error unrelated to the \
          delete rather than proof the object is actually gone: {err}",
+        err.code()
+    );
+    eprintln!("post-delete head_object failed as expected for `{key}`: {err}");
+
+    cleanup_prefix(&provider, &bucket, &prefix).await;
+}
+
+// --- 7: cross-region bucket routing (the point of M5b task 2) ---------------
+
+/// **This is the only test in this repository that proves cross-region
+/// routing.** Every other test above uses `oss_connection()`, whose region
+/// always matches the sandbox bucket's own -- so none of them can tell
+/// `S3Provider::client_for` routing to the bucket's own region apart from
+/// simply never needing to.
+///
+/// OSS does not route a cross-region request server-side: hitting a bucket
+/// from the wrong region's endpoint fails with `PermanentRedirect`
+/// (confirmed live). This test deliberately misconfigures the *connection*
+/// to a region the account has **no bucket in at all**
+/// (`BUCKETCAT_OSS_WRONG_REGION`, via [`oss_wrong_region_connection`]) and
+/// then targets the real sandbox bucket, which lives in a *different*
+/// region. Confirmed live, pre-fix, this exact configuration fails with
+/// `PermanentRedirect`; a green run here proves `client_for` resolved the
+/// sandbox bucket's real region (through OSS's native `ListBuckets`, since
+/// the cache starts cold) and routed every request -- both the read-only
+/// list and the data-plane write/read/delete round trip below -- to a
+/// client actually configured for that region, not the connection's
+/// (deliberately wrong) one.
+///
+/// Deliberately still only ever touches the **sandbox bucket**: the account
+/// otherwise holds production data in other buckets across other regions,
+/// and this test proves routing works without needing to go anywhere near
+/// any of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn cross_region_bucket_is_routed_automatically() {
+    let conn = oss_wrong_region_connection();
+    let bucket = oss_bucket();
+    let provider = from_connection(&conn).expect("a valid OSS connection profile should build");
+
+    // The cheapest possible proof: a bare list on the sandbox bucket
+    // through a connection configured for a region that bucket isn't even
+    // in. Pre-fix, this alone reproduces the live `PermanentRedirect`.
+    provider.list_objects(&bucket, "", None, 10).await.expect(
+        "list_objects against the sandbox bucket should succeed even though this connection is \
+         deliberately configured for a region the account has no bucket in -- a failure here \
+         (especially PermanentRedirect) means client_for did not route this request to the \
+         bucket's own region",
+    );
+
+    // A full write/read/delete round trip proves the data plane is routed
+    // too, not just the read-only list above.
+    let prefix = test_prefix();
+    let key = format!("{prefix}cross-region.bin");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cross-region.bin");
+    let size = 16 * 1024;
+    write_pseudo_random_file(&path, size, 0x0555_0004);
+
+    provider
+        .put_object_from_file(&bucket, &key, &path, size)
+        .await
+        .expect(
+            "put_object_from_file should succeed against the sandbox bucket even though this \
+             connection is configured for a bucket-less region -- client_for must route this \
+             write to the bucket's own region",
+        );
+
+    let head = provider
+        .head_object(&bucket, &key)
+        .await
+        .expect("head_object should succeed right after put_object_from_file");
+    assert_eq!(
+        head.size, size,
+        "head_object's reported size must match the uploaded file's size"
+    );
+
+    let deleted = provider
+        .delete_objects(&bucket, std::slice::from_ref(&key))
+        .await
+        .expect(
+            "delete_objects should succeed against the sandbox bucket via cross-region routing",
+        );
+    assert_eq!(
+        (deleted.succeeded, deleted.failed.len()),
+        (1, 0),
+        "delete_objects must report exactly one success and no per-key failures, got: {deleted:?}"
+    );
+
+    // Asserting the call's return value is NOT enough -- see this file's
+    // other post-delete assertions for why. Confirm the object is actually
+    // gone with the specific not-found code, not just that delete_objects
+    // claimed success.
+    let err = provider.head_object(&bucket, &key).await.expect_err(
+        "head_object must fail after delete_objects reported success -- if it still succeeds, \
+         the delete was acknowledged but did not actually remove the object",
+    );
+    assert_eq!(
+        err.code(),
+        "storage/key-not-found",
+        "head_object failed after delete, as expected, but with code `{}` instead of the \
+         expected `storage/key-not-found`: {err}",
         err.code()
     );
     eprintln!("post-delete head_object failed as expected for `{key}`: {err}");

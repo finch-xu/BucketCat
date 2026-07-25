@@ -9,7 +9,7 @@
     "loadingBuckets": "Loading buckets…",
     "retry": "Retry",
     "noBuckets": "No buckets",
-    "bucketRegionHint": "This bucket is in {{region}}, a different region than this connection",
+    "bucketRegionHint": "This bucket is in {{region}}; requests are routed there automatically",
     "emptyTitle": "No connections yet",
     "emptyHint": "Click the + above to add your first connection"
   },

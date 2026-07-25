@@ -6,8 +6,10 @@
 //! [`Provider`] trait and [`Bucket`] DTO in [`crate::provider`] keep every
 //! other caller (in particular `crate::commands`) free of an SDK dependency.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::RwLock;
 
 use async_trait::async_trait;
 use aws_sdk_s3::config::{
@@ -183,6 +185,64 @@ pub fn supports_batch_delete(provider: &str) -> bool {
     !provider.eq_ignore_ascii_case("oss")
 }
 
+/// Rewrites an OSS endpoint from one region to another.
+///
+/// OSS embeds the region right in the hostname (`oss-cn-beijing.aliyuncs.com`,
+/// or its intranet form `oss-cn-beijing-internal.aliyuncs.com`). This
+/// substitutes `oss-{from_region}` -> `oss-{to_region}` in the *authority*
+/// (host + optional port) only, so the intranet/extranet form, a custom
+/// port, and any path are all preserved byte-for-byte -- and so is the
+/// `s3.`-prefixed S3-compatible form ([`s3_compat_endpoint`]'s output),
+/// since `oss-{from_region}` still occurs as a substring of
+/// `s3.oss-{from_region}...`.
+///
+/// `from_region == to_region` short-circuits to the input unchanged (no
+/// rewrite needed, and the empty-string edge case some callers could pass
+/// for an unresolved region never reaches the substring check below).
+///
+/// When the authority doesn't contain `oss-{from_region}` at all -- a
+/// CNAME'd custom domain, or simply a non-OSS host -- the endpoint is
+/// returned byte-for-byte unchanged: such a host can't be reliably mapped
+/// to another region by string substitution, and the caller (`client_for`)
+/// is expected to fall back to the default client rather than guess. This
+/// is also what makes the function a no-op (idempotent, harmless) on a
+/// non-OSS endpoint like `http://127.0.0.1:9000`.
+pub fn oss_endpoint_for_region(endpoint: &str, from_region: &str, to_region: &str) -> String {
+    if from_region == to_region {
+        return endpoint.to_string();
+    }
+
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, endpoint),
+    };
+    // Split off any path/query so the rewrite only ever touches the
+    // authority, mirroring `s3_compat_endpoint`'s own split.
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+
+    let needle = format!("oss-{from_region}");
+    if !authority.contains(needle.as_str()) {
+        return endpoint.to_string();
+    }
+    let replacement = format!("oss-{to_region}");
+    let new_authority = authority.replacen(needle.as_str(), replacement.as_str(), 1);
+
+    let mut result = String::new();
+    if let Some(scheme) = scheme {
+        result.push_str(scheme);
+        result.push_str("://");
+    }
+    result.push_str(&new_authority);
+    if let Some(path) = path {
+        result.push('/');
+        result.push_str(path);
+    }
+    result
+}
+
 /// Native (non-S3-compatible) OSS admin-plane endpoint + credentials,
 /// captured only for Aliyun OSS connections so [`S3Provider::list_buckets`]
 /// can call [`oss_admin::list_buckets`] -- OSS's *native* `ListBuckets` API,
@@ -200,6 +260,19 @@ struct OssNativeAuth {
     region: String,
     access_key_id: String,
     secret_access_key: String,
+    /// Bucket name -> region, as reported by OSS's native `ListBuckets`.
+    /// Filled by [`S3Provider::list_buckets`] (whenever the sidebar expands
+    /// this connection) and lazily by [`S3Provider::client_for`] on a cache
+    /// miss. `std::sync::RwLock`, not `tokio::sync::RwLock`: every access
+    /// clones what it needs and drops the guard before any `.await`, so the
+    /// synchronous lock is both correct and cheaper.
+    bucket_regions: RwLock<HashMap<String, String>>,
+    /// Region -> a client already configured for that region's OSS
+    /// S3-compatible endpoint (same credentials, built through
+    /// [`build_client`] -- the same helper [`from_connection`] uses, so the
+    /// two constructions can never drift apart). Populated lazily by
+    /// [`S3Provider::client_for`].
+    region_clients: RwLock<HashMap<String, aws_sdk_s3::Client>>,
 }
 
 impl fmt::Debug for OssNativeAuth {
@@ -209,7 +282,13 @@ impl fmt::Debug for OssNativeAuth {
             .field("region", &self.region)
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"<redacted>")
-            .finish()
+            // `finish_non_exhaustive` rather than listing `bucket_regions` /
+            // `region_clients`: both are process-local routing caches with
+            // nothing secret in them, but their content is noisy and
+            // irrelevant to what this `Debug` impl exists to guard (the
+            // secret above never printing in the clear), so they're
+            // deliberately left out rather than dumped.
+            .finish_non_exhaustive()
     }
 }
 
@@ -227,6 +306,69 @@ pub struct S3Provider {
     /// `S3Provider` keeps `#[derive(Debug)]` safely because this field's own
     /// `Debug` impl is hand-redacted.
     oss_native: Option<OssNativeAuth>,
+}
+
+/// Builds an `aws_sdk_s3::Client` for one `(provider, endpoint, region)` +
+/// credential set.
+///
+/// This is the **single** place `aws_sdk_s3::Config` gets built in this
+/// module -- both [`from_connection`] (the connection's own default client)
+/// and [`S3Provider::client_for`] (a region-specific OSS client, built from
+/// the *same* credentials against a different region's endpoint) call this
+/// rather than each assembling their own `Config::builder()`. That is
+/// deliberate, not just deduplication: two independently-maintained copies
+/// of this configuration are exactly how the class of bug this module's
+/// other doc comments warn about (a client silently missing the `s3.`
+/// rewrite, or the non-AWS checksum override, or virtual-hosted addressing)
+/// would creep back in for one of the two call sites but not the other.
+///
+/// `endpoint` is the connection's *raw* endpoint (e.g. `oss-cn-hangzhou.
+/// aliyuncs.com`, no `s3.` prefix, possibly no scheme) -- exactly what
+/// `conn.endpoint` holds, and exactly what [`oss_endpoint_for_region`]
+/// produces from [`OssNativeAuth::endpoint`] (which already carries a
+/// scheme, added once by [`from_connection`]; running it through
+/// [`with_scheme`] again here is a no-op, per that function's own
+/// idempotence). [`s3_compat_endpoint`] and [`with_scheme`] are applied
+/// here, exactly once, to whatever comes in.
+///
+/// Infallible: `aws_sdk_s3::Config::builder().build()` cannot fail (unlike,
+/// e.g., presigning's `PresigningConfig::expires_in`).
+fn build_client(
+    provider: &str,
+    endpoint: &str,
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> aws_sdk_s3::Client {
+    let is_aws = is_aws_endpoint(endpoint);
+
+    let credentials = Credentials::new(
+        access_key_id.to_string(),
+        secret_access_key.to_string(),
+        None,
+        None,
+        "bucketcat",
+    );
+
+    let mut config_builder = aws_sdk_s3::Config::builder()
+        .behavior_version_latest()
+        .endpoint_url(with_scheme(&s3_compat_endpoint(provider, endpoint)))
+        .region(Region::new(region.to_string()))
+        .credentials_provider(credentials)
+        .force_path_style(uses_path_style(provider, endpoint));
+
+    // See `from_connection`'s doc comment: non-AWS endpoints must not get
+    // the SDK's `WhenSupported` default, which breaks R2/older MinIO/Dell
+    // ECS with `NotImplemented`, and OSS specifically with `aws-chunked`
+    // being rejected outright. Real AWS endpoints are left on the SDK
+    // default.
+    if !is_aws {
+        config_builder = config_builder
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+    }
+
+    aws_sdk_s3::Client::from_conf(config_builder.build())
 }
 
 /// Builds an [`S3Provider`] from a saved connection profile.
@@ -300,53 +442,34 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
         conn.region.clone()
     };
 
-    let credentials = Credentials::new(
-        conn.access_key_id.clone(),
-        conn.secret_access_key.clone(),
-        None,
-        None,
-        "bucketcat",
-    );
-
-    // Captured before `region` is moved into `Region::new` below -- `None`
+    // Captured before `region` is moved into `build_client` below -- `None`
     // for every non-OSS connection, since only OSS's native `ListBuckets`
-    // (called from `S3Provider::list_buckets`) needs the *native* endpoint
-    // (pre `s3_compat_endpoint` rewrite) alongside the plain credentials.
+    // (called from `S3Provider::list_buckets`) and the region-routing cache
+    // it feeds (`S3Provider::client_for`) need the *native* endpoint (pre
+    // `s3_compat_endpoint` rewrite) alongside the plain credentials.
     let oss_native = if conn.provider.eq_ignore_ascii_case("oss") {
         Some(OssNativeAuth {
             endpoint: with_scheme(&conn.endpoint),
             region: region.clone(),
             access_key_id: conn.access_key_id.clone(),
             secret_access_key: conn.secret_access_key.clone(),
+            bucket_regions: RwLock::new(HashMap::new()),
+            region_clients: RwLock::new(HashMap::new()),
         })
     } else {
         None
     };
 
-    let mut config_builder = aws_sdk_s3::Config::builder()
-        .behavior_version_latest()
-        .endpoint_url(with_scheme(&s3_compat_endpoint(
-            &conn.provider,
-            &conn.endpoint,
-        )))
-        .region(Region::new(region))
-        .credentials_provider(credentials)
-        .force_path_style(uses_path_style(&conn.provider, &conn.endpoint));
-
-    // See the `from_connection` doc comment: non-AWS endpoints must not get
-    // the SDK's `WhenSupported` default, which breaks R2/older MinIO/Dell
-    // ECS with `NotImplemented`. Real AWS endpoints are left on the SDK
-    // default.
-    if !is_aws {
-        config_builder = config_builder
-            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-            .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
-    }
-
-    let config = config_builder.build();
+    let client = build_client(
+        &conn.provider,
+        &conn.endpoint,
+        &region,
+        &conn.access_key_id,
+        &conn.secret_access_key,
+    );
 
     Ok(S3Provider {
-        client: aws_sdk_s3::Client::from_conf(config),
+        client,
         batch_delete: supports_batch_delete(&conn.provider),
         oss_native,
     })
@@ -768,6 +891,134 @@ pub fn range_header(offset: u64, length: u64) -> String {
 }
 
 impl S3Provider {
+    /// Returns the client that should be used to reach `bucket`.
+    ///
+    /// **Non-OSS** (`self.oss_native` is `None`): returns `self.client.clone()`
+    /// immediately and does nothing else -- OSS is the only backend this app
+    /// targets that fails to route a cross-region request server-side (see
+    /// this module's doc comments), so every other provider always talks to
+    /// the one client [`from_connection`] built. `Client` is `Arc`-backed
+    /// internally, so cloning it is cheap.
+    ///
+    /// **OSS**: resolves `bucket`'s region through two caches on
+    /// [`OssNativeAuth`], both `std::sync::RwLock`-guarded. **A lock guard is
+    /// never held across an `.await` anywhere in this method** -- every
+    /// acquisition below is scoped to a block that either returns or drops
+    /// the guard before the next `await` point, cloning out whatever value
+    /// (a region `String`, or an already-`Arc`-backed `Client`) is actually
+    /// needed first.
+    ///
+    /// 1. Look up `bucket` in the bucket -> region cache. On a miss, call
+    ///    OSS's native `ListBuckets` **once** to (re-)fill the cache -- this
+    ///    is what lets a bucket resolve even if the user never expanded this
+    ///    connection in the sidebar first (e.g. a transfer resumed right
+    ///    after an app restart) -- then look up `bucket` again. A fill
+    ///    failure (network/permission) is not an error from this method's
+    ///    point of view: it's logged at `debug` and treated the same as an
+    ///    unresolved region below, so the caller's own request against the
+    ///    fallback client surfaces any real problem with better context than
+    ///    this routing step ever could.
+    /// 2. If the resolved region equals this connection's configured region,
+    ///    or the region is still unknown after step 1, return
+    ///    `self.client.clone()` unchanged.
+    /// 3. Otherwise, look up (or build and cache) a client for that region in
+    ///    the region -> client cache, via [`build_client`] -- the same
+    ///    helper [`from_connection`] uses, so this can never end up with a
+    ///    subtly different configuration than the connection's own default
+    ///    client. [`oss_endpoint_for_region`] derives the target region's
+    ///    endpoint from [`OssNativeAuth::endpoint`]. Two concurrent callers
+    ///    racing to fill the same unknown region may each build a `Client`
+    ///    (construction is local, no network call -- see `build_client`'s
+    ///    doc comment), but only the first to take the write lock is kept;
+    ///    the other's is simply dropped. Never panics, never deadlocks.
+    ///
+    /// Beyond the one bucket-list call in step 1 on a genuine cache miss,
+    /// this method never itself makes a network request.
+    async fn client_for(&self, bucket: &str) -> aws_sdk_s3::Client {
+        let Some(native) = &self.oss_native else {
+            return self.client.clone();
+        };
+
+        let mut region = {
+            let cache = native
+                .bucket_regions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.get(bucket).cloned()
+        };
+
+        if region.is_none() {
+            match oss_admin::list_buckets(
+                &native.endpoint,
+                &native.region,
+                &native.access_key_id,
+                &native.secret_access_key,
+            )
+            .await
+            {
+                Ok(buckets) => {
+                    let mut cache = native
+                        .bucket_regions
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for b in &buckets {
+                        cache.insert(b.name.clone(), b.region.clone());
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        bucket,
+                        error = %err,
+                        "client_for: native list_buckets failed while resolving this bucket's \
+                         region; falling back to the connection's default client"
+                    );
+                }
+            }
+            region = {
+                let cache = native
+                    .bucket_regions
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cache.get(bucket).cloned()
+            };
+        }
+
+        let Some(region) = region else {
+            return self.client.clone();
+        };
+        if region == native.region {
+            return self.client.clone();
+        }
+
+        {
+            let cache = native
+                .region_clients
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(client) = cache.get(&region) {
+                return client.clone();
+            }
+        }
+
+        let endpoint = oss_endpoint_for_region(&native.endpoint, &native.region, &region);
+        let built = build_client(
+            "oss",
+            &endpoint,
+            &region,
+            &native.access_key_id,
+            &native.secret_access_key,
+        );
+
+        let mut cache = native
+            .region_clients
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // First writer wins: if another concurrent call already inserted a
+        // client for this region, keep that one and let `built` (ours) be
+        // dropped -- never overwrite, never panic, never deadlock.
+        cache.entry(region).or_insert(built).clone()
+    }
+
     /// Deletes `keys` one `DeleteObject` at a time, in batches of up to
     /// [`SINGLE_DELETE_CONCURRENCY`] concurrent requests -- the fallback
     /// [`Provider::delete_objects`] dispatches to when `self.batch_delete`
@@ -775,6 +1026,14 @@ impl S3Provider {
     /// (`DELETE /bucket/key`) has no request body, so unlike Multi-Object
     /// Delete it never needs the `Content-MD5` header OSS demands and
     /// aws-sdk-s3 has no way to send.
+    ///
+    /// Takes an already-resolved `client` (the caller, [`Provider::delete_objects`],
+    /// resolves it once via [`S3Provider::client_for`]) rather than resolving
+    /// one itself per spawned task -- calling `client_for` from inside a
+    /// spawned task would be harmless but wasteful (repeated cache lookups
+    /// for the same bucket) and, worse, would reintroduce the exact
+    /// lock-across-await risk this module's docs warn against if that method
+    /// ever grew a mid-resolution `.await` before returning.
     ///
     /// One batch is fully awaited before the next is spawned (no streaming
     /// scheduling) -- simple, and plenty fast enough at this concurrency
@@ -786,7 +1045,7 @@ impl S3Provider {
     /// doesn't panic) so `succeeded + failed.len() == keys.len()` always
     /// holds.
     async fn delete_objects_one_by_one(
-        &self,
+        client: &aws_sdk_s3::Client,
         bucket: &str,
         keys: &[String],
     ) -> AppResult<BatchResult> {
@@ -796,7 +1055,7 @@ impl S3Provider {
         for chunk in keys.chunks(SINGLE_DELETE_CONCURRENCY) {
             let mut set: JoinSet<(String, Result<(), AppError>)> = JoinSet::new();
             for key in chunk {
-                let client = self.client.clone();
+                let client = client.clone();
                 let bucket = bucket.to_string();
                 let key = key.clone();
                 set.spawn(async move {
@@ -855,6 +1114,22 @@ impl Provider for S3Provider {
                 &native.secret_access_key,
             )
             .await?;
+
+            // Feed the bucket -> region cache `client_for` routes through --
+            // this is the most natural fill point: the sidebar lists a
+            // connection's buckets as soon as it's expanded, well before the
+            // user opens any one of them. No `.await` follows this block, so
+            // the write guard never crosses one.
+            {
+                let mut cache = native
+                    .bucket_regions
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for b in &oss_buckets {
+                    cache.insert(b.name.clone(), b.region.clone());
+                }
+            }
+
             return Ok(oss_buckets
                 .into_iter()
                 .map(|b| Bucket {
@@ -886,7 +1161,8 @@ impl Provider for S3Provider {
     }
 
     async fn create_bucket(&self, name: &str) -> AppResult<()> {
-        self.client
+        let client = self.client_for(name).await;
+        client
             .create_bucket()
             .bucket(name)
             .send()
@@ -896,7 +1172,8 @@ impl Provider for S3Provider {
     }
 
     async fn delete_bucket(&self, name: &str) -> AppResult<()> {
-        self.client
+        let client = self.client_for(name).await;
+        client
             .delete_bucket()
             .bucket(name)
             .send()
@@ -912,8 +1189,8 @@ impl Provider for S3Provider {
         token: Option<&str>,
         max_keys: i32,
     ) -> AppResult<ListPage> {
-        let mut request = self
-            .client
+        let client = self.client_for(bucket).await;
+        let mut request = client
             .list_objects_v2()
             .bucket(bucket)
             .delimiter("/")
@@ -929,8 +1206,9 @@ impl Provider for S3Provider {
     }
 
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> AppResult<BatchResult> {
+        let client = self.client_for(bucket).await;
         if !self.batch_delete {
-            return self.delete_objects_one_by_one(bucket, keys).await;
+            return Self::delete_objects_one_by_one(&client, bucket, keys).await;
         }
 
         let mut succeeded: u32 = 0;
@@ -957,8 +1235,7 @@ impl Provider for S3Provider {
             // key in the failing chunk is instead recorded as failed via
             // `chunk_failure_keys`, and the loop moves on to the next
             // chunk.
-            match self
-                .client
+            match client
                 .delete_objects()
                 .bucket(bucket)
                 .delete(delete)
@@ -1036,7 +1313,8 @@ impl Provider for S3Provider {
                 message: "rename requires distinct, non-empty source and target keys".to_string(),
             });
         }
-        self.client
+        let client = self.client_for(bucket).await;
+        client
             .copy_object()
             .bucket(bucket)
             .copy_source(encode_copy_source(bucket, from_key))
@@ -1044,7 +1322,7 @@ impl Provider for S3Provider {
             .send()
             .await
             .map_err(normalize_s3_error)?;
-        self.client
+        client
             .delete_object()
             .bucket(bucket)
             .key(from_key)
@@ -1056,7 +1334,8 @@ impl Provider for S3Provider {
 
     async fn create_folder(&self, bucket: &str, prefix: &str) -> AppResult<()> {
         let key = folder_marker_key(prefix)?;
-        self.client
+        let client = self.client_for(bucket).await;
+        client
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -1075,7 +1354,8 @@ impl Provider for S3Provider {
         length: u64,
     ) -> AppResult<()> {
         let body = body_range(path, 0, length).await?;
-        self.client
+        let client = self.client_for(bucket).await;
+        client
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -1087,8 +1367,8 @@ impl Provider for S3Provider {
     }
 
     async fn multipart_init(&self, bucket: &str, key: &str) -> AppResult<String> {
-        let out = self
-            .client
+        let client = self.client_for(bucket).await;
+        let out = client
             .create_multipart_upload()
             .bucket(bucket)
             .key(key)
@@ -1115,8 +1395,8 @@ impl Provider for S3Provider {
         length: u64,
     ) -> AppResult<String> {
         let body = body_range(path, offset, length).await?;
-        let out = self
-            .client
+        let client = self.client_for(bucket).await;
+        let out = client
             .upload_part()
             .bucket(bucket)
             .key(key)
@@ -1153,7 +1433,8 @@ impl Provider for S3Provider {
             })
             .collect();
 
-        self.client
+        let client = self.client_for(bucket).await;
+        client
             .complete_multipart_upload()
             .bucket(bucket)
             .key(key)
@@ -1170,7 +1451,8 @@ impl Provider for S3Provider {
     }
 
     async fn multipart_abort(&self, bucket: &str, key: &str, upload_id: &str) -> AppResult<()> {
-        self.client
+        let client = self.client_for(bucket).await;
+        client
             .abort_multipart_upload()
             .bucket(bucket)
             .key(key)
@@ -1187,11 +1469,11 @@ impl Provider for S3Provider {
         key: &str,
         upload_id: &str,
     ) -> AppResult<Vec<UploadedPart>> {
+        let client = self.client_for(bucket).await;
         let mut out = Vec::new();
         let mut marker: Option<String> = None;
         loop {
-            let mut req = self
-                .client
+            let mut req = client
                 .list_parts()
                 .bucket(bucket)
                 .key(key)
@@ -1224,8 +1506,8 @@ impl Provider for S3Provider {
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> AppResult<ObjectHead> {
-        let out = self
-            .client
+        let client = self.client_for(bucket).await;
+        let out = client
             .head_object()
             .bucket(bucket)
             .key(key)
@@ -1255,8 +1537,8 @@ impl Provider for S3Provider {
         if length == 0 {
             return Ok(Vec::new());
         }
-        let out = self
-            .client
+        let client = self.client_for(bucket).await;
+        let out = client
             .get_object()
             .bucket(bucket)
             .key(key)
@@ -1277,8 +1559,8 @@ impl Provider for S3Provider {
         token: Option<&str>,
         max_keys: i32,
     ) -> AppResult<ListPage> {
-        let mut req = self
-            .client
+        let client = self.client_for(bucket).await;
+        let mut req = client
             .list_objects_v2()
             .bucket(bucket)
             .prefix(prefix)
@@ -1313,8 +1595,8 @@ impl Provider for S3Provider {
         .map_err(|e| AppError::Internal {
             message: format!("presign config: {e}"),
         })?;
-        let req = self
-            .client
+        let client = self.client_for(bucket).await;
+        let req = client
             .get_object()
             .bucket(bucket)
             .key(key)
@@ -1586,6 +1868,103 @@ mod tests {
         assert!(supports_batch_delete("generic"));
     }
 
+    // --- oss_endpoint_for_region (pure) --------------------------------------
+
+    #[test]
+    fn oss_endpoint_for_region_rewrites_the_extranet_host() {
+        assert_eq!(
+            oss_endpoint_for_region(
+                "https://oss-cn-beijing.aliyuncs.com",
+                "cn-beijing",
+                "cn-shanghai"
+            ),
+            "https://oss-cn-shanghai.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn oss_endpoint_for_region_preserves_the_intranet_suffix() {
+        assert_eq!(
+            oss_endpoint_for_region(
+                "https://oss-cn-beijing-internal.aliyuncs.com",
+                "cn-beijing",
+                "cn-shanghai"
+            ),
+            "https://oss-cn-shanghai-internal.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn oss_endpoint_for_region_works_without_a_scheme() {
+        assert_eq!(
+            oss_endpoint_for_region("oss-cn-beijing.aliyuncs.com", "cn-beijing", "cn-shanghai"),
+            "oss-cn-shanghai.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn oss_endpoint_for_region_same_region_is_a_no_op() {
+        assert_eq!(
+            oss_endpoint_for_region(
+                "https://oss-cn-beijing.aliyuncs.com",
+                "cn-beijing",
+                "cn-beijing"
+            ),
+            "https://oss-cn-beijing.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn oss_endpoint_for_region_leaves_a_custom_domain_untouched() {
+        // A CNAME'd custom domain doesn't contain `oss-{from_region}` at
+        // all -- this can't be reliably mapped to another region by string
+        // substitution, so the caller (`client_for`) is expected to fall
+        // back to the default client instead.
+        assert_eq!(
+            oss_endpoint_for_region("https://cdn.example.com", "cn-beijing", "cn-shanghai"),
+            "https://cdn.example.com"
+        );
+    }
+
+    #[test]
+    fn oss_endpoint_for_region_is_a_no_op_on_a_non_oss_host() {
+        // Idempotent / harmless on a host this function was never meant to
+        // touch -- e.g. the local MinIO dev endpoint. `client_for` must
+        // never mangle a non-OSS connection's endpoint.
+        assert_eq!(
+            oss_endpoint_for_region("http://127.0.0.1:9000", "cn-beijing", "cn-shanghai"),
+            "http://127.0.0.1:9000"
+        );
+    }
+
+    #[test]
+    fn oss_endpoint_for_region_preserves_a_custom_port_and_path() {
+        assert_eq!(
+            oss_endpoint_for_region(
+                "https://oss-cn-beijing.aliyuncs.com:8443/some/path",
+                "cn-beijing",
+                "cn-shanghai"
+            ),
+            "https://oss-cn-shanghai.aliyuncs.com:8443/some/path"
+        );
+    }
+
+    #[test]
+    fn oss_endpoint_for_region_rewrites_the_s3_compat_prefixed_host_too() {
+        // `client_for` always feeds this the *native* `OssNativeAuth::endpoint`
+        // (never the `s3.`-prefixed form), but the rewrite must also work on
+        // an already-`s3.`-prefixed host: `oss-{from_region}` still occurs
+        // as a substring of `s3.oss-{from_region}...`.
+        assert_eq!(
+            oss_endpoint_for_region(
+                "https://s3.oss-cn-beijing.aliyuncs.com",
+                "cn-beijing",
+                "cn-shanghai"
+            ),
+            "https://s3.oss-cn-shanghai.aliyuncs.com"
+        );
+    }
+
     // --- from_connection ---------------------------------------------------
 
     #[test]
@@ -1770,6 +2149,136 @@ mod tests {
             "unexpected presigned URL: {url}"
         );
         assert_eq!(conn.endpoint, "s3.amazonaws.com");
+    }
+
+    // --- client_for ----------------------------------------------------------
+    //
+    // These only ever exercise `client_for`'s CACHE HIT paths -- the bucket
+    // -> region cache is seeded directly (`mod tests` can reach
+    // `OssNativeAuth`'s private fields, being a child module of `s3`), never
+    // left empty. That's deliberate, not just convenient: an empty cache
+    // sends `client_for` down its lazy-fill branch, which calls the real
+    // `oss_admin::list_buckets` -- an actual network request against
+    // whatever `native.endpoint` is configured to. This crate's tests must
+    // never make a live request to a real Aliyun endpoint (see
+    // `tests/oss_e2e.rs`'s safety rules), so that branch is deliberately
+    // left to code review / the live e2e suite rather than a unit test here.
+    //
+    // `presign_get` is the vehicle for observing which client `client_for`
+    // picked, exactly like the existing `oss_connection_presigned_url_is_..`
+    // tests above: presigning is local-only computation (no request is ever
+    // sent), so the resulting URL's host reveals the endpoint the returned
+    // `Client` was configured with, with zero network I/O.
+
+    /// An OSS `S3Provider` (region `cn-hangzhou`, see `oss_connection`) whose
+    /// bucket -> region cache already has one entry -- a cache HIT, so
+    /// `client_for` never reaches its network-calling fallback branch.
+    fn oss_provider_with_cached_region(bucket: &str, region: &str) -> S3Provider {
+        let provider = from_connection(&oss_connection()).unwrap();
+        let native = provider
+            .oss_native
+            .as_ref()
+            .expect("oss_connection() must produce oss_native");
+        native
+            .bucket_regions
+            .write()
+            .unwrap()
+            .insert(bucket.to_string(), region.to_string());
+        provider
+    }
+
+    #[tokio::test]
+    async fn client_for_returns_the_default_client_unchanged_for_non_oss_connections() {
+        // Non-OSS connections have `oss_native == None`, so `client_for`
+        // must return `self.client.clone()` immediately -- no cache lookup,
+        // no possibility of ever calling `oss_admin::list_buckets`.
+        let provider = from_connection(&minio_connection()).unwrap();
+
+        let client = provider.client_for("any-bucket").await;
+
+        assert_eq!(
+            client.config().region().map(|r| r.as_ref()),
+            provider.client.config().region().map(|r| r.as_ref()),
+        );
+    }
+
+    #[tokio::test]
+    async fn client_for_returns_the_default_client_when_the_bucket_is_in_the_connection_region() {
+        // `oss_connection()`'s configured region is "cn-hangzhou" -- caching
+        // that same region for the bucket must short-circuit to the default
+        // client rather than building a redundant "different" one.
+        let provider = oss_provider_with_cached_region("same-region-bucket", "cn-hangzhou");
+
+        let url = provider
+            .presign_get("same-region-bucket", "docs/readme.md", 60)
+            .await
+            .expect("presigning is local-only, no network involved");
+
+        assert!(
+            url.starts_with("https://same-region-bucket.s3.oss-cn-hangzhou.aliyuncs.com/"),
+            "unexpected presigned URL: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_for_routes_to_a_region_specific_client_for_a_cross_region_bucket() {
+        let provider = oss_provider_with_cached_region("shanghai-bucket", "cn-shanghai");
+
+        let url = provider
+            .presign_get("shanghai-bucket", "docs/readme.md", 60)
+            .await
+            .expect("presigning is local-only, no network involved");
+
+        // Virtual-hosted, on the *cn-shanghai* S3-compat host -- proves
+        // `client_for` picked a client built via `oss_endpoint_for_region` +
+        // `build_client` for the bucket's own region, not the connection's
+        // configured `cn-hangzhou` default.
+        assert!(
+            url.starts_with("https://shanghai-bucket.s3.oss-cn-shanghai.aliyuncs.com/"),
+            "unexpected presigned URL: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_for_caches_the_built_region_client_and_reuses_it() {
+        let provider = oss_provider_with_cached_region("shanghai-bucket", "cn-shanghai");
+
+        let _ = provider.client_for("shanghai-bucket").await;
+        let _ = provider.client_for("shanghai-bucket").await;
+
+        let native = provider.oss_native.as_ref().unwrap();
+        let cache = native.region_clients.read().unwrap();
+        assert_eq!(
+            cache.len(),
+            1,
+            "a second call for an already-cached region must reuse the cached client, not \
+             build (and cache) a new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_for_shares_one_cached_client_across_buckets_in_the_same_non_default_region() {
+        // The region -> client cache is keyed by REGION, not by bucket: two
+        // different buckets that both resolve to "cn-shanghai" must share
+        // exactly one cached client.
+        let provider = from_connection(&oss_connection()).unwrap();
+        {
+            let native = provider.oss_native.as_ref().unwrap();
+            let mut cache = native.bucket_regions.write().unwrap();
+            cache.insert("bucket-a".to_string(), "cn-shanghai".to_string());
+            cache.insert("bucket-b".to_string(), "cn-shanghai".to_string());
+        }
+
+        let _ = provider.client_for("bucket-a").await;
+        let _ = provider.client_for("bucket-b").await;
+
+        let native = provider.oss_native.as_ref().unwrap();
+        let cache = native.region_clients.read().unwrap();
+        assert_eq!(
+            cache.len(),
+            1,
+            "two buckets resolving to the same region must share one cached client"
+        );
     }
 
     #[test]

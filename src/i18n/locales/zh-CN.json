@@ -9,7 +9,7 @@
     "loadingBuckets": "正在加载存储桶…",
     "retry": "重试",
     "noBuckets": "没有存储桶",
-    "bucketRegionHint": "该存储桶位于 {{region}}，与当前连接的区域不同",
+    "bucketRegionHint": "该存储桶位于 {{region}}，请求会自动路由到该区域",
     "emptyTitle": "还没有连接",
     "emptyHint": "点击右上角的 + 添加第一个连接"
   },
