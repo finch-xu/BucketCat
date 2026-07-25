@@ -260,25 +260,55 @@ async fn list_objects_on_the_test_bucket_succeeds() {
 /// would let the UI resolve that automatically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn s3_compat_list_buckets_works() {
+async fn native_list_buckets_reports_each_bucket_region() {
     let conn = oss_connection();
     let provider = from_connection(&conn).expect("a valid OSS connection profile should build");
 
     let buckets = provider.list_buckets().await.expect(
-        "OSS's S3-compatible endpoint should serve account-level ListBuckets (verified \
-         2026-07-25 against a real account, despite its absence from Aliyun's published \
-         S3 compatibility list); if this now fails, OSS's behavior has changed and the \
-         native-API ListBuckets fallback from the design doc becomes necessary",
+        "an OSS connection should list buckets through the native OSS ListBuckets API \
+         (OSS4-HMAC-SHA256 signed); a failure here means the signer, the native endpoint, \
+         or the XML parsing is wrong",
     );
 
     // The configured sandbox bucket must be in its own account listing --
     // proves we read a real account-level response, not an empty stub.
     let bucket = oss_bucket();
-    assert!(
-        buckets.iter().any(|b| b.name == bucket),
-        "the configured test bucket `{bucket}` should appear in its own account's bucket \
-         listing, got: {buckets:?}"
+    let found = buckets
+        .iter()
+        .find(|b| b.name == bucket)
+        .unwrap_or_else(|| {
+            panic!(
+                "the configured test bucket `{bucket}` should appear in its own account's bucket \
+             listing, got: {buckets:?}"
+            )
+        });
+
+    // The whole reason OSS lists natively rather than over the S3-compatible
+    // endpoint: only the native response carries each bucket's own region.
+    // The S3-compatible one returns name + creation date only, so if this
+    // assertion fails the provider has silently fallen back to it and the
+    // region-aware routing built on top of this has nothing to route with.
+    let region = found.region.as_deref().unwrap_or_else(|| {
+        panic!("bucket `{bucket}` must report a region from the native ListBuckets API, got: {found:?}")
+    });
+    assert_eq!(
+        region, conn.region,
+        "the sandbox bucket's reported region must match the region this connection is \
+         configured for (the suite points at the bucket's own region)"
     );
+
+    // Every bucket in the account must carry a non-empty region, not just
+    // the one we happen to target -- that is what makes cross-region
+    // resolution possible for the buckets this connection is NOT pointed at.
+    for b in &buckets {
+        assert!(
+            b.region.as_deref().is_some_and(|r| !r.is_empty()),
+            "every bucket from the native listing must report a non-empty region, but \
+             `{}` reported {:?}",
+            b.name,
+            b.region
+        );
+    }
 }
 
 // --- 3: small object round trip ----------------------------------------------
