@@ -13,7 +13,6 @@ import {
   FolderDown,
   FolderOpen,
   Loader2,
-  MousePointerClick,
   Pencil,
   Trash2,
   UploadCloud,
@@ -21,6 +20,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
+import logoIcon from "@/assets/logo-icon.png";
 import { cn } from "@/lib/utils";
 import type { ObjectEntry } from "@/lib/api";
 import { basename } from "@/lib/entries";
@@ -41,14 +41,20 @@ function selectModeFromEvent(e: React.MouseEvent): SelectMode {
   return "single";
 }
 
+/** Shared empty/loading/error state. Takes either a lucide `icon` or an
+ * `image`: the design lets the app icon itself carry exactly one state --
+ * "pick a bucket" -- and leaves every other state on a neutral glyph, so
+ * the logo stays an event rather than decoration. */
 function CenterState({
   icon: Icon,
+  image,
   spin = false,
   title,
   hint,
   action,
 }: {
-  icon: ComponentType<{ className?: string }>;
+  icon?: ComponentType<{ className?: string }>;
+  image?: string;
   spin?: boolean;
   title: string;
   hint: string;
@@ -56,7 +62,11 @@ function CenterState({
 }) {
   return (
     <div className="flex h-full min-h-[340px] flex-col items-center justify-center gap-1.5 text-muted-foreground">
-      <Icon className={cn("mb-1.5 size-11 text-muted2", spin && "animate-spin")} />
+      {image ? (
+        <img src={image} alt="" className="mb-1.5 size-[92px] rounded-[20px] opacity-90" />
+      ) : (
+        Icon && <Icon className={cn("mb-1.5 size-11 text-muted2", spin && "animate-spin")} />
+      )}
       <p className="text-sm font-semibold text-fg2">{title}</p>
       {hint && <p className="max-w-[420px] text-center text-[12.5px]">{hint}</p>}
       {action}
@@ -99,19 +109,41 @@ function useEntryHandlers(orderedFileKeys: string[]) {
  * marker unreachable from any UI gesture). */
 function RowActions({
   entry,
+  selected,
   onDownloadFile,
   onDownloadFolder,
 }: {
   entry: ObjectEntry;
+  selected: boolean;
   onDownloadFile: (entry: ObjectEntry) => void;
   onDownloadFolder: (entry: ObjectEntry) => void;
 }) {
   const { t } = useTranslation();
   const { openRename, openDeleteObjects } = useApp();
 
+  // A selected row keeps its actions on screen and floats them on a raised
+  // surface; an unselected row still reveals them only on hover/focus.
+  const container = cn(
+    "flex w-[92px] shrink-0 items-center justify-end gap-0.5",
+    !selected && "opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
+  );
+  const neutralAction = cn(
+    "flex size-6 cursor-pointer items-center justify-center rounded-[6px] hover:bg-active hover:text-primary",
+    selected ? "bg-raised text-primary shadow-[0_1px_2px_var(--shadow)]" : "text-muted-foreground",
+  );
+  const dangerAction = cn(
+    "flex size-6 cursor-pointer items-center justify-center rounded-[6px] hover:bg-destructive/10 hover:text-destructive",
+    selected
+      ? "bg-raised text-destructive shadow-[0_1px_2px_var(--shadow)]"
+      : "text-muted-foreground",
+  );
+
   if (entry.is_prefix) {
+    // Folders are never selected -- clicking one clears the selection -- so
+    // this branch always renders the unselected styling in practice. It uses
+    // the same class builders anyway so the two branches don't drift.
     return (
-      <span className="flex w-[92px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+      <span className={container}>
         <button
           type="button"
           onClick={(e) => {
@@ -120,7 +152,7 @@ function RowActions({
           }}
           title={t("objects.downloadFolder")}
           aria-label={t("objects.downloadFolder")}
-          className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-active hover:text-primary"
+          className={neutralAction}
         >
           <FolderDown className="size-3.5" />
         </button>
@@ -132,7 +164,7 @@ function RowActions({
           }}
           title={t("objects.delete")}
           aria-label={t("objects.delete")}
-          className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+          className={dangerAction}
         >
           <Trash2 className="size-3.5" />
         </button>
@@ -141,7 +173,7 @@ function RowActions({
   }
 
   return (
-    <span className="flex w-[92px] shrink-0 items-center justify-end gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+    <span className={container}>
       <button
         type="button"
         onClick={(e) => {
@@ -150,7 +182,7 @@ function RowActions({
         }}
         title={t("objects.download")}
         aria-label={t("objects.download")}
-        className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-active hover:text-primary"
+        className={neutralAction}
       >
         <Download className="size-3.5" />
       </button>
@@ -162,7 +194,7 @@ function RowActions({
         }}
         title={t("objects.rename")}
         aria-label={t("objects.rename")}
-        className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-active hover:text-primary"
+        className={neutralAction}
       >
         <Pencil className="size-3.5" />
       </button>
@@ -174,7 +206,7 @@ function RowActions({
         }}
         title={t("objects.delete")}
         aria-label={t("objects.delete")}
-        className="flex size-6 cursor-pointer items-center justify-center rounded-[6px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+        className={dangerAction}
       >
         <Trash2 className="size-3.5" />
       </button>
@@ -309,6 +341,9 @@ function ListView({
               )}
               style={{ height: vi.size, transform: `translateY(${vi.start}px)` }}
             >
+              {/* Selection marker. The row is itself absolutely positioned,
+               * which already makes it the containing block for this. */}
+              {selected && <span className="absolute inset-y-0 left-0 w-[2px] bg-primary" />}
               <span className="flex min-w-0 flex-1 items-center gap-[11px]">
                 <Icon className="size-[18px] shrink-0" style={{ color: meta.color }} />
                 <span
@@ -331,6 +366,7 @@ function ListView({
               </span>
               <RowActions
                 entry={entry}
+                selected={selected}
                 onDownloadFile={onDownloadFile}
                 onDownloadFolder={onDownloadFolder}
               />
@@ -499,7 +535,7 @@ export function FileBrowser() {
   if (!activeBucket) {
     body = (
       <CenterState
-        icon={MousePointerClick}
+        image={logoIcon}
         title={t("main.selectBucketTitle")}
         hint={t("main.selectBucketHint")}
       />
@@ -573,6 +609,9 @@ export function FileBrowser() {
           <span className="text-[13.5px] font-semibold">
             {guardReady ? t("upload.dropHint") : t("objects.checkingNames")}
           </span>
+          {/* Names the destination folder. Skipped at the bucket root, where
+           * a bare "/" would carry no information. */}
+          {path.length > 0 && <span className="text-[12px] text-fg2">{`${path.join("/")}/`}</span>}
         </div>
       )}
       {dialog}
