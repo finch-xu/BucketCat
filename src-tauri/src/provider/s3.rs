@@ -48,6 +48,86 @@ pub fn is_aws_endpoint(endpoint: &str) -> bool {
     host == "amazonaws.com" || host.ends_with(".amazonaws.com")
 }
 
+/// Whether `force_path_style` should be `true` (bucket in the URL path)
+/// for this connection.
+///
+/// - Real AWS ([`is_aws_endpoint`] true) -> `false` (virtual-hosted): AWS
+///   supports and expects bucket-subdomain addressing.
+/// - Aliyun OSS (`provider` case-insensitively `"oss"`) -> `false`: OSS's
+///   own docs state it supports *only* virtual-hosted addressing for
+///   security reasons and rejects path-style requests outright, unlike
+///   every other backend this app targets.
+/// - Everything else (MinIO / R2 / COS / B2 / generic / unknown) -> `true`,
+///   unchanged from the pre-OSS behavior: those backends don't support
+///   wildcard DNS for bucket subdomains, so virtual-hosted addressing
+///   breaks for them.
+pub fn uses_path_style(provider: &str, endpoint: &str) -> bool {
+    if is_aws_endpoint(endpoint) {
+        return false;
+    }
+    if provider.eq_ignore_ascii_case("oss") {
+        return false;
+    }
+    true
+}
+
+/// Normalizes an OSS endpoint to its S3-compatible form by prefixing the
+/// hostname with `s3.`. Non-OSS connections are returned byte-for-byte
+/// unchanged -- this must never touch MinIO/R2/other endpoints.
+///
+/// Aliyun's *native* OSS endpoint (`oss-cn-hangzhou.aliyuncs.com`, which is
+/// what the frontend prefills as the OSS default and what later M5 tasks'
+/// native ListBuckets call needs) is a different address from its
+/// *S3-compatible* endpoint (`s3.oss-cn-hangzhou.aliyuncs.com`) -- only the
+/// latter accepts S3 API calls. This function performs that one conversion,
+/// conservatively: it only adds the prefix when the host starts with
+/// `oss-` (Aliyun's own naming convention for both public and
+/// `-internal` regional hosts), leaving any host it doesn't recognize
+/// (e.g. a user-supplied private domain) untouched rather than guessing.
+/// It is idempotent: a host that already starts with `s3.oss-` is left
+/// alone, so calling this twice (or on an endpoint the user already saved
+/// in S3-compatible form) never produces `s3.s3....`.
+pub fn s3_compat_endpoint(provider: &str, endpoint: &str) -> String {
+    if !provider.eq_ignore_ascii_case("oss") {
+        return endpoint.to_string();
+    }
+
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, endpoint),
+    };
+    // Split off any path/query so the prefix check and rewrite only ever
+    // touch the host, not something that happens to follow it.
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+    // Host only (strip a trailing `:port`), mirroring `is_aws_endpoint`'s
+    // approach -- but the possibly-porty `authority` is what actually gets
+    // rewritten below, so the port (if any) survives untouched.
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    };
+
+    if !host.starts_with("oss-") {
+        return endpoint.to_string();
+    }
+
+    let mut result = String::new();
+    if let Some(scheme) = scheme {
+        result.push_str(scheme);
+        result.push_str("://");
+    }
+    result.push_str("s3.");
+    result.push_str(authority);
+    if let Some(path) = path {
+        result.push('/');
+        result.push_str(path);
+    }
+    result
+}
+
 /// A constructed S3 (or S3-compatible) admin-plane client for one saved
 /// [`Connection`].
 #[derive(Debug)]
@@ -73,16 +153,34 @@ pub struct S3Provider {
 ///   signals the same kind of upstream-validation gap, and silently
 ///   guessing `"us-east-1"` for a real AWS account risks pointing
 ///   requests at the wrong region instead of failing fast.
-/// - `force_path_style` is the negation of [`is_aws_endpoint`]: MinIO, R2
-///   and other self-hosted backends need path-style addressing.
-/// - For every non-AWS endpoint, `request_checksum_calculation` and
-///   `response_checksum_validation` are both explicitly set to
+/// - `force_path_style` comes from [`uses_path_style`], not a plain negation
+///   of [`is_aws_endpoint`] anymore: real AWS and Aliyun OSS both need
+///   virtual-hosted addressing (`force_path_style(false)`) -- OSS's own docs
+///   say it supports *only* virtual-hosted access for security reasons and
+///   rejects path-style requests outright -- while MinIO, R2 and other
+///   self-hosted backends still need path-style addressing (no wildcard DNS
+///   for bucket subdomains).
+/// - The endpoint handed to the SDK is [`s3_compat_endpoint`]'s output, not
+///   `conn.endpoint` directly: Aliyun's *native* OSS endpoint (what the
+///   frontend prefills, and what later M5 tasks' native ListBuckets call
+///   needs) is a different host from its *S3-compatible* endpoint (needs an
+///   `s3.` prefix), and only the latter accepts S3 API calls. `conn.endpoint`
+///   itself is never mutated -- only this local conversion.
+/// - For every non-AWS endpoint (this already includes OSS, since
+///   [`is_aws_endpoint`] is false for `*.aliyuncs.com`), `request_checksum_calculation`
+///   and `response_checksum_validation` are both explicitly set to
 ///   [`RequestChecksumCalculation::WhenRequired`] /
 ///   [`ResponseChecksumValidation::WhenRequired`] (design §2, 2026-07-23
 ///   revision, **mandatory**): aws-sdk-rust >=1.69 defaults both to
 ///   `WhenSupported`, which attaches a request checksum / demands response
-///   checksum validation on every eligible operation -- Cloudflare R2,
-///   older MinIO and Dell ECS all reject that with `NotImplemented`. A real
+///   checksum validation on every eligible operation. For OSS specifically
+///   this is not just the pre-existing R2/older-MinIO/Dell-ECS
+///   `NotImplemented` concern -- a `WhenSupported` request checksum on a
+///   streamed body (every upload here reads from a file stream) is sent as
+///   a trailer, which forces `aws-chunked` transfer encoding, and OSS
+///   rejects `aws-chunked` outright (`InvalidArgument`), failing every OSS
+///   upload. Since this branch is keyed on `!is_aws` (not "is OSS"), it
+///   already covers OSS without widening what MinIO/R2/others get. A real
 ///   AWS endpoint keeps the SDK's own default (`WhenSupported`) untouched.
 pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
     if conn.endpoint.trim().is_empty() {
@@ -114,10 +212,10 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
 
     let mut config_builder = aws_sdk_s3::Config::builder()
         .behavior_version_latest()
-        .endpoint_url(conn.endpoint.clone())
+        .endpoint_url(s3_compat_endpoint(&conn.provider, &conn.endpoint))
         .region(Region::new(region))
         .credentials_provider(credentials)
-        .force_path_style(!is_aws);
+        .force_path_style(uses_path_style(&conn.provider, &conn.endpoint));
 
     // See the `from_connection` doc comment: non-AWS endpoints must not get
     // the SDK's `WhenSupported` default, which breaks R2/older MinIO/Dell
@@ -994,6 +1092,22 @@ mod tests {
         }
     }
 
+    fn oss_connection() -> Connection {
+        Connection {
+            id: "c3".to_string(),
+            provider: "oss".to_string(),
+            name: "aliyun".to_string(),
+            // Native endpoint, exactly what `src/lib/providers.ts` prefills --
+            // deliberately NOT the S3-compatible `s3.`-prefixed form, since
+            // `from_connection` is what must perform that conversion.
+            endpoint: "oss-cn-hangzhou.aliyuncs.com".to_string(),
+            region: "cn-hangzhou".to_string(),
+            access_key_id: "LTAIexample".to_string(),
+            secret_access_key: "secret".to_string(),
+            default_bucket: None,
+        }
+    }
+
     // --- is_aws_endpoint -------------------------------------------------
 
     #[test]
@@ -1046,6 +1160,77 @@ mod tests {
         assert!(!is_aws_endpoint(""));
     }
 
+    // --- uses_path_style / s3_compat_endpoint (pure) ------------------------
+
+    #[test]
+    fn oss_uses_virtual_hosted_style() {
+        assert!(!uses_path_style("oss", "oss-cn-hangzhou.aliyuncs.com"));
+        assert!(!uses_path_style(
+            "OSS",
+            "https://oss-cn-beijing.aliyuncs.com"
+        ));
+    }
+
+    #[test]
+    fn aws_uses_virtual_hosted_style() {
+        assert!(!uses_path_style("s3", "s3.amazonaws.com"));
+        assert!(!uses_path_style("s3", "https://s3.us-west-2.amazonaws.com"));
+    }
+
+    #[test]
+    fn other_backends_keep_path_style() {
+        assert!(uses_path_style("minio", "http://127.0.0.1:9000"));
+        assert!(uses_path_style(
+            "r2",
+            "https://acct.r2.cloudflarestorage.com"
+        ));
+        assert!(uses_path_style("generic", "https://storage.example.com"));
+        assert!(uses_path_style(
+            "cos",
+            "https://cos.ap-guangzhou.myqcloud.com"
+        ));
+    }
+
+    #[test]
+    fn oss_endpoint_gets_the_s3_compat_prefix() {
+        assert_eq!(
+            s3_compat_endpoint("oss", "oss-cn-hangzhou.aliyuncs.com"),
+            "s3.oss-cn-hangzhou.aliyuncs.com"
+        );
+        assert_eq!(
+            s3_compat_endpoint("oss", "https://oss-cn-hangzhou.aliyuncs.com"),
+            "https://s3.oss-cn-hangzhou.aliyuncs.com"
+        );
+        assert_eq!(
+            s3_compat_endpoint("oss", "https://oss-cn-shenzhen-internal.aliyuncs.com"),
+            "https://s3.oss-cn-shenzhen-internal.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn s3_compat_prefix_is_idempotent() {
+        assert_eq!(
+            s3_compat_endpoint("oss", "s3.oss-cn-hangzhou.aliyuncs.com"),
+            "s3.oss-cn-hangzhou.aliyuncs.com"
+        );
+        assert_eq!(
+            s3_compat_endpoint("oss", "https://s3.oss-cn-hangzhou.aliyuncs.com"),
+            "https://s3.oss-cn-hangzhou.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn non_oss_endpoints_are_untouched() {
+        assert_eq!(
+            s3_compat_endpoint("minio", "http://127.0.0.1:9000"),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(
+            s3_compat_endpoint("s3", "https://s3.amazonaws.com"),
+            "https://s3.amazonaws.com"
+        );
+    }
+
     // --- from_connection ---------------------------------------------------
 
     #[test]
@@ -1074,6 +1259,72 @@ mod tests {
     #[test]
     fn valid_minio_connection_builds_successfully() {
         assert!(from_connection(&minio_connection()).is_ok());
+    }
+
+    #[test]
+    fn valid_oss_connection_builds_successfully() {
+        assert!(from_connection(&oss_connection()).is_ok());
+    }
+
+    // `aws_sdk_s3::Config` has no public getter for `force_path_style` or
+    // `endpoint_url` (only `region`/the two checksum settings are exposed,
+    // per the vendored 1.139.0 source), so the wiring is instead verified
+    // black-box through a locally-computed presigned URL below: presigning
+    // resolves the endpoint and chooses path- vs virtual-hosted addressing
+    // exactly like a real request would, but never touches the network.
+    #[tokio::test]
+    async fn oss_connection_presigned_url_is_virtual_hosted_on_the_s3_compat_host() {
+        // Scheme included -- see `oss_connection_without_a_scheme_is_a_known_pre_existing_gap`
+        // below for the (out-of-scope, pre-existing) scheme-less case.
+        let mut conn = oss_connection();
+        conn.endpoint = "https://oss-cn-hangzhou.aliyuncs.com".to_string();
+
+        let provider = from_connection(&conn).unwrap();
+        let url = provider
+            .presign_get("my-bucket", "docs/readme.md", 60)
+            .await
+            .expect("presigning is local-only, no network involved");
+
+        // Virtual-hosted: the bucket is a subdomain of the *S3-compatible*
+        // (`s3.`-prefixed) host, not a path segment on the native one.
+        assert!(
+            url.starts_with("https://my-bucket.s3.oss-cn-hangzhou.aliyuncs.com/"),
+            "unexpected presigned URL: {url}"
+        );
+        // The stored connection itself must never be mutated by
+        // `from_connection` -- the native endpoint is still needed by
+        // later M5 tasks' native OSS ListBuckets call.
+        assert_eq!(conn.endpoint, "https://oss-cn-hangzhou.aliyuncs.com");
+    }
+
+    #[tokio::test]
+    async fn oss_connection_without_a_scheme_is_a_known_pre_existing_gap() {
+        // PINS A KNOWN, PRE-EXISTING, OUT-OF-SCOPE GAP (not introduced or
+        // worsened by this task): `aws_sdk_s3::Config::endpoint_url` requires
+        // an absolute URI (a scheme), and neither `s3_compat_endpoint` (per
+        // this task's exact spec) nor anything else in `from_connection`
+        // adds one. `src/lib/providers.ts`'s OSS default endpoint
+        // ("oss-cn-hangzhou.aliyuncs.com") has no scheme, and the
+        // add-connection wizard prefills that value verbatim into the form
+        // -- so an OSS connection saved without manually adding "https://"
+        // to the endpoint field will fail here.
+        //
+        // This is NOT OSS-specific: the same failure reproduces for
+        // `aws_connection()`'s bare AWS default ("s3.amazonaws.com", also
+        // schemeless in `providers.ts`), so it predates and is orthogonal
+        // to this task's 3 required fixes. Left unfixed here per the brief's
+        // exact `s3_compat_endpoint` contract (no scheme injection) and
+        // "don't touch other providers' behavior" constraint -- flagged in
+        // the task report as a follow-up.
+        let conn = oss_connection();
+        assert_eq!(conn.endpoint, "oss-cn-hangzhou.aliyuncs.com");
+
+        let provider = from_connection(&conn).unwrap();
+        let result = provider
+            .presign_get("my-bucket", "docs/readme.md", 60)
+            .await;
+
+        assert!(matches!(result, Err(AppError::Unreachable)));
     }
 
     #[test]
