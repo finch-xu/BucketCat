@@ -11,10 +11,15 @@
 //! ## What this suite proves about Rainyun specifically
 //!
 //! Rainyun's S3 endpoint ("雨云对象存储 ROS") is a MinIO cluster behind an
-//! APISIX gateway. Four facts, all verified live on 2026-07-25 by probing
-//! the real endpoint, are what let it work with **no provider-specific code
-//! in `provider::s3`** -- the whole design premise of this integration was
-//! zero backend change:
+//! APISIX gateway. The original design premise of this integration was zero
+//! backend change, and four facts -- all verified live on 2026-07-25 by
+//! probing the real endpoint -- confirm Rainyun needs none of them to be
+//! addressed, listed, uploaded to, or presigned against:
+//!
+//! Batch delete is the one exception: this suite's first live run (also
+//! 2026-07-25, same probing session) is what caught it, and `provider::s3`
+//! now has exactly one line of Rainyun-specific code as a result -- see
+//! "The one actual special case" below, after these four.
 //!
 //! - **Path-style addressing is mandatory.** `bucket.cn-nb1.rains3.com` gets
 //!   `404 Route Not Found` from the gateway -- APISIX has no wildcard
@@ -44,6 +49,39 @@
 //!   the **only** test that can catch a regression there: a unit test on a
 //!   config value cannot prove wire behavior, and it is the streamed,
 //!   multi-part upload path that actually trips over it.
+//!
+//! ## The one actual special case: batch delete
+//!
+//! `provider::s3::supports_batch_delete` returns `false` for `"rainyun"`
+//! (case-insensitively), the **only** place `provider::s3` branches on the
+//! Rainyun provider string at all. Every other behavior above rides the
+//! generic non-AWS/non-OSS path unchanged.
+//!
+//! This is not something static analysis found -- it's exactly what this
+//! suite's first live run against a real endpoint exposed, on 2026-07-25.
+//! Before that fix, `supports_batch_delete` returned `true` for Rainyun (it
+//! only special-cased OSS), so every call to `Provider::delete_objects`
+//! here -- single-key or multi-key alike, since the dispatch in
+//! `S3Provider::delete_objects` doesn't look at key count -- went out as a
+//! real Multi-Object Delete (`POST /?delete`) body. Rainyun's MinIO rejects
+//! that request with `400 MissingContentMD5` unless it carries a legacy
+//! `Content-MD5` header; `aws-sdk-s3` only ever sends `x-amz-checksum-*`
+//! flexible checksums and has no way to send `Content-MD5`. The live
+//! symptom was every delete call failing with
+//! `BatchResult { succeeded: 0, failed: [FailedKey { code: "internal" }] }`
+//! -- **four of this file's six tests** (every one that deletes anything:
+//! [`small_object_round_trip`], [`multipart_upload_round_trip`],
+//! [`presigned_get_works`], and [`delete_prefix_removes_every_object_under_it`])
+//! failed that way on that first run.
+//!
+//! The fix folds `"rainyun"` into the same `supports_batch_delete` check
+//! Aliyun OSS already used for the identical reason, so `delete_objects`
+//! now falls back to one `DeleteObject` per key for Rainyun too -- see the
+//! doc comment on `supports_batch_delete` in `provider::s3` for the full
+//! three-way probe (`Content-MD5` present / absent / `x-amz-checksum-crc32`
+//! present) that confirmed the root cause. Every delete call in this file
+//! now exercises that one-by-one fallback rather than the batch endpoint,
+//! which Rainyun simply cannot use via `aws-sdk-s3`.
 //!
 //! ## ⚠️ Hard safety rules this file obeys
 //!
@@ -153,12 +191,16 @@ fn rainyun_bucket() -> String {
 
 /// A `Connection` pointed at the live Rainyun endpoint from the environment.
 ///
-/// `provider` is `"rainyun"`, which is deliberately **not** special-cased
-/// anywhere in `provider::s3`: it falls into `uses_path_style`'s
-/// "everything else" branch (path-style, which the APISIX gateway requires),
-/// `s3_compat_endpoint`'s non-OSS passthrough (the endpoint is used
-/// verbatim), and the non-AWS `RequestChecksumCalculation::WhenRequired`
-/// branch (no `aws-chunked`). See this file's module doc comment.
+/// `provider` is `"rainyun"`, which `provider::s3` special-cases in exactly
+/// one place: `supports_batch_delete` returns `false` for it, the same
+/// fallback Aliyun OSS uses, because Rainyun's MinIO also mandates a legacy
+/// `Content-MD5` header on Multi-Object Delete that `aws-sdk-s3` cannot
+/// send (confirmed live 2026-07-25; see this file's module doc comment,
+/// "The one actual special case"). Everywhere else it falls into the
+/// generic path: `uses_path_style`'s "everything else" branch (path-style,
+/// which the APISIX gateway requires), `s3_compat_endpoint`'s non-OSS
+/// passthrough (the endpoint is used verbatim), and the non-AWS
+/// `RequestChecksumCalculation::WhenRequired` branch (no `aws-chunked`).
 ///
 /// `region` is whatever `BUCKETCAT_RAINYUN_REGION` says; Rainyun never
 /// validates it (fact 3 in the module doc), but the app stores the real
@@ -788,13 +830,22 @@ async fn presigned_get_works() {
 /// deletes it individually via `delete_objects` *before* calling
 /// `cleanup_prefix`, so `cleanup_prefix`'s own `delete_prefix` call always
 /// runs against an already-empty prefix: 0 keys listed, 0 chunks, no
-/// multi-key `delete_objects` request ever issued. `delete_prefix`'s
-/// walk-then-batch-delete logic and Rainyun's handling of a real
-/// `DeleteObjects` (`POST /?delete`) body would otherwise never be exercised
-/// with a >1-key fan-out at all. That last part is not hypothetical: Aliyun
-/// OSS rejects that very request (it mandates a `Content-MD5` the SDK cannot
-/// send), which is why `supports_batch_delete` exists -- it returns `true`
-/// for Rainyun, and this is the test that proves that is right.
+/// multi-key delete request ever issued. `delete_prefix`'s walk-then-delete
+/// logic would otherwise never be exercised with a >1-key fan-out at all.
+///
+/// This test is also, historically, one of the four that caught the real
+/// Rainyun batch-delete bug on this suite's first live run (2026-07-25; see
+/// the module doc comment, "The one actual special case"): back then
+/// `supports_batch_delete` still returned `true` for Rainyun, so this
+/// four-key `delete_prefix` call went out as one real `DeleteObjects`
+/// (`POST /?delete`) body -- which Rainyun's MinIO rejected outright
+/// (`400 MissingContentMD5`). Now that `supports_batch_delete` returns
+/// `false` for Rainyun, this same call instead exercises the one-by-one
+/// `DeleteObject` fallback -- four individual requests, not one batch
+/// request -- so what this test verifies today is `delete_prefix`'s
+/// walk-then-delete *logic* (does it find and remove every key across a
+/// multi-depth tree), not the batch endpoint's wire behavior, which Rainyun
+/// cannot use via `aws-sdk-s3` at all.
 ///
 /// The tree deliberately contains **four** keys of three different shapes:
 /// a top-level object, one nested two levels deep (to exercise the
