@@ -1,6 +1,7 @@
 import {
   Box,
   Cloud,
+  CloudRain,
   Database,
   HardDrive,
   Server,
@@ -31,6 +32,7 @@ export const PROVIDERS: ProviderMeta[] = [
   { id: "r2", name: "Cloudflare R2", descKey: "providers.r2", color: "#F6821F", icon: Cloud, endpoint: "https://<account>.r2.cloudflarestorage.com", region: "auto" },
   { id: "minio", name: "MinIO", descKey: "providers.minio", color: "#C4203F", icon: Server, endpoint: "https://minio.local:9000", region: "us-east-1" },
   { id: "oss", name: "Aliyun OSS", descKey: "providers.oss", color: "#FF6A00", icon: Database, endpoint: "https://oss-cn-hangzhou.aliyuncs.com", region: "cn-hangzhou" },
+  { id: "rainyun", name: "Rainyun ROS", descKey: "providers.rainyun", color: "#3E8BD6", icon: CloudRain, endpoint: "https://cn-nb1.rains3.com", region: "cn-nb1" },
   { id: "cos", name: "Tencent COS", descKey: "providers.cos", color: "#0B63F6", icon: Cloud, endpoint: "https://cos.ap-guangzhou.myqcloud.com", region: "ap-guangzhou" },
   { id: "b2", name: "Backblaze B2", descKey: "providers.b2", color: "#E21E29", icon: HardDrive, endpoint: "https://s3.us-west-004.backblazeb2.com", region: "us-west-004" },
   { id: "generic", name: "", nameKey: "providers.genericName", descKey: "providers.generic", color: "#7d90a0", icon: Box, endpoint: "https://", region: "" },

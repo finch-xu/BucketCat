@@ -26,6 +26,7 @@ export type ProviderKind =
   | "r2"
   | "minio"
   | "oss"
+  | "rainyun"
   | "cos"
   | "b2"
   | "generic"

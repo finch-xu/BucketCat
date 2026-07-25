@@ -10,7 +10,7 @@
 
 ## 功能特性
 
-- **一站接入主流对象存储** — 内置 Amazon S3、Cloudflare R2、MinIO、阿里云 OSS、腾讯云 COS、Backblaze B2 预设，也支持接入任意 S3 兼容服务。
+- **一站接入主流对象存储** — 内置 Amazon S3、Cloudflare R2、MinIO、阿里云 OSS、雨云 ROS、腾讯云 COS、Backblaze B2 预设，也支持接入任意 S3 兼容服务。
 
 - **大文件分片并发传输** — 超过 16 MiB 的文件自动分片，分片大小随文件体积自适应，上传与下载均以多分片并发进行。
 
