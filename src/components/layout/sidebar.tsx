@@ -259,15 +259,26 @@ export function Sidebar() {
        * gone (see `titleBarStyle: "Overlay"` in tauri.conf.json), and Tauri
        * documents that Overlay leaves a window with NO default draggable
        * area -- without this attribute the window could not be moved at all.
-       * On macOS the native traffic lights float over the left of this strip,
-       * so it has to yield 76px; Windows/Linux keep their native title bar
-       * and need no inset.
+       *
+       * On macOS the native traffic lights float over the top-left, so the
+       * strip grows to 80px and pads 28px off the top, dropping the logo and
+       * name *below* the buttons rather than beside them. Yielding vertically
+       * rather than horizontally is also the sturdier bet: Tauri warns that
+       * the title bar's height -- and so where the controls land -- varies by
+       * OS version, and a 28px band clears them with room to spare, whereas a
+       * left inset has to guess their exact horizontal span. Windows and Linux
+       * keep their native title bar, so there the strip is a plain 52px and
+       * the layout is identical minus the reserved band.
+       *
        * The children are `pointer-events-none` on purpose: Tauri decides
        * what is draggable by looking at the event target, so a logo or label
        * that can receive pointer events would swallow drags aimed at it. */}
       <div
         data-tauri-drag-region
-        className={cn("flex h-[52px] shrink-0 items-center gap-2.5 px-3.5", isMac && "pl-[76px]")}
+        className={cn(
+          "flex shrink-0 items-center gap-2.5 px-3.5",
+          isMac ? "h-20 pt-7" : "h-[52px]",
+        )}
       >
         <img
           src={logoIcon}
