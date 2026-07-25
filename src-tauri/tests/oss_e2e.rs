@@ -228,40 +228,48 @@ async fn list_objects_on_the_test_bucket_succeeds() {
     );
 }
 
-// --- 2: documents a known gap, doesn't test a fix ----------------------------
+// --- 2: account-level ListBuckets over the S3-compatible endpoint ------------
 
-/// Records OSS's actual `ListBuckets` behavior through the S3-compatible
-/// endpoint.
+/// Account-level `ListBuckets` **works** through OSS's S3-compatible
+/// endpoint, contradicting Aliyun's published compatibility list.
 ///
-/// Per Aliyun's own documentation (confirmed by the controller against a
-/// real account before this task was written), account-level `ListBuckets`
-/// is **out of scope** for OSS's S3 compatibility layer -- it is only
-/// available through OSS's native API. This test doesn't exercise a fix (there
-/// isn't one yet); it pins the current failure so a later task ("use the
-/// native OSS API for ListBuckets", per the design doc's open item) has a
-/// concrete, reproducible baseline to work against, and so a silent change in
-/// OSS's behavior (e.g. if Aliyun ever adds S3-compatible `ListBuckets`)
-/// would be caught here rather than discovered in production.
+/// Aliyun's "OSS 兼容的 S3 API" page enumerates the supported S3 operations
+/// as Bucket + Object + Multipart only, and account-level
+/// `ListBuckets`/`GetService` is absent from it. BucketCat's design
+/// therefore planned a native-API (OSS4-HMAC-SHA256) call just to list
+/// buckets. **Verified empirically against a real account on 2026-07-25:
+/// `ListBuckets` succeeds over the S3-compatible endpoint**, so that native
+/// call is not needed. This test pins the behavior we actually depend on --
+/// if Aliyun ever removes it, this fails loudly and the native fallback
+/// becomes necessary again.
+///
+/// Known limitation (the reason the native call still has *some* value):
+/// the S3 response carries only name + creation date, **not** each bucket's
+/// region. OSS does not redirect cross-region requests -- it answers
+/// `NoSuchBucket` -- so on an account whose buckets span regions, buckets
+/// outside the connection's configured region will list fine but fail on
+/// access. OSS's *native* `ListBuckets` returns a `Location` per bucket and
+/// would let the UI resolve that automatically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn s3_compat_list_buckets_is_unsupported() {
+async fn s3_compat_list_buckets_works() {
     let conn = oss_connection();
     let provider = from_connection(&conn).expect("a valid OSS connection profile should build");
 
-    let err = provider.list_buckets().await.expect_err(
-        "expected OSS's S3-compatible endpoint to reject account-level ListBuckets -- this is \
-         documented as out of scope for OSS's S3 compatibility layer (native API only); if this \
-         now succeeds, OSS's behavior has changed and the M5 task that adds native-API \
-         ListBuckets support should be revisited",
+    let buckets = provider.list_buckets().await.expect(
+        "OSS's S3-compatible endpoint should serve account-level ListBuckets (verified \
+         2026-07-25 against a real account, despite its absence from Aliyun's published \
+         S3 compatibility list); if this now fails, OSS's behavior has changed and the \
+         native-API ListBuckets fallback from the design doc becomes necessary",
     );
-    // Recorded (not asserted on the specific code/message) since the exact
-    // wire error OSS returns for an out-of-scope operation isn't pinned down
-    // anywhere -- this is purely so a human reading `--nocapture` output (or
-    // a future maintainer diffing behavior) can see exactly what OSS said.
-    eprintln!(
-        "s3_compat_list_buckets_is_unsupported: OSS rejected ListBuckets as expected -- \
-         code={} message={err}",
-        err.code()
+
+    // The configured sandbox bucket must be in its own account listing --
+    // proves we read a real account-level response, not an empty stub.
+    let bucket = oss_bucket();
+    assert!(
+        buckets.iter().any(|b| b.name == bucket),
+        "the configured test bucket `{bucket}` should appear in its own account's bucket \
+         listing, got: {buckets:?}"
     );
 }
 
