@@ -279,7 +279,7 @@ export function DetailsPanel() {
   }
 
   return (
-    <aside className="flex w-[300px] shrink-0 flex-col border-l border-border bg-background">
+    <aside className="flex w-[308px] shrink-0 flex-col border-l border-border bg-background">
       <div className="flex h-[46px] shrink-0 items-center justify-between border-b border-border pr-3 pl-4">
         <span className="text-[13px] font-semibold">{t("details.title")}</span>
         <button
@@ -315,9 +315,10 @@ export function DetailsPanel() {
           <button
             type="button"
             onClick={() => setShareOpen((open) => !open)}
-            className={`inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] border text-[12.5px] font-medium hover:bg-hover ${
-              shareOpen ? "border-primary text-primary" : "border-border bg-background text-fg2"
-            }`}
+            // Share is this panel's marquee action, so it carries the accent
+            // treatment at rest rather than only once expanded. `shareOpen`
+            // still controls the panel below it.
+            className="inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] border border-primary bg-accent-tint text-[12.5px] font-medium text-primary hover:bg-accent-surface"
           >
             <Share2 className="size-3.5" />
             {t("details.share")}
@@ -332,7 +333,7 @@ export function DetailsPanel() {
           </button>
         </div>
         {shareOpen && (
-          <div className="mb-4 flex flex-col gap-2.5 rounded-[9px] border border-border bg-panel p-3">
+          <div className="mb-4 flex flex-col gap-2.5 rounded-[9px] border border-accent-border bg-accent-surface p-3">
             <div>
               <div className="mb-[5px] text-[10.5px] tracking-[0.4px] text-muted-foreground uppercase">
                 {t("details.shareExpiry")}

@@ -38,8 +38,8 @@ const EXT_META: Record<string, FileMeta> = {
   js: { icon: Braces, color: "#5aa86e", labelKey: "fileTypes.js" },
   json: { icon: Braces, color: "#5aa86e", labelKey: "fileTypes.json" },
   code: { icon: Code, color: "#7d90a0", labelKey: "fileTypes.xml" },
-  md: { icon: FileText, color: "#8b877f", labelKey: "fileTypes.md" },
-  txt: { icon: FileText, color: "#8b877f", labelKey: "fileTypes.txt" },
+  md: { icon: FileText, color: "#8794a1", labelKey: "fileTypes.md" },
+  txt: { icon: FileText, color: "#8794a1", labelKey: "fileTypes.txt" },
   csv: { icon: FileText, color: "#5aa86e", labelKey: "fileTypes.csv" },
   woff2: { icon: Type, color: "#c98a4a", labelKey: "fileTypes.font" },
   woff: { icon: Type, color: "#c98a4a", labelKey: "fileTypes.font" },
@@ -51,7 +51,7 @@ const EXT_META: Record<string, FileMeta> = {
   pdf: { icon: File, color: "#d05a5a", labelKey: "fileTypes.pdf" },
 };
 
-const DEFAULT_META: FileMeta = { icon: File, color: "#8b877f", labelKey: "fileTypes.file" };
+const DEFAULT_META: FileMeta = { icon: File, color: "#8794a1", labelKey: "fileTypes.file" };
 
 export function fileMeta(kind: "folder" | "file", ext: string): FileMeta {
   if (kind === "folder") return FOLDER_META;

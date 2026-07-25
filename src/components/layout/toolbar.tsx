@@ -121,7 +121,7 @@ export function Toolbar() {
         aria-label={t("objects.newFolder")}
         disabled={noBucket}
         onClick={openNewFolder}
-        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-background text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-raised text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
       >
         <FolderPlus className="size-[15px]" />
       </button>
@@ -133,7 +133,7 @@ export function Toolbar() {
         onClick={() =>
           queryClient.invalidateQueries({ queryKey: objectsRootKey(activeConn, activeBucket) })
         }
-        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-background text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-raised text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
       >
         <RefreshCw className="size-[15px]" />
       </button>
@@ -153,7 +153,7 @@ export function Toolbar() {
         // looks like it did nothing -- `reportError` turns it into a visible
         // message through the same dialog the upload flow already renders.
         onClick={() => void handleUpload().catch(reportError)}
-        className="inline-flex h-8 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground shadow-[0_2px_6px_-1px_var(--primary-soft)] hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
+        className="inline-flex h-8 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground shadow-[0_2px_6px_-1px_var(--primary-shadow)] hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
       >
         {!noBucket && !guardReady ? (
           <Loader2 className="size-[15px] animate-spin" />

@@ -21,10 +21,8 @@ import {
   type LiveTransfer,
 } from "@/store/transfer-store";
 
-const DONE_COLOR = "#4bb39a";
-
 function colorFor(status: LiveTransfer["status"]): string {
-  if (status === "completed") return DONE_COLOR;
+  if (status === "completed") return "var(--success)";
   if (status === "failed") return "var(--destructive)";
   if (status === "canceled") return "var(--muted2)";
   return "var(--primary)";
@@ -78,6 +76,11 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
 
   const DirIcon = task.direction === "upload" ? Upload : Download;
   const color = colorFor(task.status);
+  // In-flight rows get the accent surface; terminal ones (done, failed,
+  // canceled) fall back to neutral so the panel reads as "these are still
+  // moving" at a glance.
+  const inFlight =
+    task.status === "running" || task.status === "queued" || task.status === "paused";
   const pct =
     task.status === "completed" ? 100 : task.total > 0 ? Math.round((task.transferred / task.total) * 100) : 0;
 
@@ -125,7 +128,12 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
 
   return (
     <div className="flex items-center gap-[11px] rounded-[10px] px-2 py-[9px] hover:bg-hover">
-      <span className="flex size-[30px] shrink-0 items-center justify-center rounded-lg border border-border bg-panel">
+      <span
+        className={cn(
+          "flex size-[30px] shrink-0 items-center justify-center rounded-lg border",
+          inFlight ? "border-accent-border bg-accent-tint" : "border-border bg-panel",
+        )}
+      >
         <DirIcon className="size-[15px]" style={{ color }} />
       </span>
       <div className="min-w-0 flex-1">
