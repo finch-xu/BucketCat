@@ -2,7 +2,8 @@
 name = "bucketcat"
 version = "0.1.0"
 description = "BucketCat — a small and beautiful object storage manager"
-authors = ["BucketCat contributors"]
+authors = ["虚拟世界的懒猫"]
+license = "Apache-2.0"
 edition = "2021"
 rust-version = "1.94.1"
 
