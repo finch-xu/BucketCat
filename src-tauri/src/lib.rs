@@ -4,6 +4,7 @@ pub mod logging;
 pub mod provider;
 pub mod store;
 pub mod transfer;
+pub mod tray;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,12 +12,13 @@ use std::sync::Arc;
 use commands::{
     add_connection, cancel_transfer, clean_checkpoint_residue, clear_finished_transfers,
     create_folder, delete_connection, delete_objects, delete_prefix, enqueue_download,
-    enqueue_folder_download, enqueue_uploads, get_resume_enabled, get_settings, head_object,
-    list_buckets, list_connections, list_objects, list_transfers, pause_transfer, presign_get,
-    rename_object, resume_transfer, retry_transfer, set_max_parts, set_max_tasks,
-    set_resume_enabled, set_share_expiry, test_connection, update_connection, AppState, ResumeFlag,
+    enqueue_folder_download, enqueue_uploads, get_autostart, get_close_to_tray, get_resume_enabled,
+    get_settings, head_object, list_buckets, list_connections, list_objects, list_transfers,
+    pause_transfer, presign_get, rename_object, resume_transfer, retry_transfer, set_autostart,
+    set_close_to_tray, set_max_parts, set_max_tasks, set_resume_enabled, set_share_expiry,
+    set_tray_labels, test_connection, update_connection, AppState, CloseToTrayFlag, ResumeFlag,
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 use crate::transfer::{
     spawn_aggregator, DispatchRunner, DownloadRunner, EngineConfig, ProgressPayload, ProgressSink,
@@ -53,10 +55,49 @@ impl TransferSink for TauriStateSink {
     }
 }
 
+/// The flag `tauri_plugin_autostart` is told to append to the registered
+/// launch command, telling a boot-time start apart from the user opening the
+/// app themselves.
+const SILENT_START_ARG: &str = "--silent-start";
+
+/// Whether this process was started by the login-item registration rather than
+/// by the user.
+///
+/// Skips the first argument: `argv[0]` is the executable path, and a user
+/// whose app happens to live under a directory containing this string would
+/// otherwise never get a window.
+pub fn wants_silent_start(args: impl Iterator<Item = String>) -> bool {
+    args.skip(1).any(|a| a == SILENT_START_ARG)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // `--silent-start` is baked into the registered login item, so a
+        // boot-time launch is distinguishable from a manual one below.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![SILENT_START_ARG]),
+        ))
+        // The window is configured `"visible": false` so a silent start never
+        // flashes it; every other path shows it explicitly at the end of
+        // `setup`.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                // Only the runtime atomic is consulted -- this runs on the
+                // window event loop and must decide synchronously, so a
+                // settings.json read here would put disk I/O on every close.
+                let close_to_tray = app
+                    .try_state::<CloseToTrayFlag>()
+                    .is_some_and(|flag| flag.0.load(Ordering::Relaxed));
+                if close_to_tray {
+                    api.prevent_close();
+                    tray::hide_main_window(app);
+                }
+            }
+        })
         .setup(|app| {
             // Logging first: everything below this line is worth logging, and
             // a failure here must not take the app down -- a desktop app that
@@ -108,6 +149,12 @@ pub fn run() {
             // (see `commands::settings`'s module doc for why that sharing
             // matters).
             app.manage(ResumeFlag(resume_enabled.clone()));
+            // Same one-atomic discipline as `ResumeFlag`: the `on_window_event`
+            // handler above and the `set_close_to_tray` command read and write
+            // this very atomic, never two independently-built flags.
+            app.manage(CloseToTrayFlag(Arc::new(AtomicBool::new(
+                settings.close_to_tray,
+            ))));
             // Checkpoints live under the app data dir.
             let checkpoint_dir = transfer::checkpoint::checkpoint_dir(&app.path().app_data_dir()?);
             let engine = TransferEngine::new(
@@ -153,6 +200,26 @@ pub fn run() {
             }
 
             app.manage(engine);
+
+            // Built before the window is shown: during a silent start the tray
+            // icon is the only evidence the app came up at all.
+            if let Err(err) = tray::build(app.handle()) {
+                tracing::error!("tray icon unavailable: {err}");
+            }
+
+            // The window is created hidden (`"visible": false` in
+            // tauri.conf.json) so a login-item launch never flashes it. Every
+            // other launch shows it right here.
+            if wants_silent_start(std::env::args()) {
+                tracing::info!("silent start: staying in the tray");
+                #[cfg(target_os = "macos")]
+                if let Err(err) = app.handle().set_dock_visibility(false) {
+                    tracing::warn!("hiding dock icon failed: {err}");
+                }
+            } else if let Some(window) = app.get_webview_window("main") {
+                window.show()?;
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -184,6 +251,11 @@ pub fn run() {
             set_max_tasks,
             set_max_parts,
             set_share_expiry,
+            get_close_to_tray,
+            set_close_to_tray,
+            get_autostart,
+            set_autostart,
+            set_tray_labels,
             clean_checkpoint_residue
         ])
         .build(tauri::generate_context!())
@@ -211,4 +283,40 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> impl Iterator<Item = String> + use<> {
+        args.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn silent_start_is_off_for_a_plain_launch() {
+        assert!(!wants_silent_start(argv(&[
+            "/Applications/BucketCat.app/Contents/MacOS/bucketcat"
+        ])));
+    }
+
+    #[test]
+    fn silent_start_is_on_when_the_login_item_passes_the_flag() {
+        assert!(wants_silent_start(argv(&[
+            "/Applications/BucketCat.app/Contents/MacOS/bucketcat",
+            "--silent-start",
+        ])));
+    }
+
+    #[test]
+    fn silent_start_ignores_the_flag_appearing_in_argv0() {
+        // A user who unpacks the app into a directory named after the flag
+        // must still get a window when they open it themselves.
+        assert!(!wants_silent_start(argv(&[
+            "/Users/x/--silent-start/BucketCat.app/Contents/MacOS/bucketcat",
+        ])));
+    }
 }

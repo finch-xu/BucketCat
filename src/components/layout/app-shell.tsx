@@ -2,6 +2,7 @@ import { ConnectionModals } from "@/components/modals/connection-modals";
 import { ObjectDialogs } from "@/components/modals/object-dialogs";
 import { SettingsModal } from "@/components/modals/settings-modal";
 import { AppStoreProvider } from "@/store/app-store";
+import { useTrayLabels } from "@/hooks/use-tray-labels";
 import { DetailsPanel } from "./details-panel";
 import { FileBrowser } from "./file-browser";
 import { Sidebar } from "./sidebar";
@@ -9,6 +10,7 @@ import { Toolbar } from "./toolbar";
 import { TransferBar } from "./transfer-bar";
 
 export function AppShell() {
+  useTrayLabels();
   return (
     <AppStoreProvider>
       <div className="relative flex h-screen flex-col overflow-hidden bg-background text-foreground">

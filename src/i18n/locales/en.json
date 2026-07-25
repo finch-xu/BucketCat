@@ -1,5 +1,9 @@
 {
   "app": { "name": "BucketCat", "tagline": "Cross-platform object storage client · Tauri + React" },
+  "tray": {
+    "show": "Show BucketCat",
+    "quit": "Quit"
+  },
   "sidebar": {
     "connections": "Connections",
     "addConnection": "Add Connection",
@@ -184,6 +188,11 @@
     "language": "Language",
     "defaultView": "Default view",
     "shareExpiry": "Default share link expiry",
+    "startup": "Startup & closing",
+    "closeToTray": "Minimize to tray on close",
+    "closeToTrayHint": "The app keeps running in the background; transfers in progress are not interrupted",
+    "autostart": "Launch at login",
+    "autostartHint": "Starts silently into the tray, without opening a window",
     "transfers": "Transfers",
     "concurrency": "Concurrent tasks",
     "maxParts": "Parts per task",

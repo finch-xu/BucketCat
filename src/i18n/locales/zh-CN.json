@@ -1,5 +1,9 @@
 {
   "app": { "name": "BucketCat", "tagline": "跨平台对象存储客户端 · Tauri + React" },
+  "tray": {
+    "show": "显示 BucketCat",
+    "quit": "退出"
+  },
   "sidebar": {
     "connections": "连接",
     "addConnection": "添加连接",
@@ -184,6 +188,11 @@
     "language": "语言",
     "defaultView": "默认视图",
     "shareExpiry": "分享链接默认有效期",
+    "startup": "启动与关闭",
+    "closeToTray": "关闭窗口时最小化到托盘",
+    "closeToTrayHint": "应用继续在后台运行，未完成的传输不会中断",
+    "autostart": "开机时自动启动",
+    "autostartHint": "静默启动并直接驻留托盘，不弹出窗口",
     "transfers": "传输",
     "concurrency": "同时任务数",
     "maxParts": "单任务并发分片",

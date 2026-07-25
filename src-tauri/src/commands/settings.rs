@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::AppState;
 use crate::error::{AppError, AppResult};
@@ -35,6 +36,17 @@ use crate::transfer::{
 /// `setup` (both are clones of one `Arc`, never separately constructed) --
 /// see this module's doc comment for why that sharing is load-bearing.
 pub struct ResumeFlag(pub Arc<AtomicBool>);
+
+/// Tauri-managed handle to the runtime close-to-tray flag, built the same way
+/// [`ResumeFlag`] is: `lib.rs`'s `setup` makes one `Arc<AtomicBool>` from the
+/// persisted `Settings::close_to_tray` and clones it into both this managed
+/// state and the `WindowEvent::CloseRequested` handler's closure.
+///
+/// It has to be an atomic rather than a re-read of settings.json because the
+/// close handler runs on the window event loop and must decide *synchronously*
+/// whether to call `prevent_close()`. Doing a file read there would put disk
+/// I/O on the path of every window close.
+pub struct CloseToTrayFlag(pub Arc<AtomicBool>);
 
 /// Stores `enabled` into `atomic` (the engine reads this directly, so this is
 /// the "takes effect now" half) and persists it to `settings_path` via
@@ -61,6 +73,21 @@ pub fn apply_resume_setting(
     enabled: bool,
 ) -> AppResult<()> {
     apply_settings_patch(settings_path, |s| s.resume_enabled = enabled)?;
+    atomic.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Close-to-tray's counterpart to [`apply_resume_setting`], with the identical
+/// save-then-store ordering and for the identical reason: if the write to disk
+/// fails the command errors out and the runtime flag is left as it was, rather
+/// than the app behaving one way now and another way after a restart (the
+/// persisted file is the source of truth on startup).
+pub fn apply_close_to_tray_setting(
+    atomic: &AtomicBool,
+    settings_path: &Path,
+    enabled: bool,
+) -> AppResult<()> {
+    apply_settings_patch(settings_path, |s| s.close_to_tray = enabled)?;
     atomic.store(enabled, Ordering::Relaxed);
     Ok(())
 }
@@ -138,6 +165,72 @@ pub fn set_resume_enabled(
 ) -> AppResult<()> {
     let path = settings_path(&app)?;
     apply_resume_setting(&state.0, &path, enabled)
+}
+
+/// Current value of the runtime close-to-tray flag.
+#[tauri::command]
+pub fn get_close_to_tray(state: State<'_, CloseToTrayFlag>) -> bool {
+    state.0.load(Ordering::Relaxed)
+}
+
+/// Sets the runtime close-to-tray flag and persists the choice. See
+/// [`apply_close_to_tray_setting`] for the save-then-store contract.
+#[tauri::command]
+pub fn set_close_to_tray(
+    app: AppHandle,
+    state: State<'_, CloseToTrayFlag>,
+    enabled: bool,
+) -> AppResult<()> {
+    let path = settings_path(&app)?;
+    apply_close_to_tray_setting(&state.0, &path, enabled)
+}
+
+/// Whether the app is registered to launch at login.
+///
+/// Deliberately *not* mirrored into settings.json. The registration lives in
+/// the OS (a LaunchAgent plist on macOS, `HKCU\...\Run` on Windows, an XDG
+/// `.desktop` file on Linux) and the user can remove it from there without
+/// this app ever knowing; keeping a second copy would let the two drift and
+/// leave the switch confidently showing the wrong state. The OS is the single
+/// source of truth, exactly as the runtime atomic -- not the file -- is for
+/// [`get_resume_enabled`].
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> AppResult<bool> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| AppError::Internal {
+            message: format!("read autostart registration: {e}"),
+        })
+}
+
+/// Registers or unregisters launch-at-login. The registered command line
+/// carries `--silent-start` (see `tauri_plugin_autostart::init` in `lib.rs`),
+/// which is what makes a boot-time launch come up in the tray rather than
+/// throwing a window at the user.
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> AppResult<()> {
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|e| AppError::Internal {
+        message: format!("update autostart registration: {e}"),
+    })
+}
+
+/// Replaces the tray menu's labels with localized ones.
+///
+/// The tray is built in `setup` with English fallbacks because the chosen
+/// locale lives only in the webview's `localStorage` (`bucketcat.locale`, see
+/// `src/i18n/index.ts`) and Rust cannot read it. The frontend calls this as
+/// soon as i18n has resolved, and again on every language switch.
+#[tauri::command]
+pub fn set_tray_labels(app: AppHandle, show: String, quit: String) -> AppResult<()> {
+    crate::tray::set_labels(&app, &show, &quit).map_err(|e| AppError::Internal {
+        message: format!("update tray menu: {e}"),
+    })
 }
 
 /// The same `<app_data_dir>/checkpoints` directory `lib.rs`'s `setup` (and its
@@ -333,6 +426,7 @@ mod tests {
                 max_tasks: 5,
                 max_parts: 8,
                 share_expiry_secs: 120,
+                close_to_tray: false,
             },
         )
         .unwrap();
@@ -342,6 +436,55 @@ mod tests {
 
         let loaded = settings::load(&path);
         assert!(!loaded.resume_enabled);
+        assert_eq!(loaded.max_tasks, 5, "must not reset max_tasks");
+        assert_eq!(loaded.max_parts, 8, "must not reset max_parts");
+        assert_eq!(
+            loaded.share_expiry_secs, 120,
+            "must not reset share_expiry_secs"
+        );
+        assert!(!loaded.close_to_tray, "must not reset close_to_tray");
+    }
+
+    #[test]
+    fn apply_close_to_tray_setting_flips_both_atomic_and_persisted_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let atomic = AtomicBool::new(true);
+
+        apply_close_to_tray_setting(&atomic, &path, false).unwrap();
+        assert!(!atomic.load(Ordering::Relaxed));
+        assert!(!settings::load(&path).close_to_tray);
+
+        apply_close_to_tray_setting(&atomic, &path, true).unwrap();
+        assert!(atomic.load(Ordering::Relaxed));
+        assert!(settings::load(&path).close_to_tray);
+    }
+
+    #[test]
+    fn apply_close_to_tray_setting_preserves_other_persisted_fields() {
+        // Same regression `apply_resume_setting` already guards against: a
+        // setter that writes a fresh `Settings` instead of patching would
+        // silently reset every other field on each toggle.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        settings::save(
+            &path,
+            &Settings {
+                resume_enabled: false,
+                max_tasks: 5,
+                max_parts: 8,
+                share_expiry_secs: 120,
+                close_to_tray: true,
+            },
+        )
+        .unwrap();
+        let atomic = AtomicBool::new(true);
+
+        apply_close_to_tray_setting(&atomic, &path, false).unwrap();
+
+        let loaded = settings::load(&path);
+        assert!(!loaded.close_to_tray);
+        assert!(!loaded.resume_enabled, "must not reset resume_enabled");
         assert_eq!(loaded.max_tasks, 5, "must not reset max_tasks");
         assert_eq!(loaded.max_parts, 8, "must not reset max_parts");
         assert_eq!(

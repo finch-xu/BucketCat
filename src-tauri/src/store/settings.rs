@@ -24,6 +24,14 @@ pub struct Settings {
     /// `provider::clamp_expiry` bounds an explicit per-call value.
     #[serde(default = "default_expiry")]
     pub share_expiry_secs: u64,
+    /// Closing the main window hides it to the tray instead of quitting, so
+    /// in-flight transfers survive (M7). Read once at startup into the runtime
+    /// atomic behind `commands::CloseToTrayFlag`, which the window's
+    /// `CloseRequested` handler consults -- see that module's doc comment.
+    /// Defaults to `true`: a close that silently kills a running upload is the
+    /// worse surprise of the two.
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
 }
 
 fn default_true() -> bool {
@@ -49,6 +57,7 @@ impl Default for Settings {
             max_tasks: default_tasks(),
             max_parts: default_parts(),
             share_expiry_secs: default_expiry(),
+            close_to_tray: true,
         }
     }
 }
@@ -144,6 +153,7 @@ mod tests {
                 max_tasks: 2,
                 max_parts: 6,
                 share_expiry_secs: 120,
+                close_to_tray: false,
             },
         )
         .unwrap();
@@ -152,6 +162,7 @@ mod tests {
         assert_eq!(loaded.max_tasks, 2);
         assert_eq!(loaded.max_parts, 6);
         assert_eq!(loaded.share_expiry_secs, 120);
+        assert!(!loaded.close_to_tray);
         // 原子写不留 .tmp
         assert!(!p.with_extension("json.tmp").exists());
     }
@@ -165,6 +176,9 @@ mod tests {
         assert_eq!(s.max_tasks, 3);
         assert_eq!(s.max_parts, 4);
         assert_eq!(s.share_expiry_secs, 3600);
+        // A settings.json written before M7 has no `close_to_tray` key at
+        // all; it must read back as enabled, not as `false`.
+        assert!(s.close_to_tray);
     }
 
     #[test]

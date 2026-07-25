@@ -13,8 +13,11 @@ import { formatSize } from "@/lib/format";
 import {
   cleanCheckpointResidue,
   clearFinishedTransfers,
+  getAutostart,
   getResumeEnabled,
   getSettings,
+  setAutostart,
+  setCloseToTray,
   setMaxParts,
   setMaxTasks,
   setResumeEnabled,
@@ -123,6 +126,12 @@ export function SettingsModal() {
   const [maxTasksPending, setMaxTasksPending] = useState(false);
   const [maxPartsPending, setMaxPartsPending] = useState(false);
   const [shareExpirySecs, setShareExpirySecsState] = useState(3600);
+  const [closeToTray, setCloseToTrayState] = useState(true);
+  // Autostart is not part of `Settings` on purpose -- the registration lives
+  // in the OS, which is its single source of truth (see `getAutostart`). Hence
+  // its own state and its own fetch below.
+  const [autostart, setAutostartState] = useState(false);
+  const [autostartError, setAutostartError] = useState<AppError | null>(null);
   const [cleanResult, setCleanResult] = useState<CleanResult | null>(null);
   const [cleanError, setCleanError] = useState<AppError | null>(null);
   const [cleanPending, setCleanPending] = useState(false);
@@ -151,9 +160,26 @@ export function SettingsModal() {
         setMaxTasksState(s.max_tasks);
         setMaxPartsState(s.max_parts);
         setShareExpirySecsState(s.share_expiry_secs);
+        setCloseToTrayState(s.close_to_tray);
       })
       .catch((err) => {
         console.error("Failed to load settings", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Separate round trip because autostart is read from the OS registration,
+  // not from settings.json -- see `getAutostart`'s doc comment.
+  useEffect(() => {
+    let cancelled = false;
+    getAutostart()
+      .then((enabled) => {
+        if (!cancelled) setAutostartState(enabled);
+      })
+      .catch((err) => {
+        console.error("Failed to read the autostart registration", err);
       });
     return () => {
       cancelled = true;
@@ -168,6 +194,7 @@ export function SettingsModal() {
       setCleanResult(null);
       setCleanError(null);
       setClearError(null);
+      setAutostartError(null);
     }
   }, [showSettings]);
 
@@ -210,6 +237,28 @@ export function SettingsModal() {
         setShareExpirySecsState(previous);
         console.error("Failed to persist share expiry", err);
       });
+  }
+
+  function handleCloseToTrayChange(v: boolean) {
+    setCloseToTrayState(v);
+    setCloseToTray(v).catch((err) => {
+      setCloseToTrayState(!v);
+      console.error("Failed to persist close-to-tray setting", err);
+    });
+  }
+
+  // Unlike every other switch here, this one writes outside the app: it
+  // registers or removes a login item with the OS, which can genuinely be
+  // refused (permissions, a sandboxed or unsigned build). A silent revert
+  // would look like the switch simply refused to move, so the reason is
+  // surfaced instead of only logged.
+  function handleAutostartChange(v: boolean) {
+    setAutostartError(null);
+    setAutostartState(v);
+    setAutostart(v).catch((err: AppError) => {
+      setAutostartState(!v);
+      setAutostartError(err);
+    });
   }
 
   function handleCleanResidue() {
@@ -299,6 +348,37 @@ export function SettingsModal() {
               </option>
             ))}
           </select>
+        </Row>
+
+        <SectionTitle>{t("settings.startup")}</SectionTitle>
+        <Row
+          label={
+            <div>
+              <div>{t("settings.closeToTray")}</div>
+              <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+                {t("settings.closeToTrayHint")}
+              </div>
+            </div>
+          }
+        >
+          <Switch checked={closeToTray} onChange={handleCloseToTrayChange} />
+        </Row>
+        <Row
+          label={
+            <div>
+              <div>{t("settings.autostart")}</div>
+              <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+                {t("settings.autostartHint")}
+              </div>
+              {autostartError && (
+                <div className="mt-0.5 text-[11.5px] text-destructive">
+                  {errorText(autostartError)}
+                </div>
+              )}
+            </div>
+          }
+        >
+          <Switch checked={autostart} onChange={handleAutostartChange} />
         </Row>
 
         <SectionTitle>{t("settings.transfers")}</SectionTitle>

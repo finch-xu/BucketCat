@@ -428,6 +428,7 @@ export interface Settings {
   max_tasks: number;
   max_parts: number;
   share_expiry_secs: number;
+  close_to_tray: boolean;
 }
 
 /** Reads the whole persisted `Settings`, e.g. to initialize the Settings
@@ -454,6 +455,43 @@ export function setMaxParts(n: number): Promise<void> {
  * `expiresSecs` is bounded to. */
 export function setShareExpiry(secs: number): Promise<void> {
   return invokeCommand<void>("set_share_expiry", { secs });
+}
+
+/** Current value of the runtime close-to-tray flag (`CloseToTrayFlag` in
+ * `src-tauri/src/commands/settings.rs`), which the window's `CloseRequested`
+ * handler consults to decide between hiding to the tray and quitting. */
+export function getCloseToTray(): Promise<boolean> {
+  return invokeCommand<boolean>("get_close_to_tray");
+}
+
+/** Sets the runtime close-to-tray flag and persists the choice, so it also
+ * holds on the next launch. Backed by `apply_close_to_tray_setting`. */
+export function setCloseToTray(enabled: boolean): Promise<void> {
+  return invokeCommand<void>("set_close_to_tray", { enabled });
+}
+
+/** Whether the app is registered to launch at login.
+ *
+ * Read straight from the OS registration (a LaunchAgent plist on macOS) rather
+ * than from `settings.json` -- deliberately not mirrored there, since the user
+ * can remove the registration outside the app and a cached copy would then lie.
+ * That is why this is not a field on `Settings`. */
+export function getAutostart(): Promise<boolean> {
+  return invokeCommand<boolean>("get_autostart");
+}
+
+/** Registers or unregisters launch-at-login. The registered command line
+ * carries `--silent-start`, so a boot-time launch comes up in the tray instead
+ * of opening a window. */
+export function setAutostart(enabled: boolean): Promise<void> {
+  return invokeCommand<void>("set_autostart", { enabled });
+}
+
+/** Replaces the tray menu's labels with localized ones. The tray is built in
+ * Rust at startup with English fallbacks because the chosen locale lives only
+ * in this webview's `localStorage`; see `src-tauri/src/tray.rs`. */
+export function setTrayLabels(show: string, quit: string): Promise<void> {
+  return invokeCommand<void>("set_tray_labels", { show, quit });
 }
 
 /** Result of `cleanCheckpointResidue`: how many orphan checkpoints were

@@ -20,7 +20,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` costs nothing here: `tray-icon` 0.24.1 and `muda` 0.19.3 are
+# already resolved in Cargo.lock as optional dependencies of `tauri` itself,
+# so turning the feature on adds zero new lock entries.
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -67,6 +70,14 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2.5"
 tauri-plugin-dialog = "2"
+# Launch-at-login. Unlike every other dependency here this one does add lock
+# entries (`auto-launch` and its own deps) -- the alternative was hand-rolling
+# a LaunchAgent plist, a HKCU\...\Run registry write and an XDG .desktop file,
+# of which only the macOS third could be tested from this machine. Used from
+# Rust only (see `commands::settings::set_autostart`): no npm package, and no
+# capability entry, since the frontend never invokes the plugin's own
+# commands.
+tauri-plugin-autostart = "2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

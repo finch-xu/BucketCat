@@ -20,8 +20,9 @@ pub use object::{
     rename_object,
 };
 pub use settings::{
-    clean_checkpoint_residue, get_resume_enabled, get_settings, set_max_parts, set_max_tasks,
-    set_resume_enabled, set_share_expiry, CleanResult, ResumeFlag,
+    clean_checkpoint_residue, get_autostart, get_close_to_tray, get_resume_enabled, get_settings,
+    set_autostart, set_close_to_tray, set_max_parts, set_max_tasks, set_resume_enabled,
+    set_share_expiry, set_tray_labels, CleanResult, CloseToTrayFlag, ResumeFlag,
 };
 pub use transfer::{
     cancel_transfer, clear_finished_transfers, enqueue_download, enqueue_folder_download,
