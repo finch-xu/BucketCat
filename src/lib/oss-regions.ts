@@ -94,3 +94,35 @@ export function isInternalOssEndpoint(endpoint: string): boolean {
 export function ossEndpointFor(region: OssRegion, network: "public" | "internal"): string {
   return `https://${network === "internal" ? region.internal : region.endpoint}`;
 }
+
+/** Derives the OSS region-picker's initial UI state from an *already saved*
+ * connection's endpoint/region, for prefilling the edit form.
+ *
+ * `endpoint` is always returned exactly as passed in -- byte-identical, no
+ * trimming/normalizing -- because opening the edit dialog must never change
+ * a connection's stored endpoint. Some connections were saved by hand before
+ * the region table existed (or point at a custom domain the table doesn't
+ * know about); for those `ossRegionFromEndpoint` can't find a match, so
+ * `unknownEndpoint` comes back `true` and `regionId` falls back to whatever
+ * region string the connection already had (so a caller can seed a
+ * temporary "current value" option in the region dropdown without inventing
+ * or discarding data). When the endpoint IS recognized, `regionId` is the
+ * table's canonical id for it (source of truth is the endpoint, not the
+ * possibly-stale `region` field). */
+export function ossFormStateFromConnection(
+  endpoint: string,
+  region: string,
+): {
+  regionId: string;
+  network: "public" | "internal";
+  endpoint: string;
+  unknownEndpoint: boolean;
+} {
+  const found = ossRegionFromEndpoint(endpoint);
+  return {
+    regionId: found ? found.id : region,
+    network: isInternalOssEndpoint(endpoint) ? "internal" : "public",
+    endpoint,
+    unknownEndpoint: !found,
+  };
+}

@@ -3,6 +3,7 @@ import {
   findOssRegion,
   isInternalOssEndpoint,
   ossEndpointFor,
+  ossFormStateFromConnection,
   ossRegionFromEndpoint,
   OSS_REGIONS,
 } from "./oss-regions";
@@ -75,6 +76,62 @@ describe("ossEndpointFor", () => {
     expect(ossEndpointFor(region, "internal")).toBe(
       "https://oss-cn-beijing-internal.aliyuncs.com",
     );
+  });
+});
+
+describe("ossFormStateFromConnection", () => {
+  it("recognizes a known public endpoint", () => {
+    const result = ossFormStateFromConnection(
+      "https://oss-cn-beijing.aliyuncs.com",
+      "cn-beijing",
+    );
+    expect(result).toEqual({
+      regionId: "cn-beijing",
+      network: "public",
+      endpoint: "https://oss-cn-beijing.aliyuncs.com",
+      unknownEndpoint: false,
+    });
+  });
+
+  it("recognizes a known internal endpoint", () => {
+    const result = ossFormStateFromConnection(
+      "https://oss-cn-beijing-internal.aliyuncs.com",
+      "cn-beijing",
+    );
+    expect(result).toEqual({
+      regionId: "cn-beijing",
+      network: "internal",
+      endpoint: "https://oss-cn-beijing-internal.aliyuncs.com",
+      unknownEndpoint: false,
+    });
+  });
+
+  it("derives the region from the endpoint's table lookup, not the stored region string", () => {
+    // Defensive: if a saved connection's `region` field ever drifted from
+    // its endpoint, the endpoint (source of truth) wins.
+    const result = ossFormStateFromConnection(
+      "https://oss-cn-shanghai.aliyuncs.com",
+      "cn-beijing",
+    );
+    expect(result.regionId).toBe("cn-shanghai");
+    expect(result.unknownEndpoint).toBe(false);
+  });
+
+  it("preserves a fully custom endpoint byte-identical and flags it as unknown", () => {
+    const customEndpoint = "https://oss.my-custom-domain.example.com:1234/weird//path/";
+    const result = ossFormStateFromConnection(customEndpoint, "legacy-region-id");
+    expect(result.endpoint).toBe(customEndpoint);
+    expect(result.unknownEndpoint).toBe(true);
+    expect(result.regionId).toBe("legacy-region-id");
+    expect(result.network).toBe("public");
+  });
+
+  it("never rewrites the endpoint even for a known region (identity, not just equality)", () => {
+    // A subtly non-canonical but still-matching input (extra whitespace)
+    // must still come back byte-for-byte as passed in.
+    const withWhitespace = "  https://oss-cn-beijing.aliyuncs.com  ";
+    const result = ossFormStateFromConnection(withWhitespace, "cn-beijing");
+    expect(result.endpoint).toBe(withWhitespace);
   });
 });
 

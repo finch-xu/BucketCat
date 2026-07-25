@@ -10,7 +10,6 @@ import {
 } from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Combobox, type ComboboxOption } from "@/components/ui/combobox";
 import { Modal } from "@/components/ui/modal";
 import { Segmented } from "@/components/ui/segmented";
 import { useAddConnection, useUpdateConnection } from "@/hooks/use-connections";
@@ -20,13 +19,20 @@ import { testConnection } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
   findOssRegion,
-  isInternalOssEndpoint,
   ossEndpointFor,
-  ossRegionFromEndpoint,
+  ossFormStateFromConnection,
   OSS_REGIONS,
 } from "@/lib/oss-regions";
 import { PROVIDERS, providerMeta } from "@/lib/providers";
 import { useApp } from "@/store/app-store";
+
+/** Region `<select>` groups, in display order -- each maps to an
+ * `<optgroup>` over `OSS_REGIONS` filtered by `group`. */
+const OSS_REGION_GROUPS: { key: "public" | "finance" | "gov"; labelKey: string }[] = [
+  { key: "public", labelKey: "addConn.regionGroupPublic" },
+  { key: "finance", labelKey: "addConn.regionGroupFinance" },
+  { key: "gov", labelKey: "addConn.regionGroupGov" },
+];
 
 /** Controlled form fields, snake_case to map 1:1 onto `ConnectionInput` --
  * `default_bucket` stays a plain string here (empty means "unset") and is
@@ -63,21 +69,21 @@ type TestStatus =
 const INPUT_CLASS =
   "h-9 w-full rounded-[9px] border border-border bg-panel px-3 text-[13px] text-foreground outline-none focus:border-primary focus:ring-[3px] focus:ring-primary-soft";
 const INPUT_ERROR_CLASS = "border-destructive";
+/** The region `<select>` and the read-only endpoint display share the same
+ * sizing/rounding cadence as `INPUT_CLASS` (so all fields in this form line
+ * up), but borrow `bg-background`/`text-fg2` from the `<select>` already
+ * used in `settings-modal.tsx` -- the token pairing that project already
+ * uses to visually mark a control as "not a free-text input". */
+const SELECT_CLASS =
+  "h-9 w-full rounded-[9px] border border-border bg-background px-3 text-[13px] text-fg2 outline-none focus:border-primary focus:ring-[3px] focus:ring-primary-soft";
+/** Read-only endpoint display: same footprint as `INPUT_CLASS` but
+ * `bg-hover`/`text-fg2` (never `bg-panel`/`text-foreground`) so it reads as
+ * non-editable even before a user notices the cursor, per the brief's "not
+ * just gray text" requirement. */
+const READONLY_INPUT_CLASS =
+  "h-9 w-full cursor-default rounded-[9px] border border-border bg-hover px-3 text-[13px] text-fg2 outline-none focus:border-primary focus:ring-[3px] focus:ring-primary-soft";
 
 type OssNetwork = "public" | "internal";
-
-/** Derives the OSS region-picker's initial `ossNetwork`/`endpointCustom`
- * state from an endpoint string -- used both on mount (edit mode) and when
- * switching the provider picker to OSS. A recognized official endpoint
- * (public or internal) means "not custom"; anything else that isn't blank
- * counts as a custom endpoint the region/network fields must not clobber. */
-function deriveOssState(endpoint: string): { network: OssNetwork; custom: boolean } {
-  const region = ossRegionFromEndpoint(endpoint);
-  if (region) {
-    return { network: isInternalOssEndpoint(endpoint) ? "internal" : "public", custom: false };
-  }
-  return { network: "public", custom: endpoint.trim() !== "" };
-}
 
 function Field({
   label,
@@ -148,16 +154,19 @@ export function ConnectionModal() {
   );
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [testStatus, setTestStatus] = useState<TestStatus>({ kind: "idle" });
-  // OSS-only: which network the shown endpoint targets, and whether the
-  // user has overridden the endpoint with something region/network changes
-  // must stop clobbering. Derived from the prefilled endpoint on mount
-  // (edit mode) or reset whenever the provider picker switches to OSS
-  // (`chooseProvider` below); inert for every other provider.
+  // OSS-only: which network the shown (read-only) endpoint targets, and
+  // whether the current endpoint is one this build can't map back to a
+  // region -- a connection saved by hand before the region table existed.
+  // Derived from the prefilled endpoint on mount (edit mode) or reset
+  // whenever the provider picker switches to OSS (`chooseProvider` below);
+  // inert for every other provider. `ossFormStateFromConnection` never
+  // rewrites `form.endpoint` itself -- see its doc comment -- so opening the
+  // edit dialog can't change a saved connection's endpoint.
   const [ossNetwork, setOssNetwork] = useState<OssNetwork>(
-    () => deriveOssState(editingConnection?.endpoint ?? "").network,
+    () => ossFormStateFromConnection(editingConnection?.endpoint ?? "", editingConnection?.region ?? "").network,
   );
-  const [endpointCustom, setEndpointCustom] = useState<boolean>(
-    () => deriveOssState(editingConnection?.endpoint ?? "").custom,
+  const [ossUnknownEndpoint, setOssUnknownEndpoint] = useState<boolean>(
+    () => ossFormStateFromConnection(editingConnection?.endpoint ?? "", editingConnection?.region ?? "").unknownEndpoint,
   );
   // Guards against a stale in-flight `testConnection` result landing after
   // the user has since edited a field or fired off a newer test -- only the
@@ -189,9 +198,9 @@ export function ConnectionModal() {
     const meta = providerMeta(id);
     setProviderId(id);
     setForm((f) => ({ ...f, endpoint: meta.endpoint, region: meta.region }));
-    const derived = deriveOssState(meta.endpoint);
+    const derived = ossFormStateFromConnection(meta.endpoint, meta.region);
     setOssNetwork(derived.network);
-    setEndpointCustom(derived.custom);
+    setOssUnknownEndpoint(derived.unknownEndpoint);
     setFieldErrors({});
     setTestStatus({ kind: "idle" });
     testReqIdRef.current++;
@@ -217,59 +226,36 @@ export function ConnectionModal() {
     invalidateTest();
   }
 
-  /** OSS region field changed (the user typed or picked from the
-   * Combobox). Only overwrites the endpoint when the typed id resolves to a
-   * known region AND the endpoint hasn't been customized -- otherwise this
-   * handler leaves the endpoint alone, per the no-feedback-loop rule: each
-   * handler only reacts to the user editing its OWN field. */
+  /** OSS region `<select>` changed. Every real `<option>` resolves via
+   * `findOssRegion`, so the endpoint (read-only, derived) always gets
+   * overwritten from the table -- this IS the "changing the region
+   * overwrites a custom endpoint" behavior the UI warns about for
+   * `ossUnknownEndpoint` connections. The one value that can't resolve is
+   * the temporary "current value" option (see the render below), whose
+   * value already equals `form.region`, so selecting it again never fires
+   * `onChange` in the first place; the fallback below is defensive only. */
   function handleOssRegionChange(newRegionId: string) {
-    updateField("region", newRegionId);
-    if (endpointCustom) return;
     const region = findOssRegion(newRegionId);
-    if (region) {
-      setForm((f) => ({ ...f, endpoint: ossEndpointFor(region, ossNetwork) }));
+    if (!region) {
+      updateField("region", newRegionId);
+      return;
     }
+    setOssUnknownEndpoint(false);
+    setFieldErrors((e) => (e.endpoint ? { ...e, endpoint: undefined } : e));
+    setForm((f) => ({ ...f, region: newRegionId, endpoint: ossEndpointFor(region, ossNetwork) }));
+    invalidateTest();
   }
 
-  /** OSS network segmented control changed. No-ops when the endpoint is
-   * custom (the toggle is also visually disabled in that state). */
+  /** OSS network segmented control changed. No-ops on the endpoint when
+   * `form.region` isn't a known region yet (the `ossUnknownEndpoint` case --
+   * nothing to derive from until the user picks a real region). */
   function handleOssNetworkChange(newNetwork: OssNetwork) {
-    if (endpointCustom) return;
     setOssNetwork(newNetwork);
     const region = findOssRegion(form.region);
     if (region) {
       setForm((f) => ({ ...f, endpoint: ossEndpointFor(region, newNetwork) }));
       invalidateTest();
     }
-  }
-
-  /** OSS endpoint field edited directly by the user. If what they typed
-   * still resolves to a known official endpoint, treat it as if they'd
-   * picked that region/network from the controls above (so hand-typing the
-   * official endpoint is recognized too) and keep `endpointCustom` false.
-   * Otherwise it's a custom value: region/network changes stop overwriting
-   * it from here on. */
-  function handleOssEndpointChange(newEndpoint: string) {
-    updateField("endpoint", newEndpoint);
-    const region = ossRegionFromEndpoint(newEndpoint);
-    if (region) {
-      setEndpointCustom(false);
-      setForm((f) => ({ ...f, region: region.id }));
-      setOssNetwork(isInternalOssEndpoint(newEndpoint) ? "internal" : "public");
-    } else {
-      setEndpointCustom(newEndpoint.trim() !== "");
-    }
-  }
-
-  /** "Reset to default" -- only enabled when `form.region` is a known
-   * region (see the disabled prop where this is used), so the lookup here
-   * can't fail in practice. */
-  function handleOssEndpointReset() {
-    const region = findOssRegion(form.region);
-    if (!region) return;
-    setEndpointCustom(false);
-    setForm((f) => ({ ...f, endpoint: ossEndpointFor(region, ossNetwork) }));
-    invalidateTest();
   }
 
   function buildInput(): ConnectionInput {
@@ -331,18 +317,6 @@ export function ConnectionModal() {
       });
     }
   }
-
-  const ossRegionOptions: ComboboxOption[] = OSS_REGIONS.map((r) => ({
-    value: r.id,
-    label: r.label,
-    hint: r.id,
-    group:
-      r.group === "finance"
-        ? t("addConn.regionGroupFinance")
-        : r.group === "gov"
-          ? t("addConn.regionGroupGov")
-          : t("addConn.regionGroupPublic"),
-  }));
 
   return (
     <Modal onClose={handleClose} className="w-[560px]">
@@ -444,12 +418,24 @@ export function ConnectionModal() {
             {providerId === "oss" ? (
               <>
                 <Field label={t("addConn.region")}>
-                  <Combobox
+                  <select
                     value={form.region}
-                    onChange={handleOssRegionChange}
-                    options={ossRegionOptions}
-                    placeholder={provider.region}
-                  />
+                    onChange={(e) => handleOssRegionChange(e.target.value)}
+                    className={SELECT_CLASS}
+                  >
+                    {ossUnknownEndpoint && (
+                      <option value={form.region}>
+                        {t("addConn.regionCurrentValue", { region: form.region || "—" })}
+                      </option>
+                    )}
+                    {OSS_REGION_GROUPS.map((g) => (
+                      <optgroup key={g.key} label={t(g.labelKey)}>
+                        {OSS_REGIONS.filter((r) => r.group === g.key).map((r) => (
+                          <option key={r.id} value={r.id}>{`${r.label} · ${r.id}`}</option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
                 </Field>
                 <Field label={t("addConn.network")}>
                   <Segmented<OssNetwork>
@@ -459,43 +445,17 @@ export function ConnectionModal() {
                       { value: "public", label: t("addConn.networkPublic") },
                       { value: "internal", label: t("addConn.networkInternal") },
                     ]}
-                    className={cn(endpointCustom && "pointer-events-none opacity-50")}
                   />
                 </Field>
-                <Field
-                  label={
-                    <span className="inline-flex items-center gap-1.5">
-                      {t("addConn.endpoint")}
-                      {endpointCustom && (
-                        <span className="rounded-full bg-primary-soft px-1.5 py-[1px] text-[10px] font-semibold text-primary">
-                          {t("addConn.endpointCustom")}
-                        </span>
-                      )}
-                    </span>
-                  }
-                  error={fieldErrors.endpoint}
-                >
-                  <div className="flex items-center gap-2">
-                    <input
-                      value={form.endpoint}
-                      onChange={(e) => handleOssEndpointChange(e.target.value)}
-                      placeholder={provider.endpoint}
-                      className={cn(
-                        INPUT_CLASS,
-                        "font-mono",
-                        fieldErrors.endpoint && INPUT_ERROR_CLASS,
-                      )}
-                    />
-                    {endpointCustom && (
-                      <button
-                        type="button"
-                        onClick={handleOssEndpointReset}
-                        disabled={!findOssRegion(form.region)}
-                        className="h-9 shrink-0 cursor-pointer rounded-[9px] border border-border bg-background px-3 text-[12.5px] font-medium text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {t("addConn.endpointReset")}
-                      </button>
-                    )}
+                <Field label={t("addConn.endpoint")} error={fieldErrors.endpoint}>
+                  <input
+                    value={form.endpoint}
+                    readOnly
+                    className={cn(READONLY_INPUT_CLASS, "font-mono")}
+                  />
+                  <div className="mt-1 text-[11.5px] text-muted-foreground">
+                    {ossUnknownEndpoint && <div>{t("addConn.endpointCustomWarning")}</div>}
+                    <div>{t("addConn.endpointGenericHint")}</div>
                   </div>
                 </Field>
               </>
