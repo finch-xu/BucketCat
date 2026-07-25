@@ -317,10 +317,27 @@ async fn small_object_round_trip() {
         "round-tripped bytes must match the source file's SHA-256"
     );
 
-    provider
+    let deleted = provider
         .delete_objects(&bucket, std::slice::from_ref(&key))
         .await
         .expect("delete_objects should succeed against live OSS");
+    assert_eq!(
+        (deleted.succeeded, deleted.failed.len()),
+        (1, 0),
+        "delete_objects must report exactly one success and no per-key failures, got: {deleted:?}"
+    );
+
+    // Asserting the call's return value is NOT enough. `delete_objects`
+    // counts a key as deleted whenever the batch response reports no error
+    // for it, so a backend that accepts the request and quietly drops it
+    // still looks like success. Assert the object is actually gone -- an
+    // earlier revision of these tests checked only the return value and
+    // passed against live OSS while every object they "deleted" survived.
+    let err = provider.head_object(&bucket, &key).await.expect_err(
+        "head_object must fail after delete_objects reported success -- if it still succeeds, \
+         the delete was acknowledged but did not actually remove the object",
+    );
+    eprintln!("post-delete head_object failed as expected for `{key}`: {err}");
 
     cleanup_prefix(&provider, &bucket, &prefix).await;
 }
@@ -417,10 +434,27 @@ async fn multipart_upload_round_trip() {
          part landed at the wrong offset"
     );
 
-    provider
+    let deleted = provider
         .delete_objects(&bucket, std::slice::from_ref(&key))
         .await
         .expect("delete_objects should succeed against live OSS");
+    assert_eq!(
+        (deleted.succeeded, deleted.failed.len()),
+        (1, 0),
+        "delete_objects must report exactly one success and no per-key failures, got: {deleted:?}"
+    );
+
+    // Asserting the call's return value is NOT enough. `delete_objects`
+    // counts a key as deleted whenever the batch response reports no error
+    // for it, so a backend that accepts the request and quietly drops it
+    // still looks like success. Assert the object is actually gone -- an
+    // earlier revision of these tests checked only the return value and
+    // passed against live OSS while every object they "deleted" survived.
+    let err = provider.head_object(&bucket, &key).await.expect_err(
+        "head_object must fail after delete_objects reported success -- if it still succeeds, \
+         the delete was acknowledged but did not actually remove the object",
+    );
+    eprintln!("post-delete head_object failed as expected for `{key}`: {err}");
 
     cleanup_prefix(&provider, &bucket, &prefix).await;
 }
@@ -488,10 +522,27 @@ async fn presigned_get_works() {
          intended"
     );
 
-    provider
+    let deleted = provider
         .delete_objects(&bucket, std::slice::from_ref(&key))
         .await
         .expect("delete_objects should succeed against live OSS");
+    assert_eq!(
+        (deleted.succeeded, deleted.failed.len()),
+        (1, 0),
+        "delete_objects must report exactly one success and no per-key failures, got: {deleted:?}"
+    );
+
+    // Asserting the call's return value is NOT enough. `delete_objects`
+    // counts a key as deleted whenever the batch response reports no error
+    // for it, so a backend that accepts the request and quietly drops it
+    // still looks like success. Assert the object is actually gone -- an
+    // earlier revision of these tests checked only the return value and
+    // passed against live OSS while every object they "deleted" survived.
+    let err = provider.head_object(&bucket, &key).await.expect_err(
+        "head_object must fail after delete_objects reported success -- if it still succeeds, \
+         the delete was acknowledged but did not actually remove the object",
+    );
+    eprintln!("post-delete head_object failed as expected for `{key}`: {err}");
 
     cleanup_prefix(&provider, &bucket, &prefix).await;
 }
