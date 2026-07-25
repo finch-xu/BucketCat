@@ -1,10 +1,10 @@
 {
   "app": { "name": "BucketCat", "tagline": "Cross-platform object storage client · Tauri + React" },
-  "titlebar": { "toggleTheme": "Toggle theme", "settings": "Settings" },
   "sidebar": {
     "connections": "Connections",
     "addConnection": "Add Connection",
     "settings": "Settings",
+    "toggleTheme": "Toggle theme",
     "loading": "Loading connections…",
     "loadingBuckets": "Loading buckets…",
     "retry": "Retry",

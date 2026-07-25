@@ -1,10 +1,10 @@
 {
   "app": { "name": "BucketCat", "tagline": "跨平台对象存储客户端 · Tauri + React" },
-  "titlebar": { "toggleTheme": "切换主题", "settings": "设置" },
   "sidebar": {
     "connections": "连接",
     "addConnection": "添加连接",
     "settings": "设置",
+    "toggleTheme": "切换主题",
     "loading": "正在加载连接…",
     "loadingBuckets": "正在加载存储桶…",
     "retry": "重试",

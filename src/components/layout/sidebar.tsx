@@ -1,6 +1,18 @@
-import { ChevronDown, ChevronRight, Folder, Pencil, Plus, Settings, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Folder,
+  Moon,
+  Pencil,
+  Plus,
+  Settings,
+  Sun,
+  Trash2,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
+import logoIcon from "@/assets/logo-icon.png";
 import { cn } from "@/lib/utils";
+import { isMac } from "@/lib/platform";
 import { providerMeta } from "@/lib/providers";
 import { useApp } from "@/store/app-store";
 import { useBuckets, useConnections } from "@/hooks/use-connections";
@@ -96,7 +108,7 @@ function BucketList({
               onClick={() => onSelect(bucket.name)}
               className={cn(
                 "flex cursor-pointer items-center gap-2 rounded-lg px-[9px] py-1.5",
-                active ? "bg-primary-soft text-primary" : "text-fg2 hover:bg-hover",
+                active ? "bg-active text-primary" : "text-fg2 hover:bg-hover",
               )}
             >
               <Folder className={cn("size-3.5", active ? "text-primary" : "text-muted-foreground")} />
@@ -159,7 +171,10 @@ function ConnectionRow({
     <div className="mb-px">
       <div
         onClick={onToggle}
-        className="group flex cursor-pointer items-center gap-[9px] rounded-[9px] px-2 py-[7px] hover:bg-hover"
+        className={cn(
+          "group flex cursor-pointer items-center gap-[9px] rounded-[9px] px-2 py-[7px]",
+          isOpen ? "bg-raised shadow-[0_1px_2px_var(--shadow)]" : "hover:bg-hover",
+        )}
       >
         <span className="flex w-3 justify-center text-muted2">
           {isOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
@@ -227,6 +242,8 @@ export function Sidebar() {
     activeConn,
     activeBucket,
     expanded,
+    dark,
+    toggleTheme,
     toggleConn,
     selectBucket,
     openAdd,
@@ -237,8 +254,31 @@ export function Sidebar() {
   const connectionsQuery = useConnections();
 
   return (
-    <aside className="flex w-[236px] shrink-0 flex-col border-r border-border bg-sidebar">
-      <div className="flex items-center justify-between px-3.5 pt-[15px] pb-2">
+    <aside className="flex w-[248px] shrink-0 flex-col border-r border-border bg-sidebar">
+      {/* Brand strip, doubling as the window's drag region. The title bar is
+       * gone (see `titleBarStyle: "Overlay"` in tauri.conf.json), and Tauri
+       * documents that Overlay leaves a window with NO default draggable
+       * area -- without this attribute the window could not be moved at all.
+       * On macOS the native traffic lights float over the left of this strip,
+       * so it has to yield 76px; Windows/Linux keep their native title bar
+       * and need no inset.
+       * The children are `pointer-events-none` on purpose: Tauri decides
+       * what is draggable by looking at the event target, so a logo or label
+       * that can receive pointer events would swallow drags aimed at it. */}
+      <div
+        data-tauri-drag-region
+        className={cn("flex h-[52px] shrink-0 items-center gap-2.5 px-3.5", isMac && "pl-[76px]")}
+      >
+        <img
+          src={logoIcon}
+          alt="BucketCat"
+          className="pointer-events-none size-[30px] rounded-lg shadow-[0_0_0_1px_var(--border)]"
+        />
+        <span className="pointer-events-none text-[15.5px] font-bold tracking-[0.1px]">
+          {t("app.name")}
+        </span>
+      </div>
+      <div className="flex items-center justify-between px-3.5 pt-[9px] pb-2">
         <span className="text-[11px] font-semibold tracking-[0.7px] text-muted-foreground uppercase">
           {t("sidebar.connections")}
         </span>
@@ -246,7 +286,7 @@ export function Sidebar() {
           type="button"
           onClick={openAdd}
           title={t("sidebar.addConnection")}
-          className="flex size-6 cursor-pointer items-center justify-center rounded-[7px] border border-border bg-background text-fg2 hover:border-primary hover:bg-hover hover:text-primary"
+          className="flex size-6 cursor-pointer items-center justify-center rounded-[7px] border border-accent-border bg-raised text-primary hover:border-primary hover:bg-accent-tint"
         >
           <Plus className="size-[15px]" />
         </button>
@@ -298,14 +338,23 @@ export function Sidebar() {
             />
           ))}
       </div>
-      <div className="border-t border-border p-2">
+      <div className="flex items-center gap-1.5 border-t border-border p-2">
         <button
           type="button"
           onClick={openSettings}
-          className="flex w-full cursor-pointer items-center gap-[9px] rounded-[9px] px-2.5 py-2 text-[13px] text-fg2 hover:bg-hover"
+          className="flex flex-1 cursor-pointer items-center gap-[9px] rounded-[9px] px-2.5 py-2 text-[13px] text-fg2 hover:bg-hover"
         >
           <Settings className="size-4" />
           {t("sidebar.settings")}
+        </button>
+        <button
+          type="button"
+          onClick={toggleTheme}
+          title={t("sidebar.toggleTheme")}
+          aria-label={t("sidebar.toggleTheme")}
+          className="flex size-[30px] shrink-0 cursor-pointer items-center justify-center rounded-[9px] text-fg2 hover:bg-hover"
+        >
+          {dark ? <Sun className="size-4" /> : <Moon className="size-4" />}
         </button>
       </div>
     </aside>
