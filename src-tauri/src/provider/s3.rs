@@ -17,6 +17,7 @@ use aws_sdk_s3::primitives::DateTimeFormat;
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use tokio::task::JoinSet;
 
 use crate::error::{AppError, AppResult};
 use crate::provider::{
@@ -155,11 +156,30 @@ pub fn with_scheme(endpoint: &str) -> String {
     }
 }
 
+/// Whether this provider can use S3's Multi-Object Delete (`POST
+/// /?delete`).
+///
+/// Aliyun OSS mandates a `Content-MD5` header on that request, but
+/// aws-sdk-s3 1.139 only ever sends `x-amz-checksum-*` flexible checksums --
+/// it has no way to send `Content-MD5` -- so the endpoint is unusable there
+/// (confirmed live: `400 MissingArgument`/`Content-MD5`). Connections this
+/// returns `false` for fall back to one `DeleteObject` per key instead:
+/// single-object delete has no request body, so it's never subject to this
+/// requirement.
+pub fn supports_batch_delete(provider: &str) -> bool {
+    !provider.eq_ignore_ascii_case("oss")
+}
+
 /// A constructed S3 (or S3-compatible) admin-plane client for one saved
 /// [`Connection`].
 #[derive(Debug)]
 pub struct S3Provider {
     client: aws_sdk_s3::Client,
+    /// Whether this connection's backend supports S3's Multi-Object Delete
+    /// (see [`supports_batch_delete`]) -- `false` only for Aliyun OSS today.
+    /// A plain capability flag computed once in [`from_connection`]; never
+    /// the [`Connection`] itself, and never credentials.
+    batch_delete: bool,
 }
 
 /// Builds an [`S3Provider`] from a saved connection profile.
@@ -265,6 +285,7 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
 
     Ok(S3Provider {
         client: aws_sdk_s3::Client::from_conf(config),
+        batch_delete: supports_batch_delete(&conn.provider),
     })
 }
 
@@ -427,6 +448,15 @@ fn to_list_page(
 /// larger batches are split client-side.
 const DELETE_BATCH_MAX: usize = 1000;
 
+/// Maximum concurrent single-key `DeleteObject` requests when a connection
+/// can't use Multi-Object Delete (see [`supports_batch_delete`] -- OSS
+/// today). Deleting one key per request instead of one request per ≤1000
+/// keys multiplies the round-trips a `delete_prefix` walk needs; running
+/// them fully sequentially would make deleting a large OSS folder painfully
+/// slow. 8 bounds the fan-out to something that still meaningfully
+/// parallelizes without looking like a burst to the storage backend.
+const SINGLE_DELETE_CONCURRENCY: usize = 8;
+
 /// Keys per page while `delete_prefix` walks a subtree. 1000 is
 /// ListObjectsV2's own server-side maximum, so this minimizes the number of
 /// round-trips needed to enumerate a large folder before deleting it.
@@ -527,6 +557,31 @@ fn chunk_failure_keys(chunk: &[String], err: &AppError) -> Vec<FailedKey> {
             code: code.clone(),
         })
         .collect()
+}
+
+/// Folds one batch of single-key `DeleteObject` outcomes (as collected off a
+/// bounded-concurrency [`JoinSet`], order-independent) into a
+/// [`BatchResult`]. Reuses [`AppError::code`] for a [`FailedKey`]'s `code`
+/// -- the same source `chunk_failure_keys`/`failed_key` use -- rather than
+/// inventing a separate error mapping for this path.
+///
+/// Extracted as a pure fn (no task spawning, no network) so the
+/// `succeeded + failed.len() == results.len()` invariant `delete_objects`'s
+/// non-batch (OSS) path must uphold is directly unit-testable. Pure,
+/// unit-tested below.
+fn fold_single_delete_outcomes(results: Vec<(String, Result<(), AppError>)>) -> BatchResult {
+    let mut succeeded: u32 = 0;
+    let mut failed: Vec<FailedKey> = Vec::new();
+    for (key, result) in results {
+        match result {
+            Ok(()) => succeeded += 1,
+            Err(err) => failed.push(FailedKey {
+                key,
+                code: err.code().to_string(),
+            }),
+        }
+    }
+    BatchResult { succeeded, failed }
 }
 
 /// Normalizes any of the three bucket-operation `SdkError`s into an
@@ -632,6 +687,74 @@ pub fn range_header(offset: u64, length: u64) -> String {
     format!("bytes={}-{}", offset, end)
 }
 
+impl S3Provider {
+    /// Deletes `keys` one `DeleteObject` at a time, in batches of up to
+    /// [`SINGLE_DELETE_CONCURRENCY`] concurrent requests -- the fallback
+    /// [`Provider::delete_objects`] dispatches to when `self.batch_delete`
+    /// is `false` (OSS today; see [`supports_batch_delete`]). `DeleteObject`
+    /// (`DELETE /bucket/key`) has no request body, so unlike Multi-Object
+    /// Delete it never needs the `Content-MD5` header OSS demands and
+    /// aws-sdk-s3 has no way to send.
+    ///
+    /// One batch is fully awaited before the next is spawned (no streaming
+    /// scheduling) -- simple, and plenty fast enough at this concurrency
+    /// cap. A single key's failure never aborts the rest (design §7,
+    /// mirrored from the batch path): every outcome, success or failure, is
+    /// folded into the returned [`BatchResult`] via
+    /// [`fold_single_delete_outcomes`], including a spawned task's panic
+    /// (never observed in practice -- `delete_object().send()` itself
+    /// doesn't panic) so `succeeded + failed.len() == keys.len()` always
+    /// holds.
+    async fn delete_objects_one_by_one(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> AppResult<BatchResult> {
+        let mut succeeded: u32 = 0;
+        let mut failed: Vec<FailedKey> = Vec::new();
+
+        for chunk in keys.chunks(SINGLE_DELETE_CONCURRENCY) {
+            let mut set: JoinSet<(String, Result<(), AppError>)> = JoinSet::new();
+            for key in chunk {
+                let client = self.client.clone();
+                let bucket = bucket.to_string();
+                let key = key.clone();
+                set.spawn(async move {
+                    let result_key = key.clone();
+                    let result = client
+                        .delete_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .send()
+                        .await
+                        .map(|_| ())
+                        .map_err(normalize_s3_error);
+                    (result_key, result)
+                });
+            }
+
+            let mut results = Vec::with_capacity(chunk.len());
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(pair) => results.push(pair),
+                    Err(join_err) => results.push((
+                        String::new(),
+                        Err(AppError::Internal {
+                            message: format!("delete_object task panicked: {join_err}"),
+                        }),
+                    )),
+                }
+            }
+
+            let batch = fold_single_delete_outcomes(results);
+            succeeded += batch.succeeded;
+            failed.extend(batch.failed);
+        }
+
+        Ok(BatchResult { succeeded, failed })
+    }
+}
+
 #[async_trait]
 impl Provider for S3Provider {
     async fn test_connection(&self) -> AppResult<()> {
@@ -702,6 +825,10 @@ impl Provider for S3Provider {
     }
 
     async fn delete_objects(&self, bucket: &str, keys: &[String]) -> AppResult<BatchResult> {
+        if !self.batch_delete {
+            return self.delete_objects_one_by_one(bucket, keys).await;
+        }
+
         let mut succeeded: u32 = 0;
         let mut failed: Vec<FailedKey> = Vec::new();
         for chunk in keys.chunks(DELETE_BATCH_MAX) {
@@ -1311,6 +1438,21 @@ mod tests {
         assert_eq!(with_scheme("   "), "https://");
     }
 
+    // --- supports_batch_delete (pure) ---------------------------------------
+
+    #[test]
+    fn oss_cannot_use_multi_object_delete() {
+        assert!(!supports_batch_delete("oss"));
+        assert!(!supports_batch_delete("OSS"));
+    }
+    #[test]
+    fn other_backends_keep_batch_delete() {
+        assert!(supports_batch_delete("s3"));
+        assert!(supports_batch_delete("minio"));
+        assert!(supports_batch_delete("r2"));
+        assert!(supports_batch_delete("generic"));
+    }
+
     // --- from_connection ---------------------------------------------------
 
     #[test]
@@ -1344,6 +1486,21 @@ mod tests {
     #[test]
     fn valid_oss_connection_builds_successfully() {
         assert!(from_connection(&oss_connection()).is_ok());
+    }
+
+    #[test]
+    fn from_connection_sets_batch_delete_false_only_for_oss() {
+        // OSS can't use Multi-Object Delete (see `supports_batch_delete`) --
+        // `from_connection` must record that so `delete_objects` knows to
+        // fall back to one `DeleteObject` per key for this connection.
+        let oss = from_connection(&oss_connection()).unwrap();
+        assert!(!oss.batch_delete);
+
+        // Every other backend keeps the batch path.
+        let aws = from_connection(&aws_connection()).unwrap();
+        assert!(aws.batch_delete);
+        let minio = from_connection(&minio_connection()).unwrap();
+        assert!(minio.batch_delete);
     }
 
     // `aws_sdk_s3::Config` has no public getter for `force_path_style` or
@@ -1941,6 +2098,69 @@ mod tests {
     #[test]
     fn chunk_failure_keys_empty_chunk_yields_empty_vec() {
         assert!(chunk_failure_keys(&[], &AppError::Unreachable).is_empty());
+    }
+
+    // --- fold_single_delete_outcomes (pure) ----------------------------------
+    //
+    // Extracted from `delete_objects`'s non-batch (OSS) path so the
+    // `succeeded + failed.len() == keys.len()` invariant it must uphold is
+    // unit-testable without a live network call or spawning any tasks.
+
+    #[test]
+    fn fold_single_delete_outcomes_invariant_succeeded_plus_failed_equals_total() {
+        let results: Vec<(String, Result<(), AppError>)> = vec![
+            ("a.txt".to_string(), Ok(())),
+            ("b.txt".to_string(), Err(AppError::AccessDenied)),
+            ("c.txt".to_string(), Ok(())),
+            (
+                "d.txt".to_string(),
+                Err(AppError::Internal {
+                    message: String::new(),
+                }),
+            ),
+            ("e.txt".to_string(), Ok(())),
+        ];
+        let total = results.len();
+
+        let batch = fold_single_delete_outcomes(results);
+
+        assert_eq!(batch.succeeded as usize + batch.failed.len(), total);
+        assert_eq!(batch.succeeded, 3);
+        let failed_keys: Vec<&str> = batch.failed.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(failed_keys, vec!["b.txt", "d.txt"]);
+        assert_eq!(batch.failed[0].code, "auth/access-denied");
+        assert_eq!(batch.failed[1].code, "internal");
+    }
+
+    #[test]
+    fn fold_single_delete_outcomes_all_succeeded() {
+        let results: Vec<(String, Result<(), AppError>)> =
+            vec![("a.txt".to_string(), Ok(())), ("b.txt".to_string(), Ok(()))];
+
+        let batch = fold_single_delete_outcomes(results);
+
+        assert_eq!(batch.succeeded, 2);
+        assert!(batch.failed.is_empty());
+    }
+
+    #[test]
+    fn fold_single_delete_outcomes_all_failed() {
+        let results: Vec<(String, Result<(), AppError>)> = vec![
+            ("a.txt".to_string(), Err(AppError::Timeout)),
+            ("b.txt".to_string(), Err(AppError::Unreachable)),
+        ];
+
+        let batch = fold_single_delete_outcomes(results);
+
+        assert_eq!(batch.succeeded, 0);
+        assert_eq!(batch.failed.len(), 2);
+    }
+
+    #[test]
+    fn fold_single_delete_outcomes_empty_input() {
+        let batch = fold_single_delete_outcomes(Vec::new());
+        assert_eq!(batch.succeeded, 0);
+        assert!(batch.failed.is_empty());
     }
 
     // --- chunk_keys (pure) --------------------------------------------------
