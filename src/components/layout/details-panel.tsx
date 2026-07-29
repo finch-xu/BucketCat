@@ -6,15 +6,14 @@ import { fileMeta } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
 import { previewKind, type PreviewKind } from "@/lib/preview";
 import {
-  getSettings,
   headObject,
   presignGet,
   type AppError,
   type ObjectHead,
-  type Settings,
 } from "@/lib/api";
 import { useBrowse } from "@/hooks/use-browse";
 import { useErrorText } from "@/hooks/use-error-text";
+import { useSettings } from "@/hooks/use-settings";
 import { useStartDownloads } from "@/hooks/use-start-downloads";
 import { useApp } from "@/store/app-store";
 
@@ -92,11 +91,7 @@ export function DetailsPanel() {
   // modal writes `share_expiry_secs`). Prefills the dropdown below instead
   // of the hardcoded 1h default; a failed/slow fetch just leaves that
   // hardcoded default in place.
-  const settingsQuery = useQuery<Settings, AppError>({
-    queryKey: ["settings"],
-    queryFn: getSettings,
-    staleTime: Infinity,
-  });
+  const settingsQuery = useSettings();
 
   useEffect(() => {
     if (!expiryTouchedRef.current && settingsQuery.data) {
