@@ -1,149 +1,18 @@
 import { X } from "lucide-react";
-import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
-import { Segmented } from "@/components/ui/segmented";
-import { Switch } from "@/components/ui/switch";
 import { AboutPane } from "@/components/modals/settings/about-pane";
+import { AdvancedPane } from "@/components/modals/settings/advanced-pane";
 import { GeneralPane } from "@/components/modals/settings/general-pane";
-import { Row, SectionTitle, Stepper } from "@/components/modals/settings/shared";
-import { useErrorText } from "@/hooks/use-error-text";
-import { formatSize } from "@/lib/format";
-import {
-  cleanCheckpointResidue,
-  clearFinishedTransfers,
-  getResumeEnabled,
-  getSettings,
-  setMaxParts,
-  setMaxTasks,
-  setResumeEnabled,
-  type AppError,
-  type CleanResult,
-} from "@/lib/api";
-import { useTransferStore } from "@/store/transfer-store";
+import { TransfersPane } from "@/components/modals/settings/transfers-pane";
+import { SectionTitle } from "@/components/modals/settings/shared";
 import { useApp } from "@/store/app-store";
 
 export function SettingsModal() {
   const { t } = useTranslation();
-  const {
-    showSettings,
-    closeSettings,
-    transferSettings,
-    setTransferSettings,
-  } = useApp();
-  const errorText = useErrorText();
-  const [resumeEnabled, setResumeEnabledState] = useState(true);
-  // Real backend settings (M6c): fall back to the backend's own defaults
-  // (see `Settings::default()` in `src-tauri/src/store/settings.rs`) until
-  // `getSettings()` resolves below.
-  const [maxTasks, setMaxTasksState] = useState(3);
-  const [maxParts, setMaxPartsState] = useState(4);
-  const [maxTasksPending, setMaxTasksPending] = useState(false);
-  const [maxPartsPending, setMaxPartsPending] = useState(false);
-  const [cleanResult, setCleanResult] = useState<CleanResult | null>(null);
-  const [cleanError, setCleanError] = useState<AppError | null>(null);
-  const [cleanPending, setCleanPending] = useState(false);
-  const [clearError, setClearError] = useState<AppError | null>(null);
-  const [clearPending, setClearPending] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    getResumeEnabled()
-      .then((enabled) => {
-        if (!cancelled) setResumeEnabledState(enabled);
-      })
-      .catch((err) => {
-        console.error("Failed to load resume-transfers setting", err);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    getSettings()
-      .then((s) => {
-        if (cancelled) return;
-        setMaxTasksState(s.max_tasks);
-        setMaxPartsState(s.max_parts);
-      })
-      .catch((err) => {
-        console.error("Failed to load settings", err);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // The modal never unmounts (it self-gates below instead) so a stale
-  // result/error banner from a previous open would otherwise reappear next
-  // time the modal is shown. Reset them on close instead.
-  useEffect(() => {
-    if (!showSettings) {
-      setCleanResult(null);
-      setCleanError(null);
-      setClearError(null);
-    }
-  }, [showSettings]);
+  const { showSettings, closeSettings } = useApp();
 
   if (!showSettings) return null;
-
-  function handleMaxTasksChange(n: number) {
-    const clamped = Math.min(5, Math.max(1, n));
-    const previous = maxTasks;
-    setMaxTasksState(clamped);
-    setMaxTasksPending(true);
-    setMaxTasks(clamped)
-      .catch((err) => {
-        // Persist rejected: revert the optimistic local state, same pattern
-        // as the resume-transfers switch below.
-        setMaxTasksState(previous);
-        console.error("Failed to persist max tasks", err);
-      })
-      .finally(() => setMaxTasksPending(false));
-  }
-
-  function handleMaxPartsChange(n: number) {
-    const clamped = Math.min(8, Math.max(1, n));
-    const previous = maxParts;
-    setMaxPartsState(clamped);
-    setMaxPartsPending(true);
-    setMaxParts(clamped)
-      .catch((err) => {
-        setMaxPartsState(previous);
-        console.error("Failed to persist max parts", err);
-      })
-      .finally(() => setMaxPartsPending(false));
-  }
-
-  function handleCleanResidue() {
-    setCleanError(null);
-    setCleanResult(null);
-    setCleanPending(true);
-    cleanCheckpointResidue()
-      .then((result) => setCleanResult(result))
-      .catch((err: AppError) => setCleanError(err))
-      .finally(() => setCleanPending(false));
-  }
-
-  // Drops the known-finished tasks locally from the shared transfer store,
-  // the same pattern `TransferBar.handleClearFinished` uses -- so the
-  // transfer panel reflects the clear immediately instead of waiting on a
-  // `transfer://state` event that terminal tasks never re-emit.
-  function handleClearHistory() {
-    setClearError(null);
-    setClearPending(true);
-    clearFinishedTransfers()
-      .then(() => {
-        const { tasks, drop } = useTransferStore.getState();
-        for (const [id, task] of Object.entries(tasks)) {
-          if (task.status === "completed" || task.status === "canceled") drop(id);
-        }
-      })
-      .catch((err: AppError) => setClearError(err))
-      .finally(() => setClearPending(false));
-  }
 
   return (
     <Modal onClose={closeSettings} className="w-[600px]">
@@ -162,122 +31,10 @@ export function SettingsModal() {
         <GeneralPane />
 
         <SectionTitle>{t("settings.transfers")}</SectionTitle>
-        <Row label={t("settings.concurrency")}>
-          <Stepper
-            value={maxTasks}
-            min={1}
-            max={5}
-            onChange={handleMaxTasksChange}
-            disabled={maxTasksPending}
-          />
-        </Row>
-        <Row label={t("settings.maxParts")}>
-          <Stepper
-            value={maxParts}
-            min={1}
-            max={8}
-            onChange={handleMaxPartsChange}
-            disabled={maxPartsPending}
-          />
-        </Row>
-        <div className="-mt-1 mb-1 text-[11.5px] text-muted-foreground">
-          <div>{t("settings.concurrencyHint", { total: maxTasks * maxParts })}</div>
-          <div>{t("settings.restartHint")}</div>
-        </div>
-        <Row label={t("settings.partSize")}>
-          <Segmented<number>
-            value={transferSettings.partSizeMb}
-            onChange={(v) => setTransferSettings({ partSizeMb: v })}
-            options={[
-              { value: 8, label: "8 MB" },
-              { value: 16, label: "16 MB" },
-              { value: 64, label: "64 MB" },
-            ]}
-          />
-        </Row>
-        <Row label={t("settings.verify")}>
-          <Switch
-            checked={transferSettings.verify}
-            onChange={(v) => setTransferSettings({ verify: v })}
-          />
-        </Row>
-        <Row label={t("settings.overwrite")}>
-          <Switch
-            checked={transferSettings.overwrite}
-            onChange={(v) => setTransferSettings({ overwrite: v })}
-          />
-        </Row>
-        <Row
-          label={
-            <div>
-              <div>{t("settings.resumeTransfers")}</div>
-              <div className="mt-0.5 text-[11.5px] text-muted-foreground">
-                {t("settings.resumeTransfersHint")}
-              </div>
-            </div>
-          }
-        >
-          <Switch
-            checked={resumeEnabled}
-            onChange={(v) => {
-              setResumeEnabledState(v);
-              setResumeEnabled(v).catch((err) => {
-                // The persist was rejected: revert the optimistic local state so
-                // the switch never shows a value the backend/file did not take.
-                setResumeEnabledState(!v);
-                console.error("Failed to persist resume-transfers setting", err);
-              });
-            }}
-          />
-        </Row>
+        <TransfersPane />
 
         <SectionTitle>{t("settings.advanced")}</SectionTitle>
-        <Row
-          label={
-            <div>
-              <div>{t("settings.cleanResidue")}</div>
-              {cleanResult && (
-                <div className="mt-0.5 text-[11.5px] text-muted-foreground">
-                  {t("settings.cleanResidueDone", {
-                    count: cleanResult.removed,
-                    size: formatSize(cleanResult.freed_bytes),
-                  })}
-                </div>
-              )}
-              {cleanError && (
-                <div className="mt-0.5 text-[11.5px] text-destructive">{errorText(cleanError)}</div>
-              )}
-            </div>
-          }
-        >
-          <button
-            type="button"
-            onClick={handleCleanResidue}
-            disabled={cleanPending}
-            className="cursor-pointer rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] font-medium text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {t("settings.cleanResidue")}
-          </button>
-        </Row>
-        <Row
-          label={
-            <div>
-              <div>{t("settings.clearHistory")}</div>
-              {clearError && (
-                <div className="mt-0.5 text-[11.5px] text-destructive">{errorText(clearError)}</div>
-              )}
-            </div>
-          }
-        >
-          <button
-            type="button"
-            onClick={handleClearHistory}
-            disabled={clearPending}
-            className="cursor-pointer rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] font-medium text-fg2 hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {t("settings.clearHistory")}
-          </button>
-        </Row>
+        <AdvancedPane />
 
         <SectionTitle>{t("settings.about")}</SectionTitle>
         <AboutPane />
