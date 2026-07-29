@@ -1,6 +1,6 @@
 import { ConnectionModals } from "@/components/modals/connection-modals";
 import { ObjectDialogs } from "@/components/modals/object-dialogs";
-import { SettingsModal } from "@/components/modals/settings-modal";
+import { SettingsModal } from "@/components/modals/settings";
 import { AppStoreProvider } from "@/store/app-store";
 import { useTrayLabels } from "@/hooks/use-tray-labels";
 import { DetailsPanel } from "./details-panel";
