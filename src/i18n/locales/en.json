@@ -39,7 +39,8 @@
     "colSize": "Size",
     "colType": "Type",
     "colModified": "Modified",
-    "breadcrumbPlaceholder": "Pick a bucket on the left to get started"
+    "breadcrumbPlaceholder": "Pick a bucket on the left to get started",
+    "breadcrumbMore": "Show hidden levels"
   },
   "details": {
     "title": "Details",

@@ -1,6 +1,4 @@
 import {
-  ChevronRight,
-  Database,
   FolderPlus,
   LayoutGrid,
   List,
@@ -9,7 +7,6 @@ import {
   Search,
   Upload,
 } from "lucide-react";
-import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -20,22 +17,11 @@ import { useApp } from "@/store/app-store";
 
 export function Toolbar() {
   const { t } = useTranslation();
-  const {
-    activeConn,
-    activeBucket,
-    path,
-    gotoCrumb,
-    search,
-    setSearch,
-    view,
-    setView,
-    openNewFolder,
-  } = useApp();
+  const { activeConn, activeBucket, search, setSearch, view, setView, openNewFolder } = useApp();
   const queryClient = useQueryClient();
   const { startUploads, guardReady, reportError, dialog } = useStartUploads();
 
   const noBucket = activeBucket === "";
-  const crumbs = [activeBucket, ...path];
 
   async function handleUpload() {
     const picked = await open({ multiple: true, title: t("upload.choose") });
@@ -45,36 +31,14 @@ export function Toolbar() {
 
   return (
     <div className="flex h-[52px] shrink-0 items-center gap-2.5 border-b border-border bg-background px-4">
-      <div className="flex min-w-0 flex-1 items-center gap-px">
-        {noBucket ? (
-          <span className="truncate px-2 py-[5px] text-[13.5px] text-muted-foreground">
-            {t("main.breadcrumbPlaceholder")}
-          </span>
-        ) : (
-          crumbs.map((label, i) => {
-            const last = i === crumbs.length - 1;
-            return (
-              <Fragment key={`${i}-${label}`}>
-                {i > 0 && <ChevronRight className="size-[13px] shrink-0 text-muted2" />}
-                <button
-                  type="button"
-                  onClick={() => gotoCrumb(i - 1)}
-                  className={cn(
-                    "flex max-w-[190px] cursor-pointer items-center gap-[7px] truncate rounded-[7px] px-2 py-[5px] text-[13.5px] hover:bg-hover",
-                    last ? "font-semibold text-foreground" : "font-medium text-muted-foreground",
-                  )}
-                >
-                  {i === 0 && <Database className="size-[15px] shrink-0 text-muted-foreground" />}
-                  {label}
-                </button>
-              </Fragment>
-            );
-          })
-        )}
-      </div>
+      {/* The breadcrumb used to live here. It moved to `PathBar`, along the
+          bottom of the content area: a row of its own gives it ~820px, where
+          this slot left it ~357px once the rigid controls to the right had
+          taken theirs. This spacer keeps those controls right-aligned. */}
+      <div className="flex-1" />
       <div
         className={cn(
-          "flex h-8 w-[206px] items-center gap-[7px] rounded-[9px] border border-border bg-panel px-2.5 text-muted-foreground focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary-soft",
+          "flex h-8 w-[206px] shrink-0 items-center gap-[7px] rounded-[9px] border border-border bg-panel px-2.5 text-muted-foreground focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary-soft",
           noBucket && "opacity-50",
         )}
       >
@@ -87,7 +51,7 @@ export function Toolbar() {
           className="min-w-0 flex-1 border-none bg-transparent text-[13px] text-foreground outline-none disabled:cursor-not-allowed"
         />
       </div>
-      <div className="flex rounded-[9px] border border-border bg-panel p-0.5">
+      <div className="flex shrink-0 rounded-[9px] border border-border bg-panel p-0.5">
         <button
           type="button"
           onClick={() => setView("list")}
@@ -121,7 +85,7 @@ export function Toolbar() {
         aria-label={t("objects.newFolder")}
         disabled={noBucket}
         onClick={openNewFolder}
-        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-raised text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-raised text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
       >
         <FolderPlus className="size-[15px]" />
       </button>
@@ -133,7 +97,7 @@ export function Toolbar() {
         onClick={() =>
           queryClient.invalidateQueries({ queryKey: objectsRootKey(activeConn, activeBucket) })
         }
-        className="flex size-8 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-raised text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-[9px] border border-border bg-raised text-fg2 hover:bg-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
       >
         <RefreshCw className="size-[15px]" />
       </button>
@@ -153,7 +117,7 @@ export function Toolbar() {
         // looks like it did nothing -- `reportError` turns it into a visible
         // message through the same dialog the upload flow already renders.
         onClick={() => void handleUpload().catch(reportError)}
-        className="inline-flex h-8 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground shadow-[0_2px_6px_-1px_var(--primary-shadow)] hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
+        className="inline-flex h-8 shrink-0 cursor-pointer items-center gap-[7px] rounded-[9px] bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground shadow-[0_2px_6px_-1px_var(--primary-shadow)] hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
       >
         {!noBucket && !guardReady ? (
           <Loader2 className="size-[15px] animate-spin" />

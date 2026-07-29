@@ -5,6 +5,7 @@ import { AppStoreProvider } from "@/store/app-store";
 import { useTrayLabels } from "@/hooks/use-tray-labels";
 import { DetailsPanel } from "./details-panel";
 import { FileBrowser } from "./file-browser";
+import { PathBar } from "./path-bar";
 import { Sidebar } from "./sidebar";
 import { Toolbar } from "./toolbar";
 import { TransferBar } from "./transfer-bar";
@@ -22,6 +23,11 @@ export function AppShell() {
               <FileBrowser />
               <DetailsPanel />
             </div>
+            {/* Spans the whole content section, below the details panel rather
+                than inside the browser column -- that keeps its width at
+                (window - sidebar) regardless of whether the details panel is
+                open, which its ResizeObserver relies on. See `path-bar.tsx`. */}
+            <PathBar />
           </section>
         </div>
         <TransferBar />
