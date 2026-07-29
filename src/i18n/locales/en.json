@@ -183,6 +183,10 @@
   },
   "settings": {
     "title": "Settings",
+    "navGeneral": "General",
+    "navTransfers": "Transfers",
+    "navAdvanced": "Advanced",
+    "navAbout": "About",
     "general": "General",
     "theme": "Theme",
     "themeLight": "Light",
@@ -211,6 +215,8 @@
     "cleanResidueDone": "Removed {{count}} item(s) · freed {{size}}",
     "clearHistory": "Clear transfer history",
     "about": "About",
+    "author": "Author",
+    "license": "License",
     "github": "GitHub repo",
     "checkUpdate": "Check for updates"
   },

@@ -183,6 +183,10 @@
   },
   "settings": {
     "title": "设置",
+    "navGeneral": "通用",
+    "navTransfers": "传输",
+    "navAdvanced": "高级",
+    "navAbout": "关于",
     "general": "通用",
     "theme": "主题",
     "themeLight": "浅色",
@@ -211,6 +215,8 @@
     "cleanResidueDone": "已清理 {{count}} 项 · 释放 {{size}}",
     "clearHistory": "清空传输历史",
     "about": "关于",
+    "author": "作者",
+    "license": "开源许可",
     "github": "GitHub 仓库",
     "checkUpdate": "检查更新"
   },
