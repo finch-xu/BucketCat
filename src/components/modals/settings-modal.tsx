@@ -2,7 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import logo from "@/assets/logo.png";
+import logo from "@/assets/logo-icon.png";
 import { Modal } from "@/components/ui/modal";
 import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
