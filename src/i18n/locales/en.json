@@ -217,8 +217,7 @@
     "about": "About",
     "author": "Author",
     "license": "License",
-    "github": "GitHub repo",
-    "checkUpdate": "Check for updates"
+    "github": "GitHub repo"
   },
   "errors": {
     "auth/invalid-credentials": "Invalid credentials -- check the access key and secret key",

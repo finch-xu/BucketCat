@@ -2,10 +2,10 @@ import { useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import logo from "@/assets/logo-icon.png";
 import { Modal } from "@/components/ui/modal";
 import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
+import { AboutPane } from "@/components/modals/settings/about-pane";
 import { Row, SectionTitle, Stepper } from "@/components/modals/settings/shared";
 import { setLocale } from "@/i18n";
 import type { AppLocale } from "@/i18n/resolve-locale";
@@ -439,38 +439,7 @@ export function SettingsModal() {
         </Row>
 
         <SectionTitle>{t("settings.about")}</SectionTitle>
-        <div className="flex items-center gap-3.5 pt-1.5 pb-1">
-          <img
-            src={logo}
-            alt="BucketCat"
-            className="size-[52px] rounded-[13px] shadow-[0_0_0_1px_var(--border)]"
-          />
-          <div className="flex-1">
-            <div className="text-[15px] font-bold">
-              {t("app.name")}{" "}
-              <span className="ml-1 rounded-[20px] border border-border bg-panel px-[7px] py-px text-[11.5px] font-medium text-muted-foreground">
-                v0.1.0
-              </span>
-            </div>
-            <div className="mt-[3px] text-[12.5px] text-muted-foreground">{t("app.tagline")}</div>
-          </div>
-        </div>
-        <div className="mt-3 flex gap-2.5">
-          <a
-            href="https://github.com/finch-xu/BucketCat"
-            target="_blank"
-            rel="noreferrer"
-            className="rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] text-fg2 hover:bg-hover"
-          >
-            {t("settings.github")}
-          </a>
-          <a
-            href="#"
-            className="rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] text-fg2 hover:bg-hover"
-          >
-            {t("settings.checkUpdate")}
-          </a>
-        </div>
+        <AboutPane />
       </div>
     </Modal>
   );

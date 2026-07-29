@@ -217,8 +217,7 @@
     "about": "关于",
     "author": "作者",
     "license": "开源许可",
-    "github": "GitHub 仓库",
-    "checkUpdate": "检查更新"
+    "github": "GitHub 仓库"
   },
   "errors": {
     "auth/invalid-credentials": "凭据无效，请检查 Access Key 与 Secret Key",
