@@ -2,8 +2,8 @@ import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { getSettings, type AppError, type Settings } from "@/lib/api";
 
 /** The shared query key. Exported so writers can invalidate it without
- * re-typing the literal -- `general-pane.tsx` does exactly that after
- * persisting the share expiry. */
+ * re-typing the literal -- every settings writer in `general-pane.tsx` and
+ * `transfers-pane.tsx` does exactly that after a successful persist. */
 export const settingsKey = ["settings"] as const;
 
 /**
@@ -22,7 +22,16 @@ export const settingsKey = ["settings"] as const;
 export function useSettings(): UseQueryResult<Settings, AppError> {
   return useQuery({
     queryKey: settingsKey,
-    queryFn: getSettings,
+    // `useQuery`'s `onError` callback was removed in TanStack Query v5, and
+    // `retry: false` (the shared client default, see `src/lib/query.ts`)
+    // means a failure surfaces exactly once -- so log it here, in the
+    // queryFn itself, and re-throw so the query still enters its error
+    // state for any consumer that wants it.
+    queryFn: () =>
+      getSettings().catch((err) => {
+        console.error("Failed to load settings", err);
+        throw err;
+      }),
     staleTime: Infinity,
   });
 }

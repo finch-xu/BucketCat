@@ -90,10 +90,12 @@ export function GeneralPane() {
 
   function handleCloseToTrayChange(v: boolean) {
     setCloseToTrayState(v);
-    setCloseToTray(v).catch((err) => {
-      setCloseToTrayState(!v);
-      console.error("Failed to persist close-to-tray setting", err);
-    });
+    setCloseToTray(v)
+      .then(() => queryClient.invalidateQueries({ queryKey: settingsKey }))
+      .catch((err) => {
+        setCloseToTrayState(!v);
+        console.error("Failed to persist close-to-tray setting", err);
+      });
   }
 
   // Unlike every other switch here, this one writes outside the app: it

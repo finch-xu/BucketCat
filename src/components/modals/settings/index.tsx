@@ -30,14 +30,24 @@ const CATEGORIES: {
 ];
 
 export function SettingsModal() {
-  const { t } = useTranslation();
-  const { showSettings, closeSettings } = useApp();
-  // Pane-local view state, deliberately not in the app store: reopening the
-  // modal back on "General" is the intuitive default, so there is nothing to
-  // persist.
-  const [active, setActive] = useState<CategoryId>("general");
-
+  const { showSettings } = useApp();
+  // `SettingsModal` is rendered unconditionally by `app-shell.tsx`, so this
+  // guard must sit in the outermost component: it's the only way to make
+  // `SettingsContent` -- and the `active` state it owns -- actually unmount
+  // when the modal closes, rather than merely rendering null while staying
+  // resident. See the comment on `active` below for why that matters.
   if (!showSettings) return null;
+  return <SettingsContent />;
+}
+
+function SettingsContent() {
+  const { t } = useTranslation();
+  const { closeSettings } = useApp();
+  // Pane-local view state, deliberately not in the app store: reopening the
+  // modal back on "General" is the intuitive default. It stays that way
+  // because this component unmounts on close (see `SettingsModal` above),
+  // so there is nothing to persist.
+  const [active, setActive] = useState<CategoryId>("general");
 
   return (
     <Modal

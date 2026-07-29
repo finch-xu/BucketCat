@@ -1,8 +1,9 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
-import { useSettings } from "@/hooks/use-settings";
+import { settingsKey, useSettings } from "@/hooks/use-settings";
 import { getResumeEnabled, setMaxParts, setMaxTasks, setResumeEnabled } from "@/lib/api";
 import { useApp } from "@/store/app-store";
 import { Row, Stepper } from "./shared";
@@ -10,6 +11,7 @@ import { Row, Stepper } from "./shared";
 export function TransfersPane() {
   const { t } = useTranslation();
   const { transferSettings, setTransferSettings } = useApp();
+  const queryClient = useQueryClient();
   const settingsQuery = useSettings();
 
   // Backend defaults (`Settings::default()` in
@@ -54,6 +56,7 @@ export function TransfersPane() {
     setMaxTasksState(clamped);
     setMaxTasksPending(true);
     setMaxTasks(clamped)
+      .then(() => queryClient.invalidateQueries({ queryKey: settingsKey }))
       .catch((err) => {
         // Persist rejected: revert the optimistic local state, same pattern
         // as the resume-transfers switch below.
@@ -69,6 +72,7 @@ export function TransfersPane() {
     setMaxPartsState(clamped);
     setMaxPartsPending(true);
     setMaxParts(clamped)
+      .then(() => queryClient.invalidateQueries({ queryKey: settingsKey }))
       .catch((err) => {
         setMaxPartsState(previous);
         console.error("Failed to persist max parts", err);
@@ -137,12 +141,14 @@ export function TransfersPane() {
           checked={resumeEnabled}
           onChange={(v) => {
             setResumeEnabledState(v);
-            setResumeEnabled(v).catch((err) => {
-              // The persist was rejected: revert the optimistic local state so
-              // the switch never shows a value the backend/file did not take.
-              setResumeEnabledState(!v);
-              console.error("Failed to persist resume-transfers setting", err);
-            });
+            setResumeEnabled(v)
+              .then(() => queryClient.invalidateQueries({ queryKey: settingsKey }))
+              .catch((err) => {
+                // The persist was rejected: revert the optimistic local state so
+                // the switch never shows a value the backend/file did not take.
+                setResumeEnabledState(!v);
+                console.error("Failed to persist resume-transfers setting", err);
+              });
           }}
         />
       </Row>
