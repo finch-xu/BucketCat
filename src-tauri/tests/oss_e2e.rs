@@ -149,6 +149,7 @@ fn oss_connection() -> Connection {
         access_key_id: required_env("BUCKETCAT_OSS_AK"),
         secret_access_key: required_env("BUCKETCAT_OSS_SK"),
         default_bucket: None,
+        api_token: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn oss_wrong_region_connection() -> Connection {
         access_key_id: required_env("BUCKETCAT_OSS_AK"),
         secret_access_key: required_env("BUCKETCAT_OSS_SK"),
         default_bucket: None,
+        api_token: None,
     }
 }
 

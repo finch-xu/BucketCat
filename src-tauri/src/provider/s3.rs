@@ -329,10 +329,7 @@ pub fn qiniu_endpoint_for_region(endpoint: &str, from_region: &str, to_region: &
 /// it with a cloned client, and so the single lazy lookup in
 /// [`S3Provider::resolve_region`] shares the exact same normalization instead
 /// of re-deriving it.
-async fn bucket_location(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-) -> AppResult<Option<String>> {
+async fn bucket_location(client: &aws_sdk_s3::Client, bucket: &str) -> AppResult<Option<String>> {
     let output = client
         .get_bucket_location()
         .bucket(bucket)
@@ -476,6 +473,13 @@ pub struct S3Provider {
     /// `#[derive(Debug)]` safely because this field's own `Debug` impl is
     /// hand-redacted.
     routing: Option<RegionRouting>,
+    /// The connection's configured default bucket, if any.
+    ///
+    /// Carried purely so [`S3Provider::test_connection`] has somewhere to fall
+    /// back to when `ListBuckets` is denied -- see its doc comment. A bucket
+    /// name is not a credential, so this does not compromise the
+    /// `#[derive(Debug)]` above.
+    default_bucket: Option<String>,
 }
 
 /// Builds an `aws_sdk_s3::Client` for one `(provider, endpoint, region)` +
@@ -647,6 +651,11 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
         client,
         batch_delete: supports_batch_delete(&conn.provider),
         routing,
+        default_bucket: conn
+            .default_bucket
+            .as_ref()
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty()),
     })
 }
 
@@ -1088,6 +1097,22 @@ pub fn range_header(offset: u64, length: u64) -> String {
 }
 
 impl S3Provider {
+    /// This bucket's server-reported location, via one `GetBucketLocation`.
+    ///
+    /// `None` means the server answered with an empty (or absent)
+    /// `LocationConstraint`, not that the call failed -- see
+    /// [`bucket_location`], whose normalization this shares.
+    ///
+    /// Exposed for Cloudflare R2's bucket-info panel, where it is the *only*
+    /// piece of metadata available at every privilege tier: R2's coarse
+    /// location hint (`APAC`, `WNAM`, `WEUR`, ...) comes back here even for an
+    /// object-scoped token that the Cloudflare API refuses outright (verified
+    /// live on 2026-07-30). Everything else that panel shows needs an API
+    /// token, so this is what keeps it from being empty.
+    pub async fn bucket_location(&self, bucket: &str) -> AppResult<Option<String>> {
+        bucket_location(&self.client_for(bucket).await, bucket).await
+    }
+
     /// Returns the client that should be used to reach `bucket`.
     ///
     /// **Providers without region routing** (`self.routing` is `None`, i.e.
@@ -1247,10 +1272,7 @@ impl S3Provider {
                     &routing.secret_access_key,
                 )
                 .await?;
-                Ok(buckets
-                    .into_iter()
-                    .map(|b| (b.name, b.region))
-                    .collect())
+                Ok(buckets.into_iter().map(|b| (b.name, b.region)).collect())
             }
             RegionFlavor::Qiniu => {
                 // `self.client`, never `client_for` -- that would recurse, and
@@ -1397,7 +1419,6 @@ impl S3Provider {
             .collect())
     }
 
-
     /// Deletes `keys` one `DeleteObject` at a time, in batches of up to
     /// [`SINGLE_DELETE_CONCURRENCY`] concurrent requests -- the fallback
     /// [`Provider::delete_objects`] dispatches to when `self.batch_delete`
@@ -1475,8 +1496,40 @@ impl S3Provider {
 
 #[async_trait]
 impl Provider for S3Provider {
+    /// `ListBuckets`, falling back to a one-key `ListObjectsV2` on the
+    /// configured default bucket when the credentials are not allowed to
+    /// enumerate buckets.
+    ///
+    /// The fallback exists because "can list buckets" is a *stronger*
+    /// permission than "can use this connection", and several providers hand
+    /// out credentials scoped below it as the default: Cloudflare R2's
+    /// "Object Read & Write" tokens, Aliyun RAM sub-accounts, and any
+    /// least-privilege AWS IAM policy. Verified live against a real R2
+    /// object-scoped token on 2026-07-30: `ListBuckets` answers
+    /// `403 AccessDenied` while `ListObjectsV2` on a bucket that token *can*
+    /// reach answers 200. Without this, such a connection -- which browses,
+    /// uploads and downloads perfectly well -- would be reported to the user
+    /// as "connection failed".
+    ///
+    /// Deliberately narrow in three ways:
+    ///
+    /// - Only [`AppError::AccessDenied`] triggers it. A timeout, an
+    ///   unreachable endpoint or a wrong secret must still fail loudly; those
+    ///   are real problems the fallback would only obscure.
+    /// - It needs a `default_bucket`. With no bucket to probe there is nothing
+    ///   to prove, so the original `AccessDenied` is returned unchanged.
+    /// - The fallback's own failure is returned as-is, not swallowed back into
+    ///   the original error: if the default bucket is denied too, *that* is
+    ///   the more accurate answer.
     async fn test_connection(&self) -> AppResult<()> {
-        self.list_buckets().await.map(|_| ())
+        match self.list_buckets().await {
+            Ok(_) => Ok(()),
+            Err(AppError::AccessDenied) => match self.default_bucket.as_deref() {
+                Some(bucket) => self.list_objects(bucket, "", None, 1).await.map(|_| ()),
+                None => Err(AppError::AccessDenied),
+            },
+            Err(e) => Err(e),
+        }
     }
 
     async fn list_buckets(&self) -> AppResult<Vec<Bucket>> {
@@ -2010,6 +2063,7 @@ mod tests {
             access_key_id: "AKIAEXAMPLE".to_string(),
             secret_access_key: "secret".to_string(),
             default_bucket: None,
+            api_token: None,
         }
     }
 
@@ -2023,6 +2077,7 @@ mod tests {
             access_key_id: "minioadmin".to_string(),
             secret_access_key: "minioadmin".to_string(),
             default_bucket: None,
+            api_token: None,
         }
     }
 
@@ -2039,6 +2094,7 @@ mod tests {
             access_key_id: "LTAIexample".to_string(),
             secret_access_key: "secret".to_string(),
             default_bucket: None,
+            api_token: None,
         }
     }
 
@@ -2052,6 +2108,7 @@ mod tests {
             access_key_id: "rainyun-ak".to_string(),
             secret_access_key: "secret".to_string(),
             default_bucket: None,
+            api_token: None,
         }
     }
 
@@ -2068,7 +2125,121 @@ mod tests {
             access_key_id: "qiniu-ak".to_string(),
             secret_access_key: "secret".to_string(),
             default_bucket: None,
+            api_token: None,
         }
+    }
+
+    fn r2_connection() -> Connection {
+        Connection {
+            id: "c6".to_string(),
+            provider: "r2".to_string(),
+            name: "r2".to_string(),
+            // Exactly what `src/lib/r2.ts`'s `r2Endpoint` builds for the
+            // default jurisdiction.
+            endpoint: "https://acct123.r2.cloudflarestorage.com".to_string(),
+            region: "auto".to_string(),
+            access_key_id: "r2-token-id".to_string(),
+            secret_access_key: "sha256-of-token".to_string(),
+            default_bucket: None,
+            api_token: Some("cfut_token".to_string()),
+        }
+    }
+
+    // --- R2: the four properties that are choices, not defaults -----------
+    //
+    // Every one of these was verified live on 2026-07-30 (see
+    // `tests/r2_e2e.rs`). They are asserted here rather than left implicit
+    // because R2 would keep *working* if any of them changed -- so nothing
+    // else in this crate could catch a regression.
+
+    /// R2 accepts path-style AND virtual-hosted addressing, so moving it into
+    /// the virtual-hosted branch alongside AWS/OSS would break nothing
+    /// visibly. Only this assertion can catch that.
+    #[test]
+    fn r2_uses_path_style_addressing() {
+        assert!(uses_path_style(
+            "r2",
+            "https://acct123.r2.cloudflarestorage.com"
+        ));
+    }
+
+    /// The `s3.` hostname rewrite is Aliyun-OSS-only. R2's endpoint must cross
+    /// `from_connection` byte-for-byte.
+    #[test]
+    fn r2_endpoint_is_never_rewritten() {
+        let endpoint = "https://acct123.eu.r2.cloudflarestorage.com";
+        assert_eq!(s3_compat_endpoint("r2", endpoint), endpoint);
+    }
+
+    /// R2 keeps the fast Multi-Object Delete path, unlike Aliyun OSS and
+    /// Rainyun ROS which hard-require the legacy `Content-MD5` header
+    /// `aws-sdk-s3` cannot send. Confirmed with a real SDK `DeleteObjects`,
+    /// not a hand-rolled probe -- that shortcut is exactly what produced a
+    /// wrong answer for Rainyun.
+    #[test]
+    fn r2_keeps_the_batch_delete_path() {
+        assert!(supports_batch_delete("r2"));
+    }
+
+    /// **R2 gets no `RegionRouting`.** Its `eu`/`fedramp` endpoints are
+    /// separate namespaces, not alternate routes to the same buckets: the EU
+    /// endpoint answers `404 NoSuchBucket` for a default-jurisdiction bucket
+    /// rather than redirecting. There is nothing to route to, so building
+    /// routing state for R2 would be both useless and misleading.
+    #[test]
+    fn r2_does_not_get_region_routing() {
+        let provider = from_connection(&r2_connection()).unwrap();
+        assert!(
+            provider.routing.is_none(),
+            "R2 jurisdictions are separate namespaces, not regions -- routing between them is \
+             impossible by construction and must not be attempted"
+        );
+    }
+
+    // --- default_bucket: the low-privilege test_connection fallback --------
+
+    /// `test_connection`'s `AccessDenied` fallback needs a bucket to probe, so
+    /// `from_connection` has to carry one through.
+    #[test]
+    fn from_connection_carries_the_default_bucket() {
+        let conn = Connection {
+            default_bucket: Some("my-bucket".to_string()),
+            ..r2_connection()
+        };
+        assert_eq!(
+            from_connection(&conn).unwrap().default_bucket.as_deref(),
+            Some("my-bucket")
+        );
+    }
+
+    /// A blank default bucket is no bucket. Carrying `Some("")` through would
+    /// make the fallback issue a `ListObjectsV2` against the empty bucket
+    /// name, turning a clean `AccessDenied` into a confusing parse/404 error.
+    #[test]
+    fn from_connection_treats_a_blank_default_bucket_as_absent() {
+        for blank in ["", "  "] {
+            let conn = Connection {
+                default_bucket: Some(blank.to_string()),
+                ..r2_connection()
+            };
+            assert_eq!(
+                from_connection(&conn).unwrap().default_bucket,
+                None,
+                "a blank default bucket ({blank:?}) must not reach the fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn from_connection_trims_a_padded_default_bucket() {
+        let conn = Connection {
+            default_bucket: Some("  my-bucket \n".to_string()),
+            ..r2_connection()
+        };
+        assert_eq!(
+            from_connection(&conn).unwrap().default_bucket.as_deref(),
+            Some("my-bucket")
+        );
     }
 
     // --- is_aws_endpoint -------------------------------------------------
@@ -2472,7 +2643,10 @@ mod tests {
         assert_eq!(routing.region, "cn-east-1");
 
         // Every other backend has nothing to capture.
-        assert!(from_connection(&aws_connection()).unwrap().routing.is_none());
+        assert!(from_connection(&aws_connection())
+            .unwrap()
+            .routing
+            .is_none());
         assert!(from_connection(&minio_connection())
             .unwrap()
             .routing
@@ -2747,8 +2921,8 @@ mod tests {
     // non-AWS, non-OSS backend.
 
     #[tokio::test]
-    async fn qiniu_client_for_returns_the_default_client_when_the_bucket_is_in_the_connection_region()
-    {
+    async fn qiniu_client_for_returns_the_default_client_when_the_bucket_is_in_the_connection_region(
+    ) {
         let provider = qiniu_provider_with_cached_region("same-region-bucket", "cn-east-1");
 
         let url = provider
@@ -2800,7 +2974,11 @@ mod tests {
     #[test]
     fn qiniu_endpoint_for_region_rewrites_the_region_label() {
         assert_eq!(
-            qiniu_endpoint_for_region("https://s3.cn-east-1.qiniucs.com", "cn-east-1", "cn-north-1"),
+            qiniu_endpoint_for_region(
+                "https://s3.cn-east-1.qiniucs.com",
+                "cn-east-1",
+                "cn-north-1"
+            ),
             "https://s3.cn-north-1.qiniucs.com"
         );
     }

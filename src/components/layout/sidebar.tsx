@@ -2,6 +2,7 @@ import {
   ChevronDown,
   ChevronRight,
   Folder,
+  Info,
   Moon,
   Pencil,
   Plus,
@@ -9,9 +10,11 @@ import {
   Sun,
   Trash2,
 } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import logoIcon from "@/assets/logo-icon.png";
 import { ProviderChip } from "@/components/icons/provider-chip";
+import { BucketInfoDialog } from "@/components/modals/bucket-info-dialog";
 import { cn } from "@/lib/utils";
 import { isMac } from "@/lib/platform";
 import { providerMeta } from "@/lib/providers";
@@ -47,8 +50,7 @@ function BucketRowSkeleton() {
 }
 
 interface BucketListProps {
-  connId: string;
-  connRegion: string;
+  conn: ConnectionDto;
   isOpen: boolean;
   activeConn: string;
   activeBucket: string;
@@ -57,23 +59,106 @@ interface BucketListProps {
 
 /** Renders a connection's bucket list. `useBuckets` only actually fires the
  * IPC call once `isOpen` flips true (see its `enabled` param), so collapsed
- * connections never pay the round-trip. */
-function BucketList({
-  connId,
-  connRegion,
-  isOpen,
-  activeConn,
-  activeBucket,
-  onSelect,
-}: BucketListProps) {
+ * connections never pay the round-trip.
+ *
+ * ## The access-denied fallback
+ *
+ * "Can list buckets" is a *stronger* permission than "can use this
+ * connection", and several providers hand out credentials scoped below it by
+ * default — Cloudflare R2's object-scoped tokens, Aliyun RAM sub-accounts,
+ * least-privilege AWS IAM policies. For those, `list_buckets` returns
+ * `auth/access-denied` even though the connection browses its own bucket
+ * perfectly well, and rendering that as a red error would tell the user their
+ * working connection is broken.
+ *
+ * So when the failure is *specifically* access-denied and the connection has
+ * a default bucket, that one bucket is rendered with a note explaining why
+ * it's the only one. Every other failure still surfaces as an error with a
+ * retry, and the backend's `list_buckets` keeps its plain "enumerate what's
+ * visible" semantics — this degradation is presentation only. `test_connection`
+ * has the matching fallback on the backend, so such a connection also passes
+ * the wizard's Test button. */
+function BucketList({ conn, isOpen, activeConn, activeBucket, onSelect }: BucketListProps) {
   const { t } = useTranslation();
   const errorText = useErrorText();
-  const bucketsQuery = useBuckets(connId, isOpen);
+  const bucketsQuery = useBuckets(conn.id, isOpen);
+  const [infoBucket, setInfoBucket] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
+  const deniedFallbackBucket =
+    bucketsQuery.isError &&
+    bucketsQuery.error.code === "auth/access-denied" &&
+    conn.default_bucket?.trim()
+      ? conn.default_bucket.trim()
+      : null;
+
+  const renderBucketRow = (name: string, region: string | null) => {
+    const active = activeConn === conn.id && activeBucket === name;
+    return (
+      <div
+        key={name}
+        onClick={() => onSelect(name)}
+        className={cn(
+          "group/bucket flex cursor-pointer items-center gap-2 rounded-lg px-[9px] py-1.5",
+          active ? "bg-active text-primary" : "text-fg2 hover:bg-hover",
+        )}
+      >
+        <Folder className={cn("size-3.5", active ? "text-primary" : "text-muted-foreground")} />
+        <span
+          className={cn(
+            "min-w-0 flex-1 truncate text-[12.5px]",
+            active ? "font-semibold" : "font-medium",
+          )}
+        >
+          {name}
+        </span>
+        {/* Cross-region label (design: M5b task-1, auto-routed since
+         * M5b task-2) -- a bucket whose OSS-reported region differs
+         * from this connection's configured region is still fully
+         * reachable: `S3Provider::client_for` picks a client for the
+         * bucket's own region automatically. Purely informational,
+         * neutral styling only (no accent/warning color, no
+         * click-behavior change). */}
+        {region && region !== conn.region && (
+          <span
+            className="shrink-0 text-[10.5px] text-muted-foreground"
+            title={t("sidebar.bucketRegionHint", { region })}
+          >
+            {region}
+          </span>
+        )}
+        {/* R2 only: usage, jurisdiction and public-access info live behind
+         * Cloudflare's own API, so there is nothing to show for any other
+         * provider. Hidden until hover (or focus, for keyboard users) so it
+         * doesn't add permanent visual weight to every row. */}
+        {conn.provider === "r2" && (
+          <button
+            type="button"
+            aria-label={t("bucketInfo.open", { bucket: name })}
+            title={t("bucketInfo.open", { bucket: name })}
+            onClick={(e) => {
+              e.stopPropagation();
+              setInfoBucket(name);
+            }}
+            className="flex size-[18px] shrink-0 cursor-pointer items-center justify-center rounded-[5px] text-muted-foreground opacity-0 group-hover/bucket:opacity-100 hover:bg-hover hover:text-fg2 focus-visible:opacity-100"
+          >
+            <Info className="size-3.5" />
+          </button>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="mt-px mb-1 ml-[22px] border-l border-border pl-1.5">
+      {infoBucket && (
+        <BucketInfoDialog
+          connectionId={conn.id}
+          bucket={infoBucket}
+          onClose={() => setInfoBucket(null)}
+        />
+      )}
       {bucketsQuery.isPending && (
         <div aria-busy="true" aria-live="polite">
           <span className="sr-only">{t("sidebar.loadingBuckets")}</span>
@@ -81,7 +166,15 @@ function BucketList({
           <BucketRowSkeleton />
         </div>
       )}
-      {bucketsQuery.isError && (
+      {deniedFallbackBucket && (
+        <>
+          {renderBucketRow(deniedFallbackBucket, null)}
+          <p className="px-[9px] pt-0.5 pb-1 text-[11px] leading-snug text-muted-foreground">
+            {t("sidebar.cannotListBuckets")}
+          </p>
+        </>
+      )}
+      {bucketsQuery.isError && !deniedFallbackBucket && (
         <div role="alert" className="flex items-center justify-between gap-2 px-[9px] py-1.5">
           <span className="truncate text-[12px] text-destructive">
             {errorText(bucketsQuery.error)}
@@ -101,44 +194,7 @@ function BucketList({
         </div>
       )}
       {bucketsQuery.isSuccess &&
-        bucketsQuery.data.map((bucket) => {
-          const active = activeConn === connId && activeBucket === bucket.name;
-          return (
-            <div
-              key={bucket.name}
-              onClick={() => onSelect(bucket.name)}
-              className={cn(
-                "flex cursor-pointer items-center gap-2 rounded-lg px-[9px] py-1.5",
-                active ? "bg-active text-primary" : "text-fg2 hover:bg-hover",
-              )}
-            >
-              <Folder className={cn("size-3.5", active ? "text-primary" : "text-muted-foreground")} />
-              <span
-                className={cn(
-                  "min-w-0 flex-1 truncate text-[12.5px]",
-                  active ? "font-semibold" : "font-medium",
-                )}
-              >
-                {bucket.name}
-              </span>
-              {/* Cross-region label (design: M5b task-1, auto-routed since
-               * M5b task-2) -- a bucket whose OSS-reported region differs
-               * from this connection's configured region is still fully
-               * reachable: `S3Provider::client_for` picks a client for the
-               * bucket's own region automatically. Purely informational,
-               * neutral styling only (no accent/warning color, no
-               * click-behavior change). */}
-              {bucket.region && bucket.region !== connRegion && (
-                <span
-                  className="shrink-0 text-[10.5px] text-muted-foreground"
-                  title={t("sidebar.bucketRegionHint", { region: bucket.region })}
-                >
-                  {bucket.region}
-                </span>
-              )}
-            </div>
-          );
-        })}
+        bucketsQuery.data.map((bucket) => renderBucketRow(bucket.name, bucket.region ?? null))}
     </div>
   );
 }
@@ -219,8 +275,7 @@ function ConnectionRow({
         </span>
       </div>
       <BucketList
-        connId={conn.id}
-        connRegion={conn.region}
+        conn={conn}
         isOpen={isOpen}
         activeConn={activeConn}
         activeBucket={activeBucket}

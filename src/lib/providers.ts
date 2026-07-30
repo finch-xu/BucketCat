@@ -56,7 +56,11 @@ export interface ProviderMeta {
  */
 export const PROVIDERS: ProviderMeta[] = [
   { id: "s3", name: "Amazon S3", descKey: "providers.s3", color: "#E67C29", icon: AwsIcon, colorLogo: true, endpoint: "https://s3.amazonaws.com", region: "us-east-1" },
-  { id: "r2", name: "Cloudflare R2", descKey: "providers.r2", color: "#F6821F", icon: CloudflareIcon, colorLogo: true, endpoint: "https://<account>.r2.cloudflarestorage.com", region: "auto" },
+  // R2's endpoint is built from the account id (see `R2Fields` / `src/lib/r2.ts`),
+  // so there is no fixed default to prefill -- the empty string keeps the form
+  // from seeding a placeholder host the user would have to edit by hand. The
+  // value below is still shown as the field's *placeholder*.
+  { id: "r2", name: "Cloudflare R2", descKey: "providers.r2", color: "#F6821F", icon: CloudflareIcon, colorLogo: true, endpoint: "", region: "auto" },
   { id: "minio", name: "MinIO", descKey: "providers.minio", color: "#C72E49", icon: MinioIcon, colorLogo: false, endpoint: "https://minio.local:9000", region: "us-east-1" },
   { id: "oss", name: "Aliyun OSS", descKey: "providers.oss", color: "#FF6A00", icon: AlibabaCloudIcon, colorLogo: true, endpoint: "https://oss-cn-hangzhou.aliyuncs.com", region: "cn-hangzhou" },
   { id: "rainyun", name: "Rainyun ROS", descKey: "providers.rainyun", color: "#3E8BD6", icon: CloudRain, colorLogo: false, endpoint: "https://cn-nb1.rains3.com", region: "cn-nb1" },

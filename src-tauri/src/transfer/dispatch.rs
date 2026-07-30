@@ -99,6 +99,7 @@ mod tests {
                 access_key_id: "AK".to_string(),
                 secret_access_key: "SK".to_string(),
                 default_bucket: None,
+                api_token: None,
             });
             Ok(())
         })

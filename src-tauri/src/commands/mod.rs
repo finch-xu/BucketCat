@@ -8,6 +8,7 @@
 
 pub mod connection;
 pub mod object;
+pub mod r2;
 pub mod settings;
 pub mod transfer;
 
@@ -19,6 +20,7 @@ pub use object::{
     create_folder, delete_objects, delete_prefix, head_object, list_objects, presign_get,
     rename_object,
 };
+pub use r2::{r2_bucket_info, r2_probe_token, R2BucketInfo};
 pub use settings::{
     clean_checkpoint_residue, get_autostart, get_close_to_tray, get_resume_enabled, get_settings,
     set_autostart, set_close_to_tray, set_max_parts, set_max_tasks, set_resume_enabled,

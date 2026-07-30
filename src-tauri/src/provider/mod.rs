@@ -4,9 +4,12 @@
 //! providers) behind a small trait so [`crate::commands`] can talk to
 //! "a bucket store" without depending on `aws-sdk-s3` types directly.
 
+pub mod https;
 pub mod hub;
 pub mod oss_admin;
 pub mod oss_sign;
+pub mod r2;
+pub mod r2_admin;
 pub mod s3;
 
 pub use hub::ProviderHub;
@@ -141,7 +144,16 @@ pub struct ObjectHead {
 #[async_trait]
 pub trait Provider {
     /// Cheapest possible call that proves the connection's credentials and
-    /// endpoint are usable. Implemented as `list_buckets().map(|_| ())`.
+    /// endpoint are usable.
+    ///
+    /// Note the contract is "usable", **not** "can list buckets". Listing
+    /// buckets is a stronger permission than browsing one, and providers
+    /// routinely hand out credentials scoped below it (Cloudflare R2
+    /// object-scoped tokens, Aliyun RAM sub-accounts, least-privilege AWS IAM
+    /// policies). Implementations should therefore treat an `AccessDenied`
+    /// from `list_buckets` as inconclusive and fall back to probing the
+    /// connection's own default bucket -- see [`S3Provider::test_connection`]
+    /// for the exact rule and the live evidence behind it.
     async fn test_connection(&self) -> AppResult<()>;
 
     /// Lists every bucket visible to the connection's credentials.

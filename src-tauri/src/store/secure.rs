@@ -229,6 +229,7 @@ mod tests {
             access_key_id: "AKIAEXAMPLE".to_string(),
             secret_access_key: "super-secret-value".to_string(),
             default_bucket: Some("my-bucket".to_string()),
+            api_token: None,
         }
     }
 

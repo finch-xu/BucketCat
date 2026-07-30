@@ -43,10 +43,24 @@ export interface ConnectionInput {
   access_key_id: string;
   secret_access_key: string;
   default_bucket: string | null;
+  /** Cloudflare API token value, for R2 connections only.
+   *
+   * When this is set and `secret_access_key` is blank, the **backend**
+   * derives the secret as `sha256(token)` — Cloudflare's own relationship
+   * between an R2 token and the S3 credentials it projects into. The
+   * frontend deliberately never computes that hash (there is one
+   * implementation, in `provider/r2.rs`, and the derived secret never exists
+   * inside the webview).
+   *
+   * On edit, blank means "keep the stored token", exactly like
+   * `secret_access_key`. Optional on the wire, so every non-R2 form keeps
+   * sending the payload it always sent. */
+  api_token?: string | null;
 }
 
-/** Backend -> frontend view of a saved connection (never the secret key).
- * Mirrors `ConnectionDto` in `src-tauri/src/store/model.rs`. */
+/** Backend -> frontend view of a saved connection (never the secret key,
+ * never the API token). Mirrors `ConnectionDto` in
+ * `src-tauri/src/store/model.rs`. */
 export interface ConnectionDto {
   id: string;
   provider: ProviderKind;
@@ -55,6 +69,10 @@ export interface ConnectionDto {
   region: string;
   access_key_id: string;
   default_bucket: string | null;
+  /** Whether a Cloudflare API token is stored for this connection. The token
+   * itself never crosses this boundary; this boolean is all the edit form
+   * needs to offer its "leave blank to keep" affordance. */
+  has_api_token: boolean;
 }
 
 /** A bucket as returned by `list_buckets`. Mirrors `Bucket` in
@@ -142,6 +160,95 @@ export function testConnection(input: ConnectionInput): Promise<void> {
 
 export function listBuckets(connectionId: string): Promise<Bucket[]> {
   return invokeCommand<Bucket[]>("list_buckets", { connectionId });
+}
+
+/** One account an R2 API token can see. Mirrors `R2Account` in
+ * `src-tauri/src/provider/r2_admin.rs`. */
+export interface R2Account {
+  id: string;
+  name: string;
+}
+
+/** What probing an R2 API token establishes. Mirrors `R2TokenProbe`. */
+export interface R2TokenProbe {
+  /** The token's own id, which **is** R2's S3 Access Key ID. */
+  access_key_id: string;
+  /** Accounts the token can enumerate.
+   *
+   * **Empty is a normal success, not a failure.** An R2 object-scoped token
+   * verifies fine and reports its id, but Cloudflare answers `200 []` here
+   * for it rather than 403 (verified live). The form must then ask the user
+   * for the account id instead of rejecting the token. */
+  accounts: R2Account[];
+}
+
+/** Probes an R2 API token the user has just pasted, before any connection
+ * exists to save it against — returns the token's id (the S3 Access Key ID)
+ * and whichever accounts it can see, so one paste fills in the access key,
+ * the account id and the endpoint.
+ *
+ * Called imperatively by the connection form, like `testConnection`. */
+export function r2ProbeToken(token: string): Promise<R2TokenProbe> {
+  return invokeCommand<R2TokenProbe>("r2_probe_token", { token });
+}
+
+/** Bucket metadata from the Cloudflare API. Mirrors `R2BucketMeta`. */
+export interface R2BucketMeta {
+  /** R2's coarse location *hint* (`APAC`, `WNAM`, `WEUR`, …) — not a region.
+   * R2's SigV4 region is always `auto`. */
+  location: string | null;
+  storage_class: string | null;
+  jurisdiction: string | null;
+}
+
+/** Storage usage. Mirrors `R2Usage` — Cloudflare reports these as JSON
+ * strings, but the backend has already parsed them to numbers. */
+export interface R2Usage {
+  object_count: number;
+  payload_size: number;
+  metadata_size: number;
+  upload_count: number;
+}
+
+/** The `r2.dev` managed domain. `domain` is allocated even when `enabled` is
+ * false — Cloudflare just doesn't serve it until public access is on. */
+export interface R2ManagedDomain {
+  enabled: boolean;
+  domain: string;
+}
+
+export interface R2CustomDomain {
+  domain: string;
+  enabled: boolean;
+  /** Cloudflare's SSL provisioning status. `enabled` with a non-`active`
+   * status means configured but not yet serving. */
+  ssl_status: string | null;
+}
+
+/** Everything the bucket-info panel shows. Mirrors `R2BucketInfo` in
+ * `src-tauri/src/commands/r2.rs`.
+ *
+ * Each field is independently optional because the sources have genuinely
+ * different availability: `location` comes from the **S3** plane and survives
+ * every privilege tier, while everything below it needs a Cloudflare API
+ * token and can be refused on its own. `api_error` is an `errors.*` i18n key
+ * saying why the API-sourced fields are absent. */
+export interface R2BucketInfo {
+  bucket: string;
+  location: string | null;
+  has_api_token: boolean;
+  meta: R2BucketMeta | null;
+  usage: R2Usage | null;
+  managed_domain: R2ManagedDomain | null;
+  custom_domains: R2CustomDomain[] | null;
+  api_error: string | null;
+}
+
+export function r2BucketInfo(
+  connectionId: string,
+  bucket: string,
+): Promise<R2BucketInfo> {
+  return invokeCommand<R2BucketInfo>("r2_bucket_info", { connectionId, bucket });
 }
 
 /** One row of an object listing. Mirrors `ObjectEntry` in

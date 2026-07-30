@@ -264,6 +264,7 @@ mod tests {
             access_key_id: "AK".to_string(),
             secret_access_key: secret.to_string(),
             default_bucket: None,
+            api_token: None,
         }
     }
 

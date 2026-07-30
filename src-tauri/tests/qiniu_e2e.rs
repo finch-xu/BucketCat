@@ -192,6 +192,7 @@ fn qiniu_connection() -> Connection {
         access_key_id: required_env("BUCKETCAT_QINIU_AK"),
         secret_access_key: required_env("BUCKETCAT_QINIU_SK"),
         default_bucket: None,
+        api_token: None,
     }
 }
 
@@ -488,7 +489,11 @@ async fn small_object_round_trip() {
         .head_object(&bucket, &key)
         .await
         .expect_err("the object must be gone after delete_objects");
-    assert_eq!(err.code(), "storage/key-not-found", "unexpected error: {err}");
+    assert_eq!(
+        err.code(),
+        "storage/key-not-found",
+        "unexpected error: {err}"
+    );
 
     cleanup_prefix(&provider, &bucket, &prefix).await;
 }
@@ -702,7 +707,11 @@ async fn batch_delete_uses_the_multi_object_path() {
             .head_object(&bucket, key)
             .await
             .expect_err("the object must be gone after a batch delete");
-        assert_eq!(err.code(), "storage/key-not-found", "unexpected error: {err}");
+        assert_eq!(
+            err.code(),
+            "storage/key-not-found",
+            "unexpected error: {err}"
+        );
     }
 
     cleanup_prefix(&provider, &bucket, &prefix).await;
@@ -890,7 +899,11 @@ async fn rename_object_moves_the_object() {
         .head_object(&bucket, &from_key)
         .await
         .expect_err("the source key must be gone after the rename");
-    assert_eq!(err.code(), "storage/key-not-found", "unexpected error: {err}");
+    assert_eq!(
+        err.code(),
+        "storage/key-not-found",
+        "unexpected error: {err}"
+    );
 
     cleanup_prefix(&provider, &bucket, &prefix).await;
 }
@@ -933,7 +946,9 @@ async fn delete_prefix_removes_every_object_under_it() {
         .await
         .expect("list_objects_flat should walk the whole subtree");
     assert!(
-        flat.entries.iter().any(|e| e.key == format!("{prefix}sub/")),
+        flat.entries
+            .iter()
+            .any(|e| e.key == format!("{prefix}sub/")),
         "list_objects_flat must surface the zero-byte folder marker as a real key; saw: {:?}",
         flat.entries.iter().map(|e| &e.key).collect::<Vec<_>>()
     );

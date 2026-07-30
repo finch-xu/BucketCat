@@ -215,6 +215,7 @@ fn rainyun_connection() -> Connection {
         access_key_id: required_env("BUCKETCAT_RAINYUN_AK"),
         secret_access_key: required_env("BUCKETCAT_RAINYUN_SK"),
         default_bucket: None,
+        api_token: None,
     }
 }
 

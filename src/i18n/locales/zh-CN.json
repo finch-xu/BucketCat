@@ -1,5 +1,8 @@
 {
-  "app": { "name": "BucketCat", "tagline": "跨平台对象存储客户端 · Tauri + React" },
+  "app": {
+    "name": "BucketCat",
+    "tagline": "跨平台对象存储客户端 · Tauri + React"
+  },
   "tray": {
     "show": "显示 BucketCat",
     "quit": "退出"
@@ -15,7 +18,8 @@
     "noBuckets": "没有存储桶",
     "bucketRegionHint": "该存储桶位于 {{region}}，请求会自动路由到该区域",
     "emptyTitle": "还没有连接",
-    "emptyHint": "点击右上角的 + 添加第一个连接"
+    "emptyHint": "点击右上角的 + 添加第一个连接",
+    "cannotListBuckets": "该凭据无权列出存储桶，因此仅显示默认桶。"
   },
   "main": {
     "searchPlaceholder": "按前缀搜索…",
@@ -181,6 +185,50 @@
     "b2": "高性价比归档存储",
     "generic": "任意 S3 兼容服务",
     "genericName": "通用 S3 兼容"
+  },
+  "r2": {
+    "credMode": "凭据方式",
+    "credModeToken": "API 令牌",
+    "credModeKeys": "S3 密钥",
+    "credModeTokenHint": "粘贴一个 R2 API 令牌即可 —— 访问 ID 和密钥都由它派生，还能解锁桶用量与公共访问信息。",
+    "credModeKeysHint": "直接填写 S3 访问 ID 与机密访问密钥。没有令牌则无法读取桶用量与公共访问信息。",
+    "apiToken": "R2 API 令牌",
+    "apiTokenHint": "在 Cloudflare 控制台创建令牌时只显示一次。",
+    "apiTokenKeep": "留空则保留已存的令牌。",
+    "probe": "探测",
+    "probing": "正在探测令牌…",
+    "probeOk": "令牌有效，访问 ID 与账户 ID 已自动填入。",
+    "probeOkNoAccount": "令牌有效。该令牌无权列出账户，请在下方填写账户 ID。",
+    "probeFail": "探测失败",
+    "probeRequired": "请先点「探测」以填入访问 ID。",
+    "accessKeyDerived": "探测令牌后自动填入",
+    "accountId": "账户 ID",
+    "accountIdHint": "R2 端点里那串 32 位 id。直接粘贴整条端点地址也可以。",
+    "accountRequired": "需要账户 ID 才能生成端点。",
+    "jurisdiction": "辖区",
+    "jurisdictionDefault": "默认（全球）",
+    "jurisdictionEu": "欧盟",
+    "jurisdictionFedramp": "FedRAMP",
+    "jurisdictionHint": "每个辖区是独立的命名空间 —— 一个连接只能看到建在所选辖区里的桶。",
+    "endpointNeedsAccount": "请先在上方填写账户 ID"
+  },
+  "bucketInfo": {
+    "open": "查看「{{bucket}}」的桶信息",
+    "title": "桶信息",
+    "loading": "正在读取桶信息…",
+    "location": "位置提示",
+    "locationUnknown": "未报告",
+    "jurisdiction": "辖区",
+    "storageClass": "存储类",
+    "objects": "对象数",
+    "size": "总大小",
+    "publicUrl": "公共访问",
+    "r2devOff": "r2.dev 未开启",
+    "customDomains": "自定义域",
+    "noCustomDomains": "无",
+    "domainPending": "未生效",
+    "noToken": "给这个连接填上 R2 API 令牌，即可查看用量与公共访问信息。",
+    "tokenDenied": "该连接的 API 令牌无权读取桶设置。"
   },
   "settings": {
     "title": "设置",

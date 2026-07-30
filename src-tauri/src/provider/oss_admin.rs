@@ -14,17 +14,13 @@
 //! small `hyper` + `hyper-rustls` client (see that module's Cargo.toml
 //! comment for why this isn't built on `reqwest`).
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use quick_xml::events::{BytesText, Event};
 use quick_xml::reader::Reader;
 
 use crate::error::{AppError, AppResult};
+use crate::provider::https;
 use crate::provider::oss_sign;
 use crate::provider::s3::classify_error_code;
 
@@ -237,28 +233,10 @@ fn civil_from_unix_seconds(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     (y, m, d, hh, mm, ss)
 }
 
-/// Builds the `hyper` HTTPS client used for the one-shot native `ListBuckets`
-/// request. Explicit `builder_with_provider` (rather than relying on a
-/// process-wide default `CryptoProvider`) so this never depends on some
-/// other component (e.g. `aws-sdk-s3`'s own transport) having already
-/// installed one -- and never races it if not.
-fn build_https_client() -> AppResult<
-    Client<
-        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-        Empty<Bytes>,
-    >,
-> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let connector = HttpsConnectorBuilder::new()
-        .with_provider_and_native_roots(provider)
-        .map_err(|e| AppError::Internal {
-            message: format!("oss list-buckets: tls setup failed: {e}"),
-        })?
-        .https_only()
-        .enable_http1()
-        .build();
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
-}
+// The `hyper` HTTPS client this module's one-shot native `ListBuckets`
+// request rides on now lives in `provider::https`, shared with
+// `provider::r2_admin` -- see that module for why it isn't `reqwest` and why
+// it pins its own `CryptoProvider`.
 
 /// Calls OSS's native `GET {endpoint}/` (`ListBuckets`), account-level and
 /// cross-region -- see the module doc comment. `endpoint` must be the
@@ -304,16 +282,11 @@ pub async fn list_buckets(
             message: format!("oss list-buckets: failed to build request: {e}"),
         })?;
 
-    let client = build_https_client()?;
-    let response = client.request(request).await.map_err(|e| {
-        let msg = e.to_string();
-        let lower = msg.to_lowercase();
-        if lower.contains("timed out") || lower.contains("timeout") {
-            AppError::Timeout
-        } else {
-            AppError::Unreachable
-        }
-    })?;
+    let client = https::build_https_client("oss list-buckets")?;
+    let response = client
+        .request(request)
+        .await
+        .map_err(|e| https::classify_transport_error(&e))?;
 
     let status = response.status();
     let body = response

@@ -48,6 +48,7 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::provider::r2::r2_secret_from_token;
 use crate::provider::{from_connection, Bucket, Provider, ProviderHub};
 use crate::store::{Connection, ConnectionDto, ConnectionInput, SecureStore};
 
@@ -97,6 +98,19 @@ fn ensure_config_dir(dir: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// Normalizes an incoming `api_token`: trimmed, with blank treated as absent.
+///
+/// A pasted token routinely carries a trailing newline, and an empty string
+/// arriving from a form field must mean "no token" rather than "a token that
+/// happens to be empty" -- the latter would make [`ConnectionDto`]'s
+/// `has_api_token` claim a token exists and send an empty Bearer credential
+/// to Cloudflare.
+fn normalized_api_token(token: Option<String>) -> Option<String> {
+    token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
 /// Builds the full [`Connection`] a fresh `add_connection` call should
 /// persist: an `input`'s fields plus a freshly generated id.
 ///
@@ -106,7 +120,31 @@ fn ensure_config_dir(dir: &Path) -> AppResult<()> {
 /// the same trimming, that [`merge_update`] applies on every edit, so a
 /// connection's credentials get identical treatment whether they arrive via
 /// `add_connection` or `update_connection`.
+///
+/// **The one derivation:** when an `api_token` is supplied and
+/// `secret_access_key` is blank, the secret is derived from the token as
+/// `sha256(token)` (see [`r2_secret_from_token`]). That is Cloudflare R2's
+/// documented relationship between the two, verified live against two real
+/// tokens of different privilege tiers on 2026-07-30.
+///
+/// It is deliberately **not** gated on `provider == "r2"`. `api_token` is only
+/// ever populated by the R2 connection form, so gating would add a failure
+/// mode without preventing anything: switching an R2 connection's provider in
+/// the form would silently blank its secret instead of keeping the credential
+/// that still works. An explicitly typed `secret_access_key` always wins, so
+/// the S3-key mode of that form is unaffected.
 fn new_connection(input: ConnectionInput) -> Connection {
+    let api_token = normalized_api_token(input.api_token);
+    let typed_secret = input.secret_access_key.trim();
+    let secret_access_key = if !typed_secret.is_empty() {
+        typed_secret.to_string()
+    } else {
+        api_token
+            .as_deref()
+            .map(r2_secret_from_token)
+            .unwrap_or_default()
+    };
+
     Connection {
         id: Uuid::new_v4().to_string(),
         provider: input.provider,
@@ -114,8 +152,9 @@ fn new_connection(input: ConnectionInput) -> Connection {
         endpoint: input.endpoint,
         region: input.region,
         access_key_id: input.access_key_id.trim().to_string(),
-        secret_access_key: input.secret_access_key.trim().to_string(),
+        secret_access_key,
         default_bucket: input.default_bucket,
+        api_token,
     }
 }
 
@@ -132,11 +171,28 @@ fn new_connection(input: ConnectionInput) -> Connection {
 /// for the matching treatment on creation. `id` is always preserved from
 /// `existing`, since `ConnectionInput` carries no id of its own.
 pub fn merge_update(existing: &Connection, input: ConnectionInput) -> Connection {
-    let secret_access_key = if input.secret_access_key.trim().is_empty() {
-        existing.secret_access_key.clone()
+    // The R2 API token follows the identical "leave blank to keep" contract:
+    // the edit form never echoes it back, so a blank field means "unchanged",
+    // not "clear it".
+    let new_token = normalized_api_token(input.api_token);
+    let api_token = new_token.clone().or_else(|| existing.api_token.clone());
+
+    let typed_secret = input.secret_access_key.trim();
+    let secret_access_key = if !typed_secret.is_empty() {
+        // An explicitly typed secret always wins, so the form's S3-key mode
+        // can still override a derived one.
+        typed_secret.to_string()
+    } else if let Some(token) = new_token.as_deref() {
+        // A *newly pasted* token re-derives the secret. Without this, rotating
+        // an R2 token through the edit form would store the new token while
+        // leaving the old token's hash as the S3 secret -- the connection
+        // would keep browsing (both are valid until the old token is revoked)
+        // and then break later, far from the edit that caused it.
+        r2_secret_from_token(token)
     } else {
-        input.secret_access_key.trim().to_string()
+        existing.secret_access_key.clone()
     };
+
     Connection {
         id: existing.id.clone(),
         provider: input.provider,
@@ -146,6 +202,7 @@ pub fn merge_update(existing: &Connection, input: ConnectionInput) -> Connection
         access_key_id: input.access_key_id.trim().to_string(),
         secret_access_key,
         default_bucket: input.default_bucket,
+        api_token,
     }
 }
 
@@ -258,6 +315,7 @@ mod tests {
             access_key_id: "AKIAEXAMPLE".to_string(),
             secret_access_key: secret.to_string(),
             default_bucket: Some("my-bucket".to_string()),
+            api_token: None,
         }
     }
 
@@ -270,6 +328,7 @@ mod tests {
             access_key_id: "AKIANEW".to_string(),
             secret_access_key: secret.to_string(),
             default_bucket: None,
+            api_token: None,
         }
     }
 
@@ -387,6 +446,129 @@ mod tests {
         assert_eq!(updated.region, "us-west-2");
         assert_eq!(updated.access_key_id, "AKIANEW");
         assert_eq!(updated.default_bucket, None);
+    }
+
+    // --- the R2 API token: storage, normalization, secret derivation -----
+    //
+    // These pin the relationship Cloudflare defines between an R2 API token
+    // and the S3 credentials it projects into:
+    //   Access Key ID     = the token's id (only the API can report it)
+    //   Secret Access Key = sha256(token value)   <- derived here
+    //   Bearer credential = the token value       <- stored as `api_token`
+    // Verified live against two real tokens of different privilege tiers on
+    // 2026-07-30.
+
+    fn sample_input_with_token(secret: &str, token: Option<&str>) -> ConnectionInput {
+        ConnectionInput {
+            api_token: token.map(str::to_string),
+            ..sample_input(secret)
+        }
+    }
+
+    /// The headline behavior: pasting a token is enough, because the secret
+    /// is derived from it rather than typed.
+    #[test]
+    fn new_connection_derives_the_secret_from_an_api_token() {
+        let conn = new_connection(sample_input_with_token("", Some("cfut_token")));
+
+        assert_eq!(conn.api_token.as_deref(), Some("cfut_token"));
+        assert_eq!(conn.secret_access_key, r2_secret_from_token("cfut_token"));
+        assert_eq!(
+            conn.secret_access_key.len(),
+            64,
+            "a derived secret is SHA-256 hex"
+        );
+    }
+
+    /// The S3-key mode of the same form: an explicitly typed secret is never
+    /// overwritten by a derivation, even when a token is present too.
+    #[test]
+    fn new_connection_prefers_an_explicitly_typed_secret_over_the_derivation() {
+        let conn = new_connection(sample_input_with_token("typed-secret", Some("cfut_token")));
+
+        assert_eq!(conn.secret_access_key, "typed-secret");
+        assert_eq!(conn.api_token.as_deref(), Some("cfut_token"));
+    }
+
+    /// A pasted token routinely carries a trailing newline. Storing it would
+    /// send a malformed Bearer credential; hashing it would derive a secret
+    /// that silently fails to sign.
+    #[test]
+    fn new_connection_trims_a_padded_api_token() {
+        let conn = new_connection(sample_input_with_token("", Some("  cfut_token\n")));
+
+        assert_eq!(conn.api_token.as_deref(), Some("cfut_token"));
+        assert_eq!(conn.secret_access_key, r2_secret_from_token("cfut_token"));
+    }
+
+    /// A blank field from a form means "no token", not "an empty token" --
+    /// otherwise `ConnectionDto::has_api_token` would claim one exists and the
+    /// bucket-info panel would send an empty Bearer credential to Cloudflare.
+    #[test]
+    fn new_connection_treats_a_blank_api_token_as_absent() {
+        for blank in ["", "   ", "\n"] {
+            let conn = new_connection(sample_input_with_token("s", Some(blank)));
+            assert_eq!(
+                conn.api_token, None,
+                "blank token {blank:?} must be dropped"
+            );
+        }
+    }
+
+    /// Every non-R2 connection is completely unaffected: no token in, no
+    /// token stored, secret handled exactly as before.
+    #[test]
+    fn new_connection_leaves_a_tokenless_input_untouched() {
+        let conn = new_connection(sample_input("plain-secret"));
+
+        assert_eq!(conn.api_token, None);
+        assert_eq!(conn.secret_access_key, "plain-secret");
+    }
+
+    /// The token gets the same "leave blank to keep" affordance as the secret
+    /// key -- the edit form never echoes it back, so a blank field means
+    /// unchanged, not cleared.
+    #[test]
+    fn merge_update_keeps_an_existing_token_when_the_input_token_is_blank() {
+        let existing = Connection {
+            api_token: Some("cfut_existing".to_string()),
+            ..sample_connection("c1", "original-secret")
+        };
+
+        let updated = merge_update(&existing, sample_input_with_token("", None));
+
+        assert_eq!(updated.api_token.as_deref(), Some("cfut_existing"));
+        assert_eq!(updated.secret_access_key, "original-secret");
+    }
+
+    /// Token rotation. Without re-deriving here, the connection would store
+    /// the *new* token alongside the *old* token's hash as its S3 secret --
+    /// and keep working until the old token was revoked, breaking long after
+    /// the edit that caused it.
+    #[test]
+    fn merge_update_rederives_the_secret_when_a_new_token_is_pasted() {
+        let existing = Connection {
+            api_token: Some("cfut_old".to_string()),
+            ..sample_connection("c1", r2_secret_from_token("cfut_old").as_str())
+        };
+
+        let updated = merge_update(&existing, sample_input_with_token("", Some("cfut_new")));
+
+        assert_eq!(updated.api_token.as_deref(), Some("cfut_new"));
+        assert_eq!(updated.secret_access_key, r2_secret_from_token("cfut_new"));
+    }
+
+    #[test]
+    fn merge_update_prefers_an_explicitly_typed_secret_over_a_new_token() {
+        let existing = sample_connection("c1", "original-secret");
+
+        let updated = merge_update(
+            &existing,
+            sample_input_with_token("typed-secret", Some("cfut_new")),
+        );
+
+        assert_eq!(updated.secret_access_key, "typed-secret");
+        assert_eq!(updated.api_token.as_deref(), Some("cfut_new"));
     }
 
     // --- remove_by_id: delete_connection's idempotency contract ---------

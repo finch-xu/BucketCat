@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PROVIDERS, providerMeta } from "./providers";
+import { R2_REGION } from "./r2";
 import { regionCatalog, findRegion, regionFromEndpoint } from "./regions";
 
 /** 只有这些 provider 没有官方品牌 logo，用 lucide 线性图标 + 品牌色顶上
@@ -57,5 +58,16 @@ describe("PROVIDERS", () => {
       expect(findRegion(catalog, p.region), `${p.id} region`).toBeDefined();
       expect(regionFromEndpoint(catalog, p.endpoint)?.id, `${p.id} endpoint`).toBe(p.region);
     }
+  });
+
+  // R2 的端点由账户 ID 派生（见 `R2Fields` / `src/lib/r2.ts`），所以这里
+  // **必须**是空串。曾经预填的是 `https://<account>.r2.cloudflarestorage.com`
+  // 这种带占位符的假地址 —— 它会被原样存进连接，用户不手改就连不上，而且
+  // 因为看起来像个正常端点，谁也不会怀疑它。
+  it("prefills no endpoint for r2, whose endpoint is derived from the account id", () => {
+    const r2 = PROVIDERS.find((p) => p.id === "r2");
+    expect(r2).toBeDefined();
+    expect(r2!.endpoint).toBe("");
+    expect(r2!.region).toBe(R2_REGION);
   });
 });

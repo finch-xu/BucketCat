@@ -14,9 +14,10 @@ use commands::{
     create_folder, delete_connection, delete_objects, delete_prefix, enqueue_download,
     enqueue_folder_download, enqueue_uploads, get_autostart, get_close_to_tray, get_resume_enabled,
     get_settings, head_object, list_buckets, list_connections, list_objects, list_transfers,
-    pause_transfer, presign_get, rename_object, resume_transfer, retry_transfer, set_autostart,
-    set_close_to_tray, set_max_parts, set_max_tasks, set_resume_enabled, set_share_expiry,
-    set_tray_labels, test_connection, update_connection, AppState, CloseToTrayFlag, ResumeFlag,
+    pause_transfer, presign_get, r2_bucket_info, r2_probe_token, rename_object, resume_transfer,
+    retry_transfer, set_autostart, set_close_to_tray, set_max_parts, set_max_tasks,
+    set_resume_enabled, set_share_expiry, set_tray_labels, test_connection, update_connection,
+    AppState, CloseToTrayFlag, ResumeFlag,
 };
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
@@ -256,7 +257,9 @@ pub fn run() {
             get_autostart,
             set_autostart,
             set_tray_labels,
-            clean_checkpoint_residue
+            clean_checkpoint_residue,
+            r2_probe_token,
+            r2_bucket_info
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

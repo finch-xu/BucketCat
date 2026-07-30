@@ -11,6 +11,7 @@ import {
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ProviderChip } from "@/components/icons/provider-chip";
+import { R2Fields, type R2CredMode } from "@/components/modals/r2-fields";
 import { RegionPicker, REGION_KEEP_CURRENT } from "@/components/modals/region-picker";
 import { Modal } from "@/components/ui/modal";
 import { useAddConnection, useUpdateConnection } from "@/hooks/use-connections";
@@ -18,6 +19,7 @@ import { useErrorText } from "@/hooks/use-error-text";
 import type { AppError, ConnectionInput } from "@/lib/api";
 import { testConnection } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { R2_REGION, isKnownJurisdiction, parseR2Endpoint, r2Endpoint } from "@/lib/r2";
 import {
   endpointFor,
   findRegion,
@@ -38,6 +40,9 @@ interface FormState {
   access_key_id: string;
   secret_access_key: string;
   default_bucket: string;
+  /** R2 only. Blank means "not supplied" — which on edit means "keep the
+   * stored token", matching `secret_access_key`'s own convention. */
+  api_token: string;
 }
 
 const EMPTY_FORM: FormState = {
@@ -47,6 +52,7 @@ const EMPTY_FORM: FormState = {
   access_key_id: "",
   secret_access_key: "",
   default_bucket: "",
+  api_token: "",
 };
 
 type RequiredField = "name" | "endpoint" | "access_key_id" | "secret_access_key";
@@ -70,6 +76,22 @@ function initialRegionState(provider: string | undefined, endpoint: string, regi
   if (!catalog) return { network: "public" as Network, unknownEndpoint: false };
   const derived = regionFormState(catalog, endpoint, region);
   return { network: derived.network, unknownEndpoint: derived.unknownEndpoint };
+}
+
+/** 编辑模式下 R2 的初始账户/辖区：从已存端点反解。
+ *
+ * 解不出来（自定义域、手改过的端点）时两者留空，用户重填账户 ID 即可重建
+ * 端点 —— 这与 `regionFormState` 的 `unknownEndpoint` 处理同一思路：绝不
+ * 猜测，只是把不认识的值让给用户处理。辖区若是本版本不认识的（Cloudflare
+ * 将来新增的），同样退回默认，避免 Select 出现一个选不中的值。 */
+function initialR2State(provider: string | undefined, endpoint: string) {
+  if (provider !== "r2") return { accountId: "", jurisdiction: "" };
+  const parsed = parseR2Endpoint(endpoint);
+  if (!parsed) return { accountId: "", jurisdiction: "" };
+  return {
+    accountId: parsed.accountId,
+    jurisdiction: isKnownJurisdiction(parsed.jurisdiction) ? parsed.jurisdiction : "",
+  };
 }
 
 function Field({
@@ -136,6 +158,7 @@ export function ConnectionModal() {
           access_key_id: editingConnection.access_key_id,
           secret_access_key: "",
           default_bucket: editingConnection.default_bucket ?? "",
+          api_token: "",
         }
       : EMPTY_FORM,
   );
@@ -166,6 +189,24 @@ export function ConnectionModal() {
         editingConnection?.region ?? "",
       ).unknownEndpoint,
   );
+  // R2-only. The endpoint is *derived* from these two rather than the other
+  // way around -- see `R2Fields`' doc comment for why deriving them from the
+  // endpoint cannot work (an emptied account field never round-trips).
+  const [r2Account, setR2Account] = useState<string>(
+    () => initialR2State(editingConnection?.provider, editingConnection?.endpoint ?? "").accountId,
+  );
+  const [r2Jurisdiction, setR2Jurisdiction] = useState<string>(
+    () =>
+      initialR2State(editingConnection?.provider, editingConnection?.endpoint ?? "").jurisdiction,
+  );
+  // An existing R2 connection is edited in whichever mode it was created in:
+  // one with a stored token stays in token mode (so "leave blank to keep"
+  // works), one without it -- an S3-key connection, or one saved by a build
+  // predating token mode -- opens in key mode so its editable fields are the
+  // ones it actually uses.
+  const [r2CredMode, setR2CredMode] = useState<R2CredMode>(() =>
+    editingConnection && !editingConnection.has_api_token ? "keys" : "token",
+  );
   // Guards against a stale in-flight `testConnection` result landing after
   // the user has since edited a field or fired off a newer test -- only the
   // most recent request id's resolution/rejection is allowed to update
@@ -175,7 +216,13 @@ export function ConnectionModal() {
   if (!isOpen) return null;
 
   const provider = providerId ? providerMeta(providerId) : undefined;
-  const secretBlockedForTest = isEdit && form.secret_access_key.trim() === "";
+  const isR2 = providerId === "r2";
+  // Testing needs a usable secret. On edit the stored one is never echoed
+  // back, so a blank field would send an empty credential and fail for the
+  // wrong reason -- unless a freshly pasted R2 token is present, which the
+  // backend derives a secret from.
+  const secretBlockedForTest =
+    isEdit && form.secret_access_key.trim() === "" && form.api_token.trim() === "";
 
   function handleClose() {
     if (isEdit) closeEditConnection();
@@ -195,14 +242,47 @@ export function ConnectionModal() {
     }
     const meta = providerMeta(id);
     setProviderId(id);
-    setForm((f) => ({ ...f, endpoint: meta.endpoint, region: meta.region }));
+    // R2's endpoint is built from the account id the user has yet to supply,
+    // so it starts empty rather than at a placeholder host -- and its region
+    // is fixed.
+    setForm((f) =>
+      id === "r2"
+        ? { ...f, endpoint: "", region: R2_REGION }
+        : { ...f, endpoint: meta.endpoint, region: meta.region },
+    );
     const derived = initialRegionState(id, meta.endpoint, meta.region);
     setRegionNetwork(derived.network);
     setUnknownEndpoint(derived.unknownEndpoint);
+    setR2Account("");
+    setR2Jurisdiction("");
+    setR2CredMode("token");
     setFieldErrors({});
     setTestStatus({ kind: "idle" });
     testReqIdRef.current++;
     setStep(2);
+  }
+
+  /** R2's account id changed. The endpoint is derived here (not on render) so
+   * `form.endpoint` stays the single persisted source of truth and every
+   * downstream consumer -- validation, `buildInput`, the test button --
+   * needs no R2 special case. */
+  function handleR2AccountChange(accountId: string) {
+    setR2Account(accountId);
+    setForm((f) => ({
+      ...f,
+      endpoint: accountId.trim() ? r2Endpoint(accountId, r2Jurisdiction) : "",
+    }));
+    if (fieldErrors.endpoint) setFieldErrors((e) => ({ ...e, endpoint: undefined }));
+    invalidateTest();
+  }
+
+  function handleR2JurisdictionChange(jurisdiction: string) {
+    setR2Jurisdiction(jurisdiction);
+    setForm((f) => ({
+      ...f,
+      endpoint: r2Account.trim() ? r2Endpoint(r2Account, jurisdiction) : "",
+    }));
+    invalidateTest();
   }
 
   function backToProviders() {
@@ -271,7 +351,23 @@ export function ConnectionModal() {
       access_key_id: form.access_key_id.trim(),
       secret_access_key: form.secret_access_key.trim(),
       default_bucket: form.default_bucket.trim() ? form.default_bucket.trim() : null,
+      // Only ever sent for R2, and only when the user actually supplied one.
+      // The backend derives `secret_access_key` from it when that field is
+      // blank -- the hash is never computed here, so the derived secret never
+      // exists inside the webview.
+      api_token: form.api_token.trim() ? form.api_token.trim() : null,
     };
+  }
+
+  /** Whether the secret requirement is satisfied without the user typing one.
+   *
+   * Three ways it can be: an existing connection keeps its stored secret when
+   * the field is left blank; an R2 token pasted now derives one server-side;
+   * and an R2 connection being edited already has a stored token that will
+   * re-derive it. */
+  function secretSuppliedIndirectly(): boolean {
+    if (isEdit) return true;
+    return isR2 && r2CredMode === "token" && form.api_token.trim() !== "";
   }
 
   function validate(): boolean {
@@ -279,11 +375,19 @@ export function ConnectionModal() {
     // In edit mode the secret is optional -- a blank field means "keep the
     // existing secret" (`update_connection`'s contract), so it's excluded
     // from the required-fields check there.
-    const requiredFields = isEdit
+    const requiredFields = secretSuppliedIndirectly()
       ? REQUIRED_FIELDS.filter((key) => key !== "secret_access_key")
       : REQUIRED_FIELDS;
     for (const key of requiredFields) {
       if (!form[key].trim()) errors[key] = t("addConn.required");
+    }
+    if (isR2) {
+      // R2's endpoint and access key are both derived, so the generic
+      // "required" copy would point at fields the user cannot type into.
+      if (errors.endpoint) errors.endpoint = t("r2.accountRequired");
+      if (errors.access_key_id && r2CredMode === "token") {
+        errors.access_key_id = t("r2.probeRequired");
+      }
     }
     setFieldErrors(errors);
     return Object.keys(errors).length === 0;
@@ -406,7 +510,30 @@ export function ConnectionModal() {
                 className={cn(INPUT_CLASS, fieldErrors.name && INPUT_ERROR_CLASS)}
               />
             </Field>
-            {(() => {
+            {isR2 && (
+              <R2Fields
+                credMode={r2CredMode}
+                onCredModeChange={(mode) => {
+                  setR2CredMode(mode);
+                  invalidateTest();
+                }}
+                apiToken={form.api_token}
+                onApiTokenChange={(v) => updateField("api_token", v)}
+                accountId={r2Account}
+                onAccountIdChange={handleR2AccountChange}
+                jurisdiction={r2Jurisdiction}
+                onJurisdictionChange={handleR2JurisdictionChange}
+                accessKeyId={form.access_key_id}
+                onAccessKeyIdChange={(v) => updateField("access_key_id", v)}
+                secretAccessKey={form.secret_access_key}
+                onSecretAccessKeyChange={(v) => updateField("secret_access_key", v)}
+                isEdit={isEdit}
+                hasApiToken={editingConnection?.has_api_token ?? false}
+                fieldErrors={fieldErrors}
+              />
+            )}
+            {!isR2 &&
+              (() => {
               const catalog = providerId ? regionCatalog(providerId) : undefined;
               return catalog ? (
                 <RegionPicker
@@ -445,7 +572,8 @@ export function ConnectionModal() {
                 </div>
               );
             })()}
-            <Field label={t("addConn.accessKey")} error={fieldErrors.access_key_id}>
+            {!isR2 && (
+              <Field label={t("addConn.accessKey")} error={fieldErrors.access_key_id}>
               <input
                 value={form.access_key_id}
                 onChange={(e) => updateField("access_key_id", e.target.value)}
@@ -456,7 +584,9 @@ export function ConnectionModal() {
                   fieldErrors.access_key_id && INPUT_ERROR_CLASS,
                 )}
               />
-            </Field>
+              </Field>
+            )}
+            {!isR2 && (
             <Field label={t("addConn.secretKey")} error={fieldErrors.secret_access_key}>
               <div
                 className={cn(
@@ -479,6 +609,7 @@ export function ConnectionModal() {
                 </p>
               )}
             </Field>
+            )}
             <div className="mb-1.5">
               <label className="mb-1.5 block text-xs font-medium text-fg2">
                 {t("addConn.defaultBucket")}{" "}

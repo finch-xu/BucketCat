@@ -203,6 +203,7 @@ fn minio_connection(secret: &str) -> Connection {
         access_key_id: "minioadmin".to_string(),
         secret_access_key: secret.to_string(),
         default_bucket: None,
+        api_token: None,
     }
 }
 
@@ -365,6 +366,7 @@ fn secure_store_round_trip_survives_restart_with_real_derive_key() {
             access_key_id: "minioadmin".to_string(),
             secret_access_key: "top-secret-value-one".to_string(),
             default_bucket: None,
+            api_token: None,
         },
         Connection {
             id: "c2".to_string(),
@@ -375,6 +377,7 @@ fn secure_store_round_trip_survives_restart_with_real_derive_key() {
             access_key_id: "minioadmin".to_string(),
             secret_access_key: "top-secret-value-two".to_string(),
             default_bucket: Some("some-bucket".to_string()),
+            api_token: None,
         },
     ];
 

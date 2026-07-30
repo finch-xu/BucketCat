@@ -1,5 +1,8 @@
 {
-  "app": { "name": "BucketCat", "tagline": "Cross-platform object storage client · Tauri + React" },
+  "app": {
+    "name": "BucketCat",
+    "tagline": "Cross-platform object storage client · Tauri + React"
+  },
   "tray": {
     "show": "Show BucketCat",
     "quit": "Quit"
@@ -15,7 +18,8 @@
     "noBuckets": "No buckets",
     "bucketRegionHint": "This bucket is in {{region}}; requests are routed there automatically",
     "emptyTitle": "No connections yet",
-    "emptyHint": "Click the + above to add your first connection"
+    "emptyHint": "Click the + above to add your first connection",
+    "cannotListBuckets": "These credentials can't list buckets, so only the default bucket is shown."
   },
   "main": {
     "searchPlaceholder": "Search by prefix…",
@@ -181,6 +185,50 @@
     "b2": "Cost-effective archive storage",
     "generic": "Any S3-compatible service",
     "genericName": "Generic S3 compatible"
+  },
+  "r2": {
+    "credMode": "Credentials",
+    "credModeToken": "API token",
+    "credModeKeys": "S3 keys",
+    "credModeTokenHint": "Paste one R2 API token — the access key and secret are derived from it, and it also unlocks bucket usage and public-access info.",
+    "credModeKeysHint": "Enter the S3 access key and secret directly. Bucket usage and public-access info stay unavailable without a token.",
+    "apiToken": "R2 API token",
+    "apiTokenHint": "Shown only once when you create the token in the Cloudflare dashboard.",
+    "apiTokenKeep": "Leave blank to keep the stored token.",
+    "probe": "Probe",
+    "probing": "Probing the token…",
+    "probeOk": "Token valid — access key and account ID filled in.",
+    "probeOkNoAccount": "Token valid. It cannot list accounts, so enter the account ID below.",
+    "probeFail": "Probe failed",
+    "probeRequired": "Probe the token to fill in the access key.",
+    "accessKeyDerived": "Filled in by probing the token",
+    "accountId": "Account ID",
+    "accountIdHint": "The 32-character id in your R2 endpoint. Pasting the whole endpoint URL works too.",
+    "accountRequired": "Account ID is required to build the endpoint.",
+    "jurisdiction": "Jurisdiction",
+    "jurisdictionDefault": "Default (worldwide)",
+    "jurisdictionEu": "European Union",
+    "jurisdictionFedramp": "FedRAMP",
+    "jurisdictionHint": "Each jurisdiction is a separate namespace — a connection only ever sees buckets created in the one you pick.",
+    "endpointNeedsAccount": "Enter an account ID above"
+  },
+  "bucketInfo": {
+    "open": "Bucket info for {{bucket}}",
+    "title": "Bucket info",
+    "loading": "Loading bucket info…",
+    "location": "Location",
+    "locationUnknown": "Not reported",
+    "jurisdiction": "Jurisdiction",
+    "storageClass": "Storage class",
+    "objects": "Objects",
+    "size": "Total size",
+    "publicUrl": "Public URL",
+    "r2devOff": "r2.dev not enabled",
+    "customDomains": "Custom domains",
+    "noCustomDomains": "None",
+    "domainPending": "not serving",
+    "noToken": "Add an R2 API token to this connection to see usage and public-access info.",
+    "tokenDenied": "This connection's API token is not allowed to read bucket settings."
   },
   "settings": {
     "title": "Settings",
