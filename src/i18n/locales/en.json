@@ -182,9 +182,22 @@
     "rainyun": "Rainyun object storage",
     "qiniu": "Qiniu Cloud object storage",
     "cos": "Tencent Cloud object storage",
-    "b2": "Cost-effective archive storage",
+    "b2": "Cost-effective general-purpose storage",
     "generic": "Any S3-compatible service",
     "genericName": "Generic S3 compatible"
+  },
+  "b2": {
+    "keyId": "keyID (Application Key ID)",
+    "keyIdHint": "Create one under App Keys in the Backblaze console. The region is detected from it automatically.",
+    "masterKeyWarning": "That is a master application key ID (your account ID). Backblaze does not accept master keys on the S3-compatible API — create an application key under App Keys instead.",
+    "applicationKey": "applicationKey",
+    "applicationKeyHint": "Shown only once, right after you create the application key.",
+    "regionDerived": "Region and endpoint detected from the keyID. Test connection confirms them against Backblaze.",
+    "regionAwaitingKeyId": "Enter your keyID above and the region fills in automatically.",
+    "regionUnknown": "Could not read a region from that keyID. Pick one, or copy the Endpoint shown on the Buckets page of the Backblaze console.",
+    "regionEndpointMismatch": "This connection's endpoint is not the one this keyID points at. Keeping it as-is is fine — pick a region only if you want to replace it.",
+    "regionBlockedByMasterKey": "A master key carries no region. Pick one manually, or switch to an application key.",
+    "endpointCorrected": "Connected. Backblaze reports this account is at {{endpoint}} — endpoint updated."
   },
   "r2": {
     "credMode": "Credentials",

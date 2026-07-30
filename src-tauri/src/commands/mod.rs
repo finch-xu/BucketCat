@@ -6,12 +6,14 @@
 //! [`crate::error::AppError`] so the wire format the frontend sees is always
 //! `{ code, params }`.
 
+pub mod b2;
 pub mod connection;
 pub mod object;
 pub mod r2;
 pub mod settings;
 pub mod transfer;
 
+pub use b2::b2_probe_key;
 pub use connection::{
     add_connection, delete_connection, list_buckets, list_connections, test_connection,
     update_connection, AppState,

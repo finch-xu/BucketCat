@@ -182,9 +182,22 @@
     "rainyun": "雨云对象存储",
     "qiniu": "七牛云对象存储",
     "cos": "腾讯云对象存储",
-    "b2": "高性价比归档存储",
+    "b2": "高性价比通用对象存储",
     "generic": "任意 S3 兼容服务",
     "genericName": "通用 S3 兼容"
+  },
+  "b2": {
+    "keyId": "keyID（应用密钥 ID）",
+    "keyIdHint": "在 Backblaze 控制台的 App Keys 页创建，地区会据此自动识别。",
+    "masterKeyWarning": "这是主应用密钥 ID（即账号 ID）。Backblaze 不接受主密钥调用 S3 兼容 API，请到 App Keys 页新建一个应用密钥。",
+    "applicationKey": "applicationKey（应用密钥）",
+    "applicationKeyHint": "只在创建应用密钥的那一刻显示一次。",
+    "regionDerived": "地区与 Endpoint 已从 keyID 自动识别，点「测试连接」会向 Backblaze 核对。",
+    "regionAwaitingKeyId": "在上方填入 keyID，地区会自动填好。",
+    "regionUnknown": "无法从该 keyID 识别地区。请手动选择，或在 Backblaze 控制台 Buckets 页复制 Endpoint。",
+    "regionEndpointMismatch": "该连接的 Endpoint 与这个 keyID 指向的地区不一致。保持现状即可；只有想替换它时才需要选择地区。",
+    "regionBlockedByMasterKey": "主密钥不含地区信息。请手动选择地区，或改用应用密钥。",
+    "endpointCorrected": "连接成功。Backblaze 显示该账号位于 {{endpoint}}，已更新 Endpoint。"
   },
   "r2": {
     "credMode": "凭据方式",

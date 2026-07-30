@@ -2145,6 +2145,94 @@ mod tests {
         }
     }
 
+    fn b2_connection() -> Connection {
+        Connection {
+            id: "c7".to_string(),
+            provider: "b2".to_string(),
+            name: "b2".to_string(),
+            // Exactly what `src/lib/b2-regions.ts` resolves for the real key
+            // id this provider was developed against (cluster `004`), and what
+            // Backblaze's own `b2_authorize_account` reports as `s3ApiUrl`.
+            endpoint: "https://s3.us-west-004.backblazeb2.com".to_string(),
+            region: "us-west-004".to_string(),
+            // Shape only -- a B2 keyID is `{cluster}{account}{counter}`. The
+            // secret is a placeholder; no real applicationKey exists anywhere
+            // in this repo.
+            access_key_id: "004024147e7d0760000000001".to_string(),
+            secret_access_key: "secret".to_string(),
+            default_bucket: None,
+            api_token: None,
+        }
+    }
+
+    // --- B2: the four properties that are choices, not defaults -----------
+    //
+    // Every one of these was verified live on 2026-07-30 against a real
+    // Backblaze account (see `tests/b2_e2e.rs`). B2 needs no provider branch
+    // anywhere in this module -- it lands on every default -- which is exactly
+    // why these are asserted: "it works because nobody wrote code for it" is
+    // invisible to every other test here, so a change to one of the defaults
+    // would silently take B2 with it.
+
+    /// B2 accepts path-style **and** virtual-hosted addressing -- both were
+    /// verified to return 200 for `ListObjectsV2` on the same bucket. So
+    /// moving B2 into the virtual-hosted branch alongside AWS/OSS would break
+    /// nothing visibly, and only this assertion can catch it.
+    #[test]
+    fn b2_uses_path_style_addressing() {
+        assert!(uses_path_style(
+            "b2",
+            "https://s3.us-west-004.backblazeb2.com"
+        ));
+    }
+
+    /// The `s3.` hostname rewrite is Aliyun-OSS-only. A B2 endpoint already
+    /// *starts* with `s3.`, so a widened rewrite would produce
+    /// `s3.s3.us-west-004...` -- which resolves to nothing.
+    #[test]
+    fn b2_endpoint_is_never_rewritten() {
+        let endpoint = "https://s3.us-west-004.backblazeb2.com";
+        assert_eq!(s3_compat_endpoint("b2", endpoint), endpoint);
+    }
+
+    /// B2 keeps the fast Multi-Object Delete path.
+    ///
+    /// This is the subtle one. B2 *does* require an integrity header on
+    /// `DeleteObjects` -- a request carrying neither is refused with
+    /// `400 InvalidRequest: Missing required header for this request:
+    /// Content-MD5 OR x-amz-checksum-*` (verified live 2026-07-30). The `OR`
+    /// is what saves it: B2 accepts the modern `x-amz-checksum-*` family,
+    /// which `aws-sdk-s3` still sends under
+    /// [`RequestChecksumCalculation::WhenRequired`] for operations the S3
+    /// model marks as requiring one. Aliyun OSS and Rainyun ROS accept only
+    /// the legacy `Content-MD5`, which is why *they* are excluded and B2 is
+    /// not.
+    ///
+    /// Confirmed with a real SDK `DeleteObjects` in `tests/b2_e2e.rs`, not a
+    /// hand-rolled probe -- taking that shortcut is exactly what produced a
+    /// wrong answer for Rainyun.
+    #[test]
+    fn b2_keeps_the_batch_delete_path() {
+        assert!(supports_batch_delete("b2"));
+    }
+
+    /// **B2 gets no `RegionRouting`.** A B2 account lives in exactly one
+    /// region, fixed at account creation, and its keys are region-scoped: the
+    /// same credential that works on `us-west-004` is refused outright by
+    /// `us-east-005` with `403 InvalidAccessKeyId` (verified live). There is
+    /// nowhere to route *to*, so building routing state would be useless and
+    /// would mislead the next reader into thinking B2 spans regions the way
+    /// OSS and Qiniu do.
+    #[test]
+    fn b2_does_not_get_region_routing() {
+        let provider = from_connection(&b2_connection()).unwrap();
+        assert!(
+            provider.routing.is_none(),
+            "a B2 account lives in exactly one region and its keys are refused by every other \
+             one -- there is nothing to route between"
+        );
+    }
+
     // --- R2: the four properties that are choices, not defaults -----------
     //
     // Every one of these was verified live on 2026-07-30 (see

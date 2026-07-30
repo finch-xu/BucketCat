@@ -643,6 +643,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "aws-sdk-s3",
+ "base64 0.22.1",
  "bytes",
  "hkdf",
  "hmac 0.13.0",

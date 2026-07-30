@@ -4,6 +4,8 @@
 //! providers) behind a small trait so [`crate::commands`] can talk to
 //! "a bucket store" without depending on `aws-sdk-s3` types directly.
 
+pub mod b2;
+pub mod b2_admin;
 pub mod https;
 pub mod hub;
 pub mod oss_admin;

@@ -192,6 +192,40 @@ export function r2ProbeToken(token: string): Promise<R2TokenProbe> {
   return invokeCommand<R2TokenProbe>("r2_probe_token", { token });
 }
 
+/** What probing a Backblaze B2 key pair establishes. Mirrors `B2KeyProbe` in
+ * `src-tauri/src/provider/b2_admin.rs`. */
+export interface B2KeyProbe {
+  /** Region id, e.g. `us-west-004`. Straight from Backblaze's own `s3ApiUrl`,
+   * so it may name a region this build's table doesn't list — that is how a
+   * newly-launched B2 region works without an app update. */
+  region: string;
+  /** `https://s3.{region}.backblazeb2.com`. */
+  endpoint: string;
+  /** Buckets the key is restricted to.
+   *
+   * **Empty is the unrestricted case, not "no buckets".** Backblaze reports
+   * `allowed.buckets: null` for a key with account-wide access (verified
+   * live). A non-empty list only tells the user their key is scoped, which
+   * explains a short bucket list later. */
+  allowed_buckets: string[];
+  /** Whether the key may call `ListBuckets`. A key without it still works for
+   * object operations, so this drives a hint rather than an error. */
+  can_list_buckets: boolean;
+}
+
+/** Probes a B2 `(keyID, applicationKey)` pair the user has just pasted, before
+ * any connection exists to save it against — returns the account's
+ * authoritative S3 region and endpoint.
+ *
+ * The form has already guessed both offline from the key id's cluster prefix
+ * (see `b2RegionFromKeyId`, a convention Backblaze does not document); this is
+ * what confirms or corrects that guess.
+ *
+ * Called imperatively by the connection form, like `testConnection`. */
+export function b2ProbeKey(keyId: string, applicationKey: string): Promise<B2KeyProbe> {
+  return invokeCommand<B2KeyProbe>("b2_probe_key", { keyId, applicationKey });
+}
+
 /** Bucket metadata from the Cloudflare API. Mirrors `R2BucketMeta`. */
 export interface R2BucketMeta {
   /** R2's coarse location *hint* (`APAC`, `WNAM`, `WEUR`, …) — not a region.

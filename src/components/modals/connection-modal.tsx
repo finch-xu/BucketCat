@@ -11,13 +11,15 @@ import {
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ProviderChip } from "@/components/icons/provider-chip";
+import { B2Fields } from "@/components/modals/b2-fields";
 import { R2Fields, type R2CredMode } from "@/components/modals/r2-fields";
 import { RegionPicker, REGION_KEEP_CURRENT } from "@/components/modals/region-picker";
 import { Modal } from "@/components/ui/modal";
 import { useAddConnection, useUpdateConnection } from "@/hooks/use-connections";
 import { useErrorText } from "@/hooks/use-error-text";
 import type { AppError, ConnectionInput } from "@/lib/api";
-import { testConnection } from "@/lib/api";
+import { b2ProbeKey, testConnection } from "@/lib/api";
+import { b2RegionFromKeyId } from "@/lib/b2-regions";
 import { cn } from "@/lib/utils";
 import { R2_REGION, isKnownJurisdiction, parseR2Endpoint, r2Endpoint } from "@/lib/r2";
 import {
@@ -63,7 +65,10 @@ type FieldErrors = Partial<Record<RequiredField, string>>;
 type TestStatus =
   | { kind: "idle" }
   | { kind: "pending" }
-  | { kind: "success" }
+  /** `corrected` is set only when B2's authoritative `s3ApiUrl` disagreed with
+   * the endpoint the form had derived offline, so the change to a read-only
+   * field is announced rather than silent. */
+  | { kind: "success"; corrected?: string }
   | { kind: "error"; error: AppError };
 
 const INPUT_CLASS =
@@ -217,6 +222,12 @@ export function ConnectionModal() {
 
   const provider = providerId ? providerMeta(providerId) : undefined;
   const isR2 = providerId === "r2";
+  const isB2 = providerId === "b2";
+  /** Which credential/endpoint block step 2 renders. A single three-way switch
+   * rather than a `!isR2 && !isB2 &&` guard on each of the four sub-blocks --
+   * those guards multiply with every provider that needs its own layout, and
+   * getting one of them wrong renders two credential forms at once. */
+  const layout: "r2" | "b2" | "generic" = isR2 ? "r2" : isB2 ? "b2" : "generic";
   // Testing needs a usable secret. On edit the stored one is never echoed
   // back, so a blank field would send an empty credential and fail for the
   // wrong reason -- unless a freshly pasted R2 token is present, which the
@@ -273,6 +284,34 @@ export function ConnectionModal() {
       endpoint: accountId.trim() ? r2Endpoint(accountId, r2Jurisdiction) : "",
     }));
     if (fieldErrors.endpoint) setFieldErrors((e) => ({ ...e, endpoint: undefined }));
+    invalidateTest();
+  }
+
+  /** B2's keyID changed. Like `handleR2AccountChange`, the endpoint is derived
+   * here rather than on render, so `form.endpoint` stays the single persisted
+   * source of truth and validation/`buildInput`/the test button need no B2
+   * special case.
+   *
+   * A keyID the cluster table can't read (still being typed, a master key, a
+   * cluster Backblaze added later) leaves region/endpoint exactly as they
+   * were: `B2Fields` then shows the region picker so the user can say, and
+   * blanking them here would only destroy a value that is still valid. */
+  function handleB2KeyIdChange(keyId: string) {
+    const derived = b2RegionFromKeyId(keyId);
+    setForm((f) =>
+      derived
+        ? {
+            ...f,
+            access_key_id: keyId,
+            region: derived.id,
+            endpoint: endpointFor(derived, "public"),
+          }
+        : { ...f, access_key_id: keyId },
+    );
+    if (derived) setUnknownEndpoint(false);
+    setFieldErrors((e) =>
+      e.access_key_id || e.endpoint ? { ...e, access_key_id: undefined, endpoint: undefined } : e,
+    );
     invalidateTest();
   }
 
@@ -403,8 +442,30 @@ export function ConnectionModal() {
     const reqId = ++testReqIdRef.current;
     setTestStatus({ kind: "pending" });
     try {
-      await testConnection(buildInput());
-      if (reqId === testReqIdRef.current) setTestStatus({ kind: "success" });
+      let input = buildInput();
+      let corrected: string | undefined;
+      if (isB2) {
+        // Ask Backblaze which region this account actually lives in, and let
+        // its answer win. The form's own endpoint came from the keyID's
+        // cluster prefix -- a convention Backblaze has never documented (see
+        // `b2-regions.ts`) -- so this is the step that turns a good guess into
+        // a fact. It also covers regions launched after this build shipped,
+        // which no table here could know.
+        //
+        // Testing the *corrected* input rather than the original matters: a
+        // wrong B2 endpoint answers `403 InvalidAccessKeyId`, so without this
+        // the user would be told their key is invalid when it is fine.
+        const probe = await b2ProbeKey(input.access_key_id, input.secret_access_key);
+        if (reqId !== testReqIdRef.current) return;
+        if (probe.endpoint !== input.endpoint || probe.region !== input.region) {
+          corrected = probe.endpoint;
+          setForm((f) => ({ ...f, endpoint: probe.endpoint, region: probe.region }));
+          setUnknownEndpoint(false);
+          input = { ...input, endpoint: probe.endpoint, region: probe.region };
+        }
+      }
+      await testConnection(input);
+      if (reqId === testReqIdRef.current) setTestStatus({ kind: "success", corrected });
     } catch (err) {
       if (reqId === testReqIdRef.current) {
         setTestStatus({ kind: "error", error: err as AppError });
@@ -510,7 +571,7 @@ export function ConnectionModal() {
                 className={cn(INPUT_CLASS, fieldErrors.name && INPUT_ERROR_CLASS)}
               />
             </Field>
-            {isR2 && (
+            {layout === "r2" && (
               <R2Fields
                 credMode={r2CredMode}
                 onCredModeChange={(mode) => {
@@ -532,86 +593,101 @@ export function ConnectionModal() {
                 fieldErrors={fieldErrors}
               />
             )}
-            {!isR2 &&
-              (() => {
-              const catalog = providerId ? regionCatalog(providerId) : undefined;
-              return catalog ? (
-                <RegionPicker
-                  catalog={catalog}
-                  regionId={form.region}
-                  network={regionNetwork}
-                  endpoint={form.endpoint}
-                  unknownEndpoint={unknownEndpoint}
-                  onRegionChange={handleRegionChange}
-                  onNetworkChange={handleNetworkChange}
-                  endpointError={fieldErrors.endpoint}
-                  hintKey={providerId === "rainyun" ? "addConn.rainyunRegionHint" : undefined}
-                />
-              ) : (
-                <div className="mb-3.5 grid grid-cols-[2fr_1fr] gap-3">
-                  <Field label={t("addConn.endpoint")} error={fieldErrors.endpoint}>
-                    <input
-                      value={form.endpoint}
-                      onChange={(e) => updateField("endpoint", e.target.value)}
-                      placeholder={provider.endpoint}
-                      className={cn(
-                        INPUT_CLASS,
-                        "font-mono",
-                        fieldErrors.endpoint && INPUT_ERROR_CLASS,
-                      )}
-                    />
-                  </Field>
-                  <Field label={t("addConn.region")}>
-                    <input
-                      value={form.region}
-                      onChange={(e) => updateField("region", e.target.value)}
-                      placeholder={provider.region || "—"}
-                      className={`${INPUT_CLASS} font-mono`}
-                    />
-                  </Field>
-                </div>
-              );
-            })()}
-            {!isR2 && (
-              <Field label={t("addConn.accessKey")} error={fieldErrors.access_key_id}>
-              {/* Deliberately no placeholder. A masked-looking one
-                  (`AKIA••••••••••••`) is indistinguishable from a credential
-                  the form already holds, so an empty required field reads as
-                  filled -- and the user only finds out at Save. */}
-              <input
-                value={form.access_key_id}
-                onChange={(e) => updateField("access_key_id", e.target.value)}
-                className={cn(
-                  INPUT_CLASS,
-                  "font-mono",
-                  fieldErrors.access_key_id && INPUT_ERROR_CLASS,
-                )}
+            {layout === "b2" && (
+              <B2Fields
+                keyId={form.access_key_id}
+                onKeyIdChange={handleB2KeyIdChange}
+                applicationKey={form.secret_access_key}
+                onApplicationKeyChange={(v) => updateField("secret_access_key", v)}
+                region={form.region}
+                endpoint={form.endpoint}
+                network={regionNetwork}
+                unknownEndpoint={unknownEndpoint}
+                onRegionChange={handleRegionChange}
+                onNetworkChange={handleNetworkChange}
+                isEdit={isEdit}
+                fieldErrors={fieldErrors}
               />
-              </Field>
             )}
-            {!isR2 && (
-            <Field label={t("addConn.secretKey")} error={fieldErrors.secret_access_key}>
-              <div
-                className={cn(
-                  "flex h-9 items-center gap-2 rounded-[9px] border border-border bg-panel px-3 focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary-soft",
-                  fieldErrors.secret_access_key && INPUT_ERROR_CLASS,
-                )}
-              >
-                <Lock className="size-3.5 text-muted-foreground" />
-                <input
-                  type="password"
-                  value={form.secret_access_key}
-                  onChange={(e) => updateField("secret_access_key", e.target.value)}
-                  placeholder={isEdit ? t("addConn.secretKeep") : ""}
-                  className="flex-1 border-none bg-transparent font-mono text-[13px] text-foreground outline-none"
-                />
-              </div>
-              {isEdit && (
-                <p className="mt-1 text-[11.5px] text-muted-foreground">
-                  {t("addConn.secretKeep")}
-                </p>
-              )}
-            </Field>
+            {layout === "generic" && (
+              <>
+                {(() => {
+                  const catalog = providerId ? regionCatalog(providerId) : undefined;
+                  return catalog ? (
+                    <RegionPicker
+                      catalog={catalog}
+                      regionId={form.region}
+                      network={regionNetwork}
+                      endpoint={form.endpoint}
+                      unknownEndpoint={unknownEndpoint}
+                      onRegionChange={handleRegionChange}
+                      onNetworkChange={handleNetworkChange}
+                      endpointError={fieldErrors.endpoint}
+                      hintKey={providerId === "rainyun" ? "addConn.rainyunRegionHint" : undefined}
+                    />
+                  ) : (
+                    <div className="mb-3.5 grid grid-cols-[2fr_1fr] gap-3">
+                      <Field label={t("addConn.endpoint")} error={fieldErrors.endpoint}>
+                        <input
+                          value={form.endpoint}
+                          onChange={(e) => updateField("endpoint", e.target.value)}
+                          placeholder={provider.endpoint}
+                          className={cn(
+                            INPUT_CLASS,
+                            "font-mono",
+                            fieldErrors.endpoint && INPUT_ERROR_CLASS,
+                          )}
+                        />
+                      </Field>
+                      <Field label={t("addConn.region")}>
+                        <input
+                          value={form.region}
+                          onChange={(e) => updateField("region", e.target.value)}
+                          placeholder={provider.region || "—"}
+                          className={`${INPUT_CLASS} font-mono`}
+                        />
+                      </Field>
+                    </div>
+                  );
+                })()}
+                <Field label={t("addConn.accessKey")} error={fieldErrors.access_key_id}>
+                  {/* Deliberately no placeholder. A masked-looking one
+                      (`AKIA••••••••••••`) is indistinguishable from a credential
+                      the form already holds, so an empty required field reads as
+                      filled -- and the user only finds out at Save. */}
+                  <input
+                    value={form.access_key_id}
+                    onChange={(e) => updateField("access_key_id", e.target.value)}
+                    className={cn(
+                      INPUT_CLASS,
+                      "font-mono",
+                      fieldErrors.access_key_id && INPUT_ERROR_CLASS,
+                    )}
+                  />
+                </Field>
+                <Field label={t("addConn.secretKey")} error={fieldErrors.secret_access_key}>
+                  <div
+                    className={cn(
+                      "flex h-9 items-center gap-2 rounded-[9px] border border-border bg-panel px-3 focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary-soft",
+                      fieldErrors.secret_access_key && INPUT_ERROR_CLASS,
+                    )}
+                  >
+                    <Lock className="size-3.5 text-muted-foreground" />
+                    <input
+                      type="password"
+                      value={form.secret_access_key}
+                      onChange={(e) => updateField("secret_access_key", e.target.value)}
+                      placeholder={isEdit ? t("addConn.secretKeep") : ""}
+                      className="flex-1 border-none bg-transparent font-mono text-[13px] text-foreground outline-none"
+                    />
+                  </div>
+                  {isEdit && (
+                    <p className="mt-1 text-[11.5px] text-muted-foreground">
+                      {t("addConn.secretKeep")}
+                    </p>
+                  )}
+                </Field>
+              </>
             )}
             <div className="mb-1.5">
               <label className="mb-1.5 block text-xs font-medium text-fg2">
@@ -648,9 +724,20 @@ export function ConnectionModal() {
                 <span className="text-muted-foreground">{t("addConn.testing")}</span>
               )}
               {testStatus.kind === "success" && (
-                <span className="inline-flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400">
-                  <CheckCircle2 className="size-[15px]" />
-                  {t("addConn.testOk")}
+                <span
+                  className="inline-flex min-w-0 items-center gap-1.5 text-emerald-600 dark:text-emerald-400"
+                  title={
+                    testStatus.corrected
+                      ? t("b2.endpointCorrected", { endpoint: testStatus.corrected })
+                      : undefined
+                  }
+                >
+                  <CheckCircle2 className="size-[15px] shrink-0" />
+                  <span className="truncate">
+                    {testStatus.corrected
+                      ? t("b2.endpointCorrected", { endpoint: testStatus.corrected })
+                      : t("addConn.testOk")}
+                  </span>
                 </span>
               )}
               {testStatus.kind === "error" && (

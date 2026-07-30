@@ -1,13 +1,16 @@
 //! The small `hyper` + `hyper-rustls` HTTPS client shared by the provider
 //! modules that talk to an API `aws-sdk-s3` cannot reach.
 //!
-//! Two callers today, for unrelated reasons:
+//! Three callers today, for unrelated reasons:
 //!
 //! - [`crate::provider::oss_admin`] signs and sends Aliyun OSS's *native*
 //!   `ListBuckets`, which is not an S3 operation at all.
 //! - [`crate::provider::r2_admin`] calls `api.cloudflare.com` for R2 bucket
 //!   metadata the S3 API simply does not expose (usage counts, public-access
 //!   domains, jurisdiction).
+//! - [`crate::provider::b2_admin`] calls `api.backblazeb2.com` for the one
+//!   thing no S3 call can report: which region a B2 account lives in (you
+//!   would need the endpoint already to ask over S3).
 //!
 //! Deliberately **not** `reqwest`: see the long comment in `Cargo.toml` for
 //! the full reasoning, but in short, every `reqwest` TLS feature drags in

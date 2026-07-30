@@ -66,6 +66,12 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
+# HTTP Basic auth for Backblaze's native `b2_authorize_account` (see
+# `provider::b2_admin`), which is the only credential scheme that API accepts.
+# Already resolved at 0.22.1 in Cargo.lock as a dependency of the AWS SDK's own
+# transport, so promoting it to a direct dependency adds zero new lock entries
+# -- the same test the hyper/rustls block above had to pass.
+base64 = "0.22"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2.5"
