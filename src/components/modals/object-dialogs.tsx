@@ -473,12 +473,21 @@ function DeleteObjectsDialog() {
  * `ConnectionModals`): switching targets remounts rather than patching, so a
  * dialog's first render is already correct for its target and no stale
  * mutation state (error, partial-failure report, pending flag) carries over
- * from whatever was open before. */
+ * from whatever was open before.
+ *
+ * The three closed sentinels must **differ from each other**, for the reason
+ * spelled out in `ConnectionModals`: these are sibling children of one
+ * fragment, so a shared "closed" makes React warn and risk remounting the
+ * wrong dialog whenever they are all shut -- which is most of the time. Each
+ * sentinel reuses its own dialog's prefix and contains no `:`, while every
+ * open-state key here does, so no real target can collide with one. */
 export function ObjectDialogs() {
   const { showNewFolder, renameTarget, deleteTargets } = useApp();
-  const newFolderKey = showNewFolder ? "new-folder" : "closed";
-  const renameDialogKey = renameTarget ? `rename:${renameTarget.key}` : "closed";
-  const deleteDialogKey = deleteTargets ? `delete:${deleteTargets.join("|")}` : "closed";
+  const newFolderKey = showNewFolder ? "new-folder" : "new-folder-closed";
+  const renameDialogKey = renameTarget ? `rename:${renameTarget.key}` : "rename-closed";
+  const deleteDialogKey = deleteTargets
+    ? `delete:${deleteTargets.join("|")}`
+    : "delete-closed";
 
   return (
     <>
