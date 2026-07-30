@@ -1,18 +1,20 @@
 /**
  * Provider-agnostic region catalog layer.
  *
- * Two providers ship a built-in region table today (Aliyun OSS with 35
- * regions across 3 groups plus internal/public endpoints, Rainyun ROS with 2
- * flat regions). Everything the connection form needs to do with such a
- * table -- look a region up, map an endpoint back to a region, build an
- * endpoint, derive the edit form's initial state -- is identical for both,
- * so it lives here once and takes the catalog as a parameter.
+ * Three providers ship a built-in region table today (Aliyun OSS with 35
+ * regions across 3 groups plus internal/public endpoints, Qiniu Kodo with 8
+ * flat regions, Rainyun ROS with 2). Everything the connection form needs to
+ * do with such a table -- look a region up, map an endpoint back to a
+ * region, build an endpoint, derive the edit form's initial state -- is
+ * identical for all of them, so it lives here once and takes the catalog as
+ * a parameter.
  *
  * The per-provider *data* (and only the data) lives in `oss-regions.ts` /
- * `rainyun-regions.ts`, which import types from this module with
- * `import type` so there is no runtime import cycle.
+ * `qiniu-regions.ts` / `rainyun-regions.ts`, which import types from this
+ * module with `import type` so there is no runtime import cycle.
  */
 import { OSS_CATALOG } from "./oss-regions";
+import { QINIU_CATALOG } from "./qiniu-regions";
 import { RAINYUN_CATALOG } from "./rainyun-regions";
 
 /** Which network a region's endpoint targets. Only meaningful for catalogs
@@ -53,6 +55,7 @@ export interface RegionCatalog {
  * don't ship one (the form then falls back to free-text endpoint/region). */
 export function regionCatalog(provider: string): RegionCatalog | undefined {
   if (provider === "oss") return OSS_CATALOG;
+  if (provider === "qiniu") return QINIU_CATALOG;
   if (provider === "rainyun") return RAINYUN_CATALOG;
   return undefined;
 }

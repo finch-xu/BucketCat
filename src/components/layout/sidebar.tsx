@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import logoIcon from "@/assets/logo-icon.png";
+import { ProviderChip } from "@/components/icons/provider-chip";
 import { cn } from "@/lib/utils";
 import { isMac } from "@/lib/platform";
 import { providerMeta } from "@/lib/providers";
@@ -165,7 +166,6 @@ function ConnectionRow({
 }: ConnectionRowProps) {
   const { t } = useTranslation();
   const meta = providerMeta(conn.provider);
-  const Icon = meta.icon;
 
   return (
     <div className="mb-px">
@@ -179,12 +179,7 @@ function ConnectionRow({
         <span className="flex w-3 justify-center text-muted2">
           {isOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
         </span>
-        <span
-          className="flex size-[26px] shrink-0 items-center justify-center rounded-[7px] shadow-[0_1px_2px_rgba(0,0,0,0.18)]"
-          style={{ background: meta.color }}
-        >
-          <Icon className="size-[15px] text-white" />
-        </span>
+        <ProviderChip meta={meta} size="sm" />
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[13px] font-semibold text-foreground">
             {conn.name}

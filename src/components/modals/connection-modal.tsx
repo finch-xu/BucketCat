@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { ProviderChip } from "@/components/icons/provider-chip";
 import { RegionPicker, REGION_KEEP_CURRENT } from "@/components/modals/region-picker";
 import { Modal } from "@/components/ui/modal";
 import { useAddConnection, useUpdateConnection } from "@/hooks/use-connections";
@@ -341,33 +342,25 @@ export function ConnectionModal() {
             </button>
           </div>
           <div className="grid grid-cols-2 gap-2.5 px-[22px] pt-4 pb-6">
-            {PROVIDERS.map((p) => {
-              const Icon = p.icon;
-              return (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => chooseProvider(p.id)}
-                  className="flex cursor-pointer items-center gap-3 rounded-xl border border-border bg-panel p-[13px] text-left hover:border-primary hover:bg-background"
-                >
-                  <span
-                    className="flex size-[38px] shrink-0 items-center justify-center rounded-[10px] shadow-[0_2px_5px_rgba(0,0,0,0.2)]"
-                    style={{ background: p.color }}
-                  >
-                    <Icon className="size-5 text-white" />
+            {PROVIDERS.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => chooseProvider(p.id)}
+                className="flex cursor-pointer items-center gap-3 rounded-xl border border-border bg-panel p-[13px] text-left hover:border-primary hover:bg-background"
+              >
+                <ProviderChip meta={p} size="lg" />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13.5px] font-semibold text-foreground">
+                    {p.nameKey ? t(p.nameKey) : p.name}
                   </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-[13.5px] font-semibold text-foreground">
-                      {p.nameKey ? t(p.nameKey) : p.name}
-                    </span>
-                    <span className="block truncate text-[11.5px] text-muted-foreground">
-                      {t(p.descKey)}
-                    </span>
+                  <span className="block truncate text-[11.5px] text-muted-foreground">
+                    {t(p.descKey)}
                   </span>
-                  <ChevronRight className="size-[15px] text-muted2" />
-                </button>
-              );
-            })}
+                </span>
+                <ChevronRight className="size-[15px] text-muted2" />
+              </button>
+            ))}
           </div>
         </>
       )}
@@ -383,12 +376,7 @@ export function ConnectionModal() {
                 <ChevronLeft className="size-4" />
               </button>
             )}
-            <span
-              className="flex size-[34px] shrink-0 items-center justify-center rounded-[9px] shadow-[0_2px_5px_rgba(0,0,0,0.2)]"
-              style={{ background: provider.color }}
-            >
-              <provider.icon className="size-5 text-white" />
-            </span>
+            <ProviderChip meta={provider} size="md" />
             <div className="min-w-0 flex-1">
               <div className="truncate text-[15px] font-bold">
                 {isEdit ? t("conn.editTitle") : provider.nameKey ? t(provider.nameKey) : provider.name}

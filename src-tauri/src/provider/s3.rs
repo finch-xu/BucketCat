@@ -256,41 +256,196 @@ pub fn oss_endpoint_for_region(endpoint: &str, from_region: &str, to_region: &st
     result
 }
 
-/// Native (non-S3-compatible) OSS admin-plane endpoint + credentials,
-/// captured only for Aliyun OSS connections so [`S3Provider::list_buckets`]
-/// can call [`oss_admin::list_buckets`] -- OSS's *native* `ListBuckets` API,
-/// the only one that reports each bucket's own region (see
-/// [`crate::provider::Bucket::region`]).
+/// Rewrites a Qiniu Kodo S3 endpoint from one region to another.
+///
+/// Qiniu embeds the region as its own label in the hostname
+/// (`s3.cn-east-1.qiniucs.com`), so this substitutes `s3.{from_region}.` ->
+/// `s3.{to_region}.` in the *authority* (host + optional port) only, leaving
+/// the scheme, any port and any path byte-for-byte intact. The trailing dot
+/// in the needle is load-bearing: it pins the match to a whole hostname
+/// label, so a region id that happens to be a prefix of another can't be
+/// partially rewritten.
+///
+/// This is the Qiniu twin of [`oss_endpoint_for_region`] and follows the same
+/// contract:
+///
+/// - `from_region == to_region` short-circuits to the input unchanged (no
+///   rewrite needed, and the empty-string edge case some callers could pass
+///   for an unresolved region never reaches the substring check below).
+/// - When the authority doesn't contain `s3.{from_region}.` at all -- a
+///   CNAME'd custom domain, or simply a non-Qiniu host -- the endpoint comes
+///   back byte-for-byte unchanged: such a host can't be reliably mapped to
+///   another region by string substitution, and the caller
+///   ([`S3Provider::client_for`]) is expected to fall back to the default
+///   client rather than guess.
+pub fn qiniu_endpoint_for_region(endpoint: &str, from_region: &str, to_region: &str) -> String {
+    if from_region == to_region {
+        return endpoint.to_string();
+    }
+
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, endpoint),
+    };
+    // Split off any path/query so the rewrite only ever touches the
+    // authority, mirroring `oss_endpoint_for_region`'s own split.
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+
+    let needle = format!("s3.{from_region}.");
+    if !authority.contains(needle.as_str()) {
+        return endpoint.to_string();
+    }
+    let replacement = format!("s3.{to_region}.");
+    let new_authority = authority.replacen(needle.as_str(), replacement.as_str(), 1);
+
+    let mut result = String::new();
+    if let Some(scheme) = scheme {
+        result.push_str(scheme);
+        result.push_str("://");
+    }
+    result.push_str(&new_authority);
+    if let Some(path) = path {
+        result.push('/');
+        result.push_str(path);
+    }
+    result
+}
+
+/// One `GetBucketLocation`, normalized to `Option<String>`: `None` when the
+/// server reports an empty (or absent) `LocationConstraint`.
+///
+/// That normalization is the whole point of the function, and callers must
+/// treat `None` as "unresolved" rather than as the region `""`: an empty region
+/// cached as if resolved would make [`S3Provider::client_for`] compare
+/// `"" != routing.region` and then try to build a client for region `""`.
+/// (Real AWS reports `us-east-1` exactly this way; whether Qiniu ever does is
+/// untested, hence handling it rather than assuming.)
+///
+/// A free function taking the client (rather than an `S3Provider` method) so
+/// the `'static` closures [`S3Provider::list_buckets_qiniu`] spawns can call
+/// it with a cloned client, and so the single lazy lookup in
+/// [`S3Provider::resolve_region`] shares the exact same normalization instead
+/// of re-deriving it.
+async fn bucket_location(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+) -> AppResult<Option<String>> {
+    let output = client
+        .get_bucket_location()
+        .bucket(bucket)
+        .send()
+        .await
+        .map_err(normalize_s3_error)?;
+    Ok(output
+        .location_constraint()
+        .map(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+        .map(|c| c.to_string()))
+}
+
+/// Which backend's cross-region quirk [`RegionRouting`] is routing around.
+///
+/// Both members share the same *cause* -- the server refuses a request for a
+/// bucket that lives in a different region than the endpoint it arrived at,
+/// rather than routing it internally -- and therefore the same machinery.
+/// They differ in exactly three places, each a `match` on this enum:
+///
+/// 1. **How the bucket -> region map gets filled.** OSS calls its *native*
+///    `ListBuckets` ([`oss_admin::list_buckets`]), the only OSS API that
+///    reports each bucket's own region. Qiniu uses the plain S3
+///    `GetBucketLocation`, which -- verified live 2026-07-30 -- answers for
+///    *any* bucket in the account from *any* regional endpoint. (Qiniu's own
+///    `ListBuckets` response does carry a `<LocationConstraint>` per bucket,
+///    but `aws-sdk-s3` 1.139 only deserializes AWS's `<BucketRegion>` tag,
+///    so that field is silently dropped and can't be used.)
+/// 2. **How a target region's endpoint is derived** --
+///    [`oss_endpoint_for_region`] vs [`qiniu_endpoint_for_region`], dispatched
+///    through [`endpoint_for_region`].
+/// 3. **Which provider string [`build_client`] is given** -- see
+///    [`provider_str`], which matters because `build_client` branches on it
+///    for the `s3.` rewrite and path-style addressing.
+///
+/// The error code each backend rejects a cross-region request with also
+/// differs (`PermanentRedirect` vs `IncorrectRegion`); both map to
+/// [`AppError::WrongRegion`] in [`classify_error_code`], which is the
+/// user-visible fallback for when routing didn't manage to kick in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionFlavor {
+    Oss,
+    Qiniu,
+}
+
+/// The `provider` string [`build_client`] expects for a given flavor.
+///
+/// Not cosmetic: `build_client` passes it to [`s3_compat_endpoint`] and
+/// [`uses_path_style`], both of which branch on `"oss"`. Getting it wrong
+/// would point a region-specific OSS client at the *native* (non-S3) host, or
+/// silently switch Qiniu to virtual-hosted addressing.
+fn provider_str(flavor: RegionFlavor) -> &'static str {
+    match flavor {
+        RegionFlavor::Oss => "oss",
+        RegionFlavor::Qiniu => "qiniu",
+    }
+}
+
+/// Derives `endpoint`'s equivalent in `to_region`, per flavor. Both arms are
+/// no-ops when the endpoint doesn't match the expected shape (see each
+/// function's contract), so an unrecognized custom domain comes back
+/// unchanged rather than mangled.
+fn endpoint_for_region(
+    flavor: RegionFlavor,
+    endpoint: &str,
+    from_region: &str,
+    to_region: &str,
+) -> String {
+    match flavor {
+        RegionFlavor::Oss => oss_endpoint_for_region(endpoint, from_region, to_region),
+        RegionFlavor::Qiniu => qiniu_endpoint_for_region(endpoint, from_region, to_region),
+    }
+}
+
+/// Endpoint + credentials + routing caches, captured only for the providers
+/// whose buckets can live outside the connection's configured region (Aliyun
+/// OSS and Qiniu Kodo today -- see [`RegionFlavor`]). This is what lets one
+/// connection reach the whole account: [`S3Provider::client_for`] resolves a
+/// bucket's own region and hands back a client pointed at it.
 ///
 /// `Debug` is hand-written (not derived), mirroring `store::Connection`'s
 /// own manual `impl`, so that `S3Provider`'s derived `Debug` -- which
 /// includes this field -- can never print `secret_access_key` in the clear.
-struct OssNativeAuth {
-    /// Native endpoint with scheme, e.g. `https://oss-cn-hangzhou.aliyuncs.com`
-    /// -- NOT the `s3.`-prefixed [`s3_compat_endpoint`] form `self.client`
-    /// talks to.
+struct RegionRouting {
+    flavor: RegionFlavor,
+    /// Endpoint with scheme. For OSS this is the *native* endpoint (e.g.
+    /// `https://oss-cn-hangzhou.aliyuncs.com`) -- NOT the `s3.`-prefixed
+    /// [`s3_compat_endpoint`] form `self.client` talks to -- because
+    /// `oss_admin` needs the native host. Qiniu has no such split: its S3
+    /// endpoint (`https://s3.cn-east-1.qiniucs.com`) is the only one, and
+    /// [`s3_compat_endpoint`] leaves non-OSS endpoints untouched.
     endpoint: String,
     region: String,
     access_key_id: String,
     secret_access_key: String,
-    /// Bucket name -> region, as reported by OSS's native `ListBuckets`.
-    /// Filled by [`S3Provider::list_buckets`] (whenever the sidebar expands
-    /// this connection) and lazily by [`S3Provider::client_for`] on a cache
-    /// miss. `std::sync::RwLock`, not `tokio::sync::RwLock`: every access
-    /// clones what it needs and drops the guard before any `.await`, so the
-    /// synchronous lock is both correct and cheaper.
+    /// Bucket name -> region. Filled by [`S3Provider::list_buckets`]
+    /// (whenever the sidebar expands this connection) and lazily by
+    /// [`S3Provider::client_for`] on a cache miss. `std::sync::RwLock`, not
+    /// `tokio::sync::RwLock`: every access clones what it needs and drops the
+    /// guard before any `.await`, so the synchronous lock is both correct and
+    /// cheaper.
     bucket_regions: RwLock<HashMap<String, String>>,
-    /// Region -> a client already configured for that region's OSS
-    /// S3-compatible endpoint (same credentials, built through
-    /// [`build_client`] -- the same helper [`from_connection`] uses, so the
-    /// two constructions can never drift apart). Populated lazily by
-    /// [`S3Provider::client_for`].
+    /// Region -> a client already configured for that region's endpoint (same
+    /// credentials, built through [`build_client`] -- the same helper
+    /// [`from_connection`] uses, so the two constructions can never drift
+    /// apart). Populated lazily by [`S3Provider::client_for`].
     region_clients: RwLock<HashMap<String, aws_sdk_s3::Client>>,
 }
 
-impl fmt::Debug for OssNativeAuth {
+impl fmt::Debug for RegionRouting {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OssNativeAuth")
+        f.debug_struct("RegionRouting")
+            .field("flavor", &self.flavor)
             .field("endpoint", &self.endpoint)
             .field("region", &self.region)
             .field("access_key_id", &self.access_key_id)
@@ -316,10 +471,11 @@ pub struct S3Provider {
     /// [`from_connection`]; never the [`Connection`] itself, and never
     /// credentials.
     batch_delete: bool,
-    /// `Some` only for Aliyun OSS connections -- see [`OssNativeAuth`].
-    /// `S3Provider` keeps `#[derive(Debug)]` safely because this field's own
-    /// `Debug` impl is hand-redacted.
-    oss_native: Option<OssNativeAuth>,
+    /// `Some` only for the providers that need per-bucket region routing
+    /// (Aliyun OSS, Qiniu Kodo) -- see [`RegionRouting`]. `S3Provider` keeps
+    /// `#[derive(Debug)]` safely because this field's own `Debug` impl is
+    /// hand-redacted.
+    routing: Option<RegionRouting>,
 }
 
 /// Builds an `aws_sdk_s3::Client` for one `(provider, endpoint, region)` +
@@ -457,22 +613,27 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
     };
 
     // Captured before `region` is moved into `build_client` below -- `None`
-    // for every non-OSS connection, since only OSS's native `ListBuckets`
-    // (called from `S3Provider::list_buckets`) and the region-routing cache
-    // it feeds (`S3Provider::client_for`) need the *native* endpoint (pre
-    // `s3_compat_endpoint` rewrite) alongside the plain credentials.
-    let oss_native = if conn.provider.eq_ignore_ascii_case("oss") {
-        Some(OssNativeAuth {
-            endpoint: with_scheme(&conn.endpoint),
-            region: region.clone(),
-            access_key_id: conn.access_key_id.clone(),
-            secret_access_key: conn.secret_access_key.clone(),
-            bucket_regions: RwLock::new(HashMap::new()),
-            region_clients: RwLock::new(HashMap::new()),
-        })
+    // for every provider that doesn't need per-bucket region routing, which
+    // is all of them except OSS and Qiniu (see `RegionFlavor`). The endpoint
+    // stored here is pre-`s3_compat_endpoint` (but scheme-normalized), which
+    // is what OSS's native `ListBuckets` needs and what both flavors'
+    // `endpoint_for_region` rewriters expect.
+    let flavor = if conn.provider.eq_ignore_ascii_case("oss") {
+        Some(RegionFlavor::Oss)
+    } else if conn.provider.eq_ignore_ascii_case("qiniu") {
+        Some(RegionFlavor::Qiniu)
     } else {
         None
     };
+    let routing = flavor.map(|flavor| RegionRouting {
+        flavor,
+        endpoint: with_scheme(&conn.endpoint),
+        region: region.clone(),
+        access_key_id: conn.access_key_id.clone(),
+        secret_access_key: conn.secret_access_key.clone(),
+        bucket_regions: RwLock::new(HashMap::new()),
+        region_clients: RwLock::new(HashMap::new()),
+    });
 
     let client = build_client(
         &conn.provider,
@@ -485,7 +646,7 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
     Ok(S3Provider {
         client,
         batch_delete: supports_batch_delete(&conn.provider),
-        oss_native,
+        routing,
     })
 }
 
@@ -580,7 +741,16 @@ pub(crate) fn classify_error_code(code: &str, message: Option<&str>) -> Option<A
         // `bucket` param is treated as best-effort context here, mirroring
         // `NoSuchBucket`/`NoSuchKey`'s own `message.unwrap_or("unknown")`
         // convention above.
-        "PermanentRedirect" => Some(AppError::WrongRegion {
+        // Qiniu Kodo's equivalent of the above, and it is NOT
+        // `PermanentRedirect`: a bucket reached through the wrong region's
+        // `s3.{region}.qiniucs.com` host comes back as
+        // `400 IncorrectRegion` ("The bucket region not match with the
+        // service region"), confirmed live 2026-07-30. Normally
+        // `S3Provider::client_for` routes around this before a request is
+        // ever sent; this mapping is the user-readable fallback for when
+        // region resolution didn't manage to (e.g. `GetBucketLocation` itself
+        // failed), so the UI says "wrong region" instead of `internal`.
+        "PermanentRedirect" | "IncorrectRegion" => Some(AppError::WrongRegion {
             bucket: message.unwrap_or("unknown").to_string(),
         }),
         _ => None,
@@ -674,6 +844,18 @@ const DELETE_BATCH_MAX: usize = 1000;
 /// meaningfully parallelizes without looking like a burst to the storage
 /// backend.
 const SINGLE_DELETE_CONCURRENCY: usize = 8;
+
+/// Maximum concurrent `GetBucketLocation` requests while
+/// [`S3Provider::list_buckets_qiniu`] fills in each bucket's region.
+///
+/// Qiniu's `ListBuckets` is account-wide but doesn't usably report regions
+/// (see [`RegionFlavor`]), so one extra request per *previously unseen* bucket
+/// is unavoidable. 8 matches [`SINGLE_DELETE_CONCURRENCY`] for the same
+/// reason: it parallelizes meaningfully without looking like a burst to the
+/// backend. The fan-out only ever happens once per connection -- already-known
+/// buckets are skipped, and `ProviderHub` keeps the `S3Provider` (and with it
+/// the cache) alive until the connection is edited.
+const QINIU_BUCKET_LOCATION_CONCURRENCY: usize = 8;
 
 /// Keys per page while `delete_prefix` walks a subtree. 1000 is
 /// ListObjectsV2's own server-side maximum, so this minimizes the number of
@@ -908,26 +1090,26 @@ pub fn range_header(offset: u64, length: u64) -> String {
 impl S3Provider {
     /// Returns the client that should be used to reach `bucket`.
     ///
-    /// **Non-OSS** (`self.oss_native` is `None`): returns `self.client.clone()`
-    /// immediately and does nothing else -- OSS is the only backend this app
-    /// targets that fails to route a cross-region request server-side (see
-    /// this module's doc comments), so every other provider always talks to
-    /// the one client [`from_connection`] built. `Client` is `Arc`-backed
-    /// internally, so cloning it is cheap.
+    /// **Providers without region routing** (`self.routing` is `None`, i.e.
+    /// everything except Aliyun OSS and Qiniu Kodo -- see [`RegionFlavor`]):
+    /// returns `self.client.clone()` immediately and does nothing else, since
+    /// those backends either route a cross-region request server-side or have
+    /// no cross-region concept at all. `Client` is `Arc`-backed internally, so
+    /// cloning it is cheap.
     ///
-    /// **OSS**: resolves `bucket`'s region through two caches on
-    /// [`OssNativeAuth`], both `std::sync::RwLock`-guarded. **A lock guard is
+    /// **OSS / Qiniu**: resolves `bucket`'s region through two caches on
+    /// [`RegionRouting`], both `std::sync::RwLock`-guarded. **A lock guard is
     /// never held across an `.await` anywhere in this method** -- every
     /// acquisition below is scoped to a block that either returns or drops
     /// the guard before the next `await` point, cloning out whatever value
     /// (a region `String`, or an already-`Arc`-backed `Client`) is actually
     /// needed first.
     ///
-    /// 1. Look up `bucket` in the bucket -> region cache. On a miss, call
-    ///    OSS's native `ListBuckets` **once** to (re-)fill the cache -- this
-    ///    is what lets a bucket resolve even if the user never expanded this
-    ///    connection in the sidebar first (e.g. a transfer resumed right
-    ///    after an app restart) -- then look up `bucket` again. A fill
+    /// 1. Look up `bucket` in the bucket -> region cache. On a miss, resolve
+    ///    it over the network **once** (see [`S3Provider::resolve_region`]) --
+    ///    this is what lets a bucket resolve even if the user never expanded
+    ///    this connection in the sidebar first (e.g. a transfer resumed right
+    ///    after an app restart) -- and cache whatever came back. A resolution
     ///    failure (network/permission) is not an error from this method's
     ///    point of view: it's logged at `debug` and treated the same as an
     ///    unresolved region below, so the caller's own request against the
@@ -940,22 +1122,22 @@ impl S3Provider {
     ///    the region -> client cache, via [`build_client`] -- the same
     ///    helper [`from_connection`] uses, so this can never end up with a
     ///    subtly different configuration than the connection's own default
-    ///    client. [`oss_endpoint_for_region`] derives the target region's
-    ///    endpoint from [`OssNativeAuth::endpoint`]. Two concurrent callers
+    ///    client. [`endpoint_for_region`] derives the target region's
+    ///    endpoint from [`RegionRouting::endpoint`]. Two concurrent callers
     ///    racing to fill the same unknown region may each build a `Client`
     ///    (construction is local, no network call -- see `build_client`'s
     ///    doc comment), but only the first to take the write lock is kept;
     ///    the other's is simply dropped. Never panics, never deadlocks.
     ///
-    /// Beyond the one bucket-list call in step 1 on a genuine cache miss,
-    /// this method never itself makes a network request.
+    /// Beyond the one resolution call in step 1 on a genuine cache miss, this
+    /// method never itself makes a network request.
     async fn client_for(&self, bucket: &str) -> aws_sdk_s3::Client {
-        let Some(native) = &self.oss_native else {
+        let Some(routing) = &self.routing else {
             return self.client.clone();
         };
 
         let mut region = {
-            let cache = native
+            let cache = routing
                 .bucket_regions
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -963,34 +1145,27 @@ impl S3Provider {
         };
 
         if region.is_none() {
-            match oss_admin::list_buckets(
-                &native.endpoint,
-                &native.region,
-                &native.access_key_id,
-                &native.secret_access_key,
-            )
-            .await
-            {
-                Ok(buckets) => {
-                    let mut cache = native
+            match self.resolve_region(routing, bucket).await {
+                Ok(resolved) => {
+                    let mut cache = routing
                         .bucket_regions
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    for b in &buckets {
-                        cache.insert(b.name.clone(), b.region.clone());
+                    for (name, bucket_region) in resolved {
+                        cache.insert(name, bucket_region);
                     }
                 }
                 Err(err) => {
                     tracing::debug!(
                         bucket,
                         error = %err,
-                        "client_for: native list_buckets failed while resolving this bucket's \
-                         region; falling back to the connection's default client"
+                        "client_for: region resolution failed for this bucket; falling back to \
+                         the connection's default client"
                     );
                 }
             }
             region = {
-                let cache = native
+                let cache = routing
                     .bucket_regions
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1001,12 +1176,12 @@ impl S3Provider {
         let Some(region) = region else {
             return self.client.clone();
         };
-        if region == native.region {
+        if region == routing.region {
             return self.client.clone();
         }
 
         {
-            let cache = native
+            let cache = routing
                 .region_clients
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1015,16 +1190,17 @@ impl S3Provider {
             }
         }
 
-        let endpoint = oss_endpoint_for_region(&native.endpoint, &native.region, &region);
+        let endpoint =
+            endpoint_for_region(routing.flavor, &routing.endpoint, &routing.region, &region);
         let built = build_client(
-            "oss",
+            provider_str(routing.flavor),
             &endpoint,
             &region,
-            &native.access_key_id,
-            &native.secret_access_key,
+            &routing.access_key_id,
+            &routing.secret_access_key,
         );
 
-        let mut cache = native
+        let mut cache = routing
             .region_clients
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1033,6 +1209,194 @@ impl S3Provider {
         // dropped -- never overwrite, never panic, never deadlock.
         cache.entry(region).or_insert(built).clone()
     }
+
+    /// Resolves which region `bucket` lives in, returning `(name, region)`
+    /// pairs to merge into [`RegionRouting::bucket_regions`]. Called only by
+    /// [`S3Provider::client_for`], only on a cache miss.
+    ///
+    /// The two flavors differ in cost, which is why this returns a map rather
+    /// than a single region:
+    ///
+    /// - **OSS** has no per-bucket region API, so it calls its native
+    ///   `ListBuckets` ([`oss_admin::list_buckets`]) and learns *every*
+    ///   bucket's region in one request. All of it is worth caching, not just
+    ///   the one bucket asked about.
+    /// - **Qiniu** has `GetBucketLocation`, and -- verified live 2026-07-30 --
+    ///   it answers for any bucket in the account from any regional endpoint,
+    ///   so one request resolves exactly the one bucket needed. Cheaper than
+    ///   OSS's whole-account listing, hence the single-entry map.
+    ///
+    /// A Qiniu bucket whose `LocationConstraint` comes back empty (which is
+    /// how real AWS reports `us-east-1`) yields **no** entry rather than an
+    /// empty-string one: an empty region would be cached as "resolved", and
+    /// `client_for` would then compare `"" != routing.region` and try to build
+    /// a client for region `""`. Returning nothing instead leaves the bucket
+    /// unresolved, which `client_for` already handles by falling back to the
+    /// connection's default client.
+    async fn resolve_region(
+        &self,
+        routing: &RegionRouting,
+        bucket: &str,
+    ) -> AppResult<Vec<(String, String)>> {
+        match routing.flavor {
+            RegionFlavor::Oss => {
+                let buckets = oss_admin::list_buckets(
+                    &routing.endpoint,
+                    &routing.region,
+                    &routing.access_key_id,
+                    &routing.secret_access_key,
+                )
+                .await?;
+                Ok(buckets
+                    .into_iter()
+                    .map(|b| (b.name, b.region))
+                    .collect())
+            }
+            RegionFlavor::Qiniu => {
+                // `self.client`, never `client_for` -- that would recurse, and
+                // it isn't needed: Qiniu answers `GetBucketLocation` for any
+                // bucket in the account regardless of which regional endpoint
+                // it arrives at (verified live 2026-07-30 by resolving a
+                // `cn-north-1` bucket through the `ap-southeast-1` host).
+                let region = bucket_location(&self.client, bucket).await?;
+                Ok(region
+                    .into_iter()
+                    .map(|region| (bucket.to_string(), region))
+                    .collect())
+            }
+        }
+    }
+
+    /// [`Provider::list_buckets`] for Qiniu Kodo.
+    ///
+    /// Qiniu's `ListBuckets` is account-wide -- any regional endpoint returns
+    /// every bucket the account owns -- so the listing itself is one request
+    /// through the connection's default client. What it *doesn't* give us is
+    /// the regions: the response body does carry a `<LocationConstraint>` per
+    /// bucket, but `aws-sdk-s3` 1.139 only deserializes AWS's own
+    /// `<BucketRegion>` tag (see `protocol_serde::shape_bucket`), so that
+    /// field never reaches `Bucket::bucket_region()`. Regions therefore come
+    /// from one `GetBucketLocation` per bucket, fanned out at
+    /// [`QINIU_BUCKET_LOCATION_CONCURRENCY`].
+    ///
+    /// Two properties keep that fan-out from being a per-refresh cost:
+    ///
+    /// - **Already-cached buckets are skipped.** The sidebar re-lists on every
+    ///   refresh; without this, each refresh would replay N requests. First
+    ///   expansion pays N, subsequent ones pay 0.
+    /// - **A failed lookup is not fatal.** The bucket is returned with
+    ///   `region: None` and logged at `debug`. Losing a region badge (and
+    ///   falling back to the default client for that bucket) is far better
+    ///   than failing the whole sidebar because one bucket's location call
+    ///   timed out.
+    ///
+    /// Regions learned here are written into [`RegionRouting::bucket_regions`],
+    /// the same cache [`S3Provider::client_for`] routes through -- listing a
+    /// connection's buckets is the natural fill point, since the sidebar does
+    /// it well before the user opens any one of them.
+    async fn list_buckets_qiniu(&self, routing: &RegionRouting) -> AppResult<Vec<Bucket>> {
+        let output = self
+            .client
+            .list_buckets()
+            .send()
+            .await
+            .map_err(normalize_s3_error)?;
+
+        let listed: Vec<(String, Option<String>)> = output
+            .buckets()
+            .iter()
+            .map(|b| {
+                (
+                    b.name().unwrap_or_default().to_string(),
+                    b.creation_date()
+                        .and_then(|d| d.fmt(DateTimeFormat::DateTime).ok()),
+                )
+            })
+            .collect();
+
+        // Snapshot the cache once, rather than re-reading it per bucket: the
+        // guard is dropped before any `.await` below (this module's rule), and
+        // one pass is enough to decide what still needs a network lookup.
+        let mut regions: HashMap<String, String> = {
+            let cache = routing
+                .bucket_regions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.clone()
+        };
+
+        let unknown: Vec<String> = listed
+            .iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| !name.is_empty() && !regions.contains_key(name))
+            .collect();
+
+        for chunk in unknown.chunks(QINIU_BUCKET_LOCATION_CONCURRENCY) {
+            let mut set: JoinSet<(String, AppResult<Option<String>>)> = JoinSet::new();
+            for name in chunk {
+                let client = self.client.clone();
+                let bucket = name.clone();
+                set.spawn(async move {
+                    let result = bucket_location(&client, &bucket).await;
+                    (bucket, result)
+                });
+            }
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok((bucket, Ok(Some(region)))) => {
+                        regions.insert(bucket, region);
+                    }
+                    // An empty `LocationConstraint` is left unresolved on
+                    // purpose -- see `resolve_region`'s doc comment on why
+                    // caching `""` would be worse than caching nothing.
+                    Ok((bucket, Ok(None))) => {
+                        tracing::debug!(
+                            bucket,
+                            "qiniu list_buckets: empty LocationConstraint; leaving region unresolved"
+                        );
+                    }
+                    Ok((bucket, Err(err))) => {
+                        tracing::debug!(
+                            bucket,
+                            error = %err,
+                            "qiniu list_buckets: GetBucketLocation failed; this bucket will \
+                             report no region and fall back to the default client"
+                        );
+                    }
+                    // A spawned task panicking is not expected
+                    // (`get_bucket_location().send()` doesn't panic), but it
+                    // must not take the whole listing down either.
+                    Err(err) => {
+                        tracing::debug!(
+                            error = %err,
+                            "qiniu list_buckets: a GetBucketLocation task failed to join"
+                        );
+                    }
+                }
+            }
+        }
+
+        // No `.await` after this point, so the write guard never crosses one.
+        {
+            let mut cache = routing
+                .bucket_regions
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (name, region) in &regions {
+                cache.insert(name.clone(), region.clone());
+            }
+        }
+
+        Ok(listed
+            .into_iter()
+            .map(|(name, creation_date)| Bucket {
+                region: regions.get(&name).cloned(),
+                name,
+                creation_date,
+            })
+            .collect())
+    }
+
 
     /// Deletes `keys` one `DeleteObject` at a time, in batches of up to
     /// [`SINGLE_DELETE_CONCURRENCY`] concurrent requests -- the fallback
@@ -1119,40 +1483,48 @@ impl Provider for S3Provider {
         // OSS connections list through the *native* `ListBuckets` API
         // instead of the S3-compatible one `self.client` calls: it's the
         // only one that reports each bucket's own region (see
-        // `crate::provider::Bucket::region`'s doc comment). Every other
-        // provider is unaffected -- `oss_native` is `None` for all of them.
-        if let Some(native) = &self.oss_native {
-            let oss_buckets = oss_admin::list_buckets(
-                &native.endpoint,
-                &native.region,
-                &native.access_key_id,
-                &native.secret_access_key,
-            )
-            .await?;
+        // `crate::provider::Bucket::region`'s doc comment). Qiniu uses the
+        // plain S3 `ListBuckets` but has to fetch each bucket's region
+        // separately (see `list_buckets_qiniu`). Every other provider is
+        // unaffected -- `routing` is `None` for all of them.
+        match self.routing.as_ref().map(|r| (r, r.flavor)) {
+            Some((routing, RegionFlavor::Oss)) => {
+                let oss_buckets = oss_admin::list_buckets(
+                    &routing.endpoint,
+                    &routing.region,
+                    &routing.access_key_id,
+                    &routing.secret_access_key,
+                )
+                .await?;
 
-            // Feed the bucket -> region cache `client_for` routes through --
-            // this is the most natural fill point: the sidebar lists a
-            // connection's buckets as soon as it's expanded, well before the
-            // user opens any one of them. No `.await` follows this block, so
-            // the write guard never crosses one.
-            {
-                let mut cache = native
-                    .bucket_regions
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                for b in &oss_buckets {
-                    cache.insert(b.name.clone(), b.region.clone());
+                // Feed the bucket -> region cache `client_for` routes through
+                // -- this is the most natural fill point: the sidebar lists a
+                // connection's buckets as soon as it's expanded, well before
+                // the user opens any one of them. No `.await` follows this
+                // block, so the write guard never crosses one.
+                {
+                    let mut cache = routing
+                        .bucket_regions
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for b in &oss_buckets {
+                        cache.insert(b.name.clone(), b.region.clone());
+                    }
                 }
-            }
 
-            return Ok(oss_buckets
-                .into_iter()
-                .map(|b| Bucket {
-                    name: b.name,
-                    creation_date: b.creation_date,
-                    region: Some(b.region),
-                })
-                .collect());
+                return Ok(oss_buckets
+                    .into_iter()
+                    .map(|b| Bucket {
+                        name: b.name,
+                        creation_date: b.creation_date,
+                        region: Some(b.region),
+                    })
+                    .collect());
+            }
+            Some((routing, RegionFlavor::Qiniu)) => {
+                return self.list_buckets_qiniu(routing).await;
+            }
+            None => {}
         }
 
         let output = self
@@ -1683,6 +2055,22 @@ mod tests {
         }
     }
 
+    fn qiniu_connection() -> Connection {
+        Connection {
+            id: "c5".to_string(),
+            provider: "qiniu".to_string(),
+            name: "qiniu".to_string(),
+            // Exactly what `src/lib/qiniu-regions.ts` prefills. Unlike OSS,
+            // there is no native-vs-S3-compatible split to convert: this host
+            // *is* the S3 endpoint, and `s3_compat_endpoint` leaves it alone.
+            endpoint: "https://s3.cn-east-1.qiniucs.com".to_string(),
+            region: "cn-east-1".to_string(),
+            access_key_id: "qiniu-ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            default_bucket: None,
+        }
+    }
+
     // --- is_aws_endpoint -------------------------------------------------
 
     #[test]
@@ -2056,39 +2444,53 @@ mod tests {
     }
 
     #[test]
-    fn from_connection_captures_oss_native_auth_only_for_oss() {
+    fn from_connection_captures_region_routing_only_for_oss_and_qiniu() {
         // OSS's native `ListBuckets` (called from `S3Provider::list_buckets`)
         // needs the *native* endpoint -- pre `s3_compat_endpoint` rewrite,
         // but still with a scheme -- alongside the plain credentials.
         let oss = from_connection(&oss_connection()).unwrap();
-        let native = oss
-            .oss_native
+        let routing = oss
+            .routing
             .as_ref()
-            .expect("oss connections must capture native auth");
-        assert_eq!(native.endpoint, "https://oss-cn-hangzhou.aliyuncs.com");
-        assert_eq!(native.region, "cn-hangzhou");
-        assert_eq!(native.access_key_id, "LTAIexample");
-        assert_eq!(native.secret_access_key, "secret");
+            .expect("oss connections must capture region routing");
+        assert_eq!(routing.flavor, RegionFlavor::Oss);
+        assert_eq!(routing.endpoint, "https://oss-cn-hangzhou.aliyuncs.com");
+        assert_eq!(routing.region, "cn-hangzhou");
+        assert_eq!(routing.access_key_id, "LTAIexample");
+        assert_eq!(routing.secret_access_key, "secret");
+
+        // Qiniu needs the same routing state, just a different flavor -- its
+        // endpoint has no native/S3-compatible split, so it is stored as-is
+        // (scheme-normalized only).
+        let qiniu = from_connection(&qiniu_connection()).unwrap();
+        let routing = qiniu
+            .routing
+            .as_ref()
+            .expect("qiniu connections must capture region routing");
+        assert_eq!(routing.flavor, RegionFlavor::Qiniu);
+        assert_eq!(routing.endpoint, "https://s3.cn-east-1.qiniucs.com");
+        assert_eq!(routing.region, "cn-east-1");
 
         // Every other backend has nothing to capture.
-        assert!(from_connection(&aws_connection())
-            .unwrap()
-            .oss_native
-            .is_none());
+        assert!(from_connection(&aws_connection()).unwrap().routing.is_none());
         assert!(from_connection(&minio_connection())
             .unwrap()
-            .oss_native
+            .routing
+            .is_none());
+        assert!(from_connection(&rainyun_connection())
+            .unwrap()
+            .routing
             .is_none());
     }
 
     #[test]
-    fn oss_native_auth_debug_redacts_secret_access_key() {
+    fn region_routing_debug_redacts_secret_access_key() {
         let mut conn = oss_connection();
         conn.secret_access_key = "super-secret-value".to_string();
         let oss = from_connection(&conn).unwrap();
-        let native = oss.oss_native.as_ref().unwrap();
+        let routing = oss.routing.as_ref().unwrap();
 
-        let debugged = format!("{native:?}");
+        let debugged = format!("{routing:?}");
 
         assert!(!debugged.contains("super-secret-value"));
         assert!(debugged.contains("<redacted>"));
@@ -2099,7 +2501,7 @@ mod tests {
     #[test]
     fn s3_provider_debug_never_leaks_the_oss_secret_through_its_derived_impl() {
         // `S3Provider` keeps `#[derive(Debug)]` -- this proves that's safe:
-        // the derive calls `OssNativeAuth`'s own hand-redacted `Debug`, so
+        // the derive calls `RegionRouting`'s own hand-redacted `Debug`, so
         // the secret can't leak even though nothing here special-cases
         // `S3Provider`'s own impl.
         let mut conn = oss_connection();
@@ -2195,12 +2597,13 @@ mod tests {
     //
     // These only ever exercise `client_for`'s CACHE HIT paths -- the bucket
     // -> region cache is seeded directly (`mod tests` can reach
-    // `OssNativeAuth`'s private fields, being a child module of `s3`), never
+    // `RegionRouting`'s private fields, being a child module of `s3`), never
     // left empty. That's deliberate, not just convenient: an empty cache
     // sends `client_for` down its lazy-fill branch, which calls the real
-    // `oss_admin::list_buckets` -- an actual network request against
-    // whatever `native.endpoint` is configured to. This crate's tests must
-    // never make a live request to a real Aliyun endpoint (see
+    // `S3Provider::resolve_region` -- an actual network request against
+    // whatever `routing.endpoint` is configured to (`oss_admin::list_buckets`
+    // for OSS, `GetBucketLocation` for Qiniu). This crate's tests must never
+    // make a live request to a real Aliyun/Qiniu endpoint (see
     // `tests/oss_e2e.rs`'s safety rules), so that branch is deliberately
     // left to code review / the live e2e suite rather than a unit test here.
     //
@@ -2210,16 +2613,16 @@ mod tests {
     // sent), so the resulting URL's host reveals the endpoint the returned
     // `Client` was configured with, with zero network I/O.
 
-    /// An OSS `S3Provider` (region `cn-hangzhou`, see `oss_connection`) whose
-    /// bucket -> region cache already has one entry -- a cache HIT, so
-    /// `client_for` never reaches its network-calling fallback branch.
-    fn oss_provider_with_cached_region(bucket: &str, region: &str) -> S3Provider {
-        let provider = from_connection(&oss_connection()).unwrap();
-        let native = provider
-            .oss_native
+    /// An `S3Provider` for `conn` whose bucket -> region cache already has one
+    /// entry -- a cache HIT, so `client_for` never reaches its
+    /// network-calling fallback branch.
+    fn provider_with_cached_region(conn: &Connection, bucket: &str, region: &str) -> S3Provider {
+        let provider = from_connection(conn).unwrap();
+        let routing = provider
+            .routing
             .as_ref()
-            .expect("oss_connection() must produce oss_native");
-        native
+            .expect("this connection must produce region routing");
+        routing
             .bucket_regions
             .write()
             .unwrap()
@@ -2227,11 +2630,23 @@ mod tests {
         provider
     }
 
+    /// An OSS `S3Provider` (region `cn-hangzhou`, see `oss_connection`) with a
+    /// pre-seeded region cache.
+    fn oss_provider_with_cached_region(bucket: &str, region: &str) -> S3Provider {
+        provider_with_cached_region(&oss_connection(), bucket, region)
+    }
+
+    /// A Qiniu `S3Provider` (region `cn-east-1`, see `qiniu_connection`) with a
+    /// pre-seeded region cache.
+    fn qiniu_provider_with_cached_region(bucket: &str, region: &str) -> S3Provider {
+        provider_with_cached_region(&qiniu_connection(), bucket, region)
+    }
+
     #[tokio::test]
-    async fn client_for_returns_the_default_client_unchanged_for_non_oss_connections() {
-        // Non-OSS connections have `oss_native == None`, so `client_for`
-        // must return `self.client.clone()` immediately -- no cache lookup,
-        // no possibility of ever calling `oss_admin::list_buckets`.
+    async fn client_for_returns_the_default_client_unchanged_for_providers_without_routing() {
+        // Providers that don't need region routing have `routing == None`, so
+        // `client_for` must return `self.client.clone()` immediately -- no
+        // cache lookup, no possibility of ever calling `resolve_region`.
         let provider = from_connection(&minio_connection()).unwrap();
 
         let client = provider.client_for("any-bucket").await;
@@ -2286,8 +2701,8 @@ mod tests {
         let _ = provider.client_for("shanghai-bucket").await;
         let _ = provider.client_for("shanghai-bucket").await;
 
-        let native = provider.oss_native.as_ref().unwrap();
-        let cache = native.region_clients.read().unwrap();
+        let routing = provider.routing.as_ref().unwrap();
+        let cache = routing.region_clients.read().unwrap();
         assert_eq!(
             cache.len(),
             1,
@@ -2303,8 +2718,8 @@ mod tests {
         // exactly one cached client.
         let provider = from_connection(&oss_connection()).unwrap();
         {
-            let native = provider.oss_native.as_ref().unwrap();
-            let mut cache = native.bucket_regions.write().unwrap();
+            let routing = provider.routing.as_ref().unwrap();
+            let mut cache = routing.bucket_regions.write().unwrap();
             cache.insert("bucket-a".to_string(), "cn-shanghai".to_string());
             cache.insert("bucket-b".to_string(), "cn-shanghai".to_string());
         }
@@ -2312,12 +2727,177 @@ mod tests {
         let _ = provider.client_for("bucket-a").await;
         let _ = provider.client_for("bucket-b").await;
 
-        let native = provider.oss_native.as_ref().unwrap();
-        let cache = native.region_clients.read().unwrap();
+        let routing = provider.routing.as_ref().unwrap();
+        let cache = routing.region_clients.read().unwrap();
         assert_eq!(
             cache.len(),
             1,
             "two buckets resolving to the same region must share one cached client"
+        );
+    }
+
+    // --- Qiniu region routing -----------------------------------------------
+    //
+    // Same vehicle as the OSS tests above (a pre-seeded cache + a locally
+    // computed presigned URL), and the same reason: an empty cache would send
+    // `client_for` into `resolve_region`, which for Qiniu means a real
+    // `GetBucketLocation` against a live endpoint. Note the URLs below are
+    // path-style (`host/bucket/key`), not virtual-hosted -- Qiniu supports
+    // both, and `uses_path_style` keeps it on path-style like every other
+    // non-AWS, non-OSS backend.
+
+    #[tokio::test]
+    async fn qiniu_client_for_returns_the_default_client_when_the_bucket_is_in_the_connection_region()
+    {
+        let provider = qiniu_provider_with_cached_region("same-region-bucket", "cn-east-1");
+
+        let url = provider
+            .presign_get("same-region-bucket", "docs/readme.md", 60)
+            .await
+            .expect("presigning is local-only, no network involved");
+
+        assert!(
+            url.starts_with("https://s3.cn-east-1.qiniucs.com/same-region-bucket/"),
+            "unexpected presigned URL: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qiniu_client_for_routes_to_a_region_specific_client_for_a_cross_region_bucket() {
+        // The exact scenario the live account exhibits: the connection is
+        // configured for one region while the bucket lives in another. Before
+        // region routing existed for Qiniu this produced `400 IncorrectRegion`.
+        let provider = qiniu_provider_with_cached_region("north-bucket", "cn-north-1");
+
+        let url = provider
+            .presign_get("north-bucket", "docs/readme.md", 60)
+            .await
+            .expect("presigning is local-only, no network involved");
+
+        // On the *cn-north-1* host -- proves `client_for` built a client via
+        // `qiniu_endpoint_for_region` + `build_client` for the bucket's own
+        // region, not the connection's configured `cn-east-1` default.
+        assert!(
+            url.starts_with("https://s3.cn-north-1.qiniucs.com/north-bucket/"),
+            "unexpected presigned URL: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qiniu_client_for_caches_the_built_region_client_and_reuses_it() {
+        let provider = qiniu_provider_with_cached_region("north-bucket", "cn-north-1");
+
+        let _ = provider.client_for("north-bucket").await;
+        let _ = provider.client_for("north-bucket").await;
+
+        let routing = provider.routing.as_ref().unwrap();
+        let cache = routing.region_clients.read().unwrap();
+        assert_eq!(cache.len(), 1);
+    }
+
+    // --- qiniu_endpoint_for_region ------------------------------------------
+
+    #[test]
+    fn qiniu_endpoint_for_region_rewrites_the_region_label() {
+        assert_eq!(
+            qiniu_endpoint_for_region("https://s3.cn-east-1.qiniucs.com", "cn-east-1", "cn-north-1"),
+            "https://s3.cn-north-1.qiniucs.com"
+        );
+    }
+
+    #[test]
+    fn qiniu_endpoint_for_region_is_a_noop_when_the_region_is_unchanged() {
+        assert_eq!(
+            qiniu_endpoint_for_region("https://s3.cn-east-1.qiniucs.com", "cn-east-1", "cn-east-1"),
+            "https://s3.cn-east-1.qiniucs.com"
+        );
+    }
+
+    #[test]
+    fn qiniu_endpoint_for_region_is_a_noop_for_an_empty_target_region() {
+        // `client_for` never calls this with an unresolved region (it returns
+        // the default client first), but an empty `to_region` must not be able
+        // to produce the nonsense host `s3..qiniucs.com`.
+        assert_eq!(
+            qiniu_endpoint_for_region("https://s3.cn-east-1.qiniucs.com", "cn-east-1", ""),
+            "https://s3..qiniucs.com",
+            "documented shape: substitution is mechanical, which is exactly why `client_for` \
+             must short-circuit an unresolved region before reaching here"
+        );
+    }
+
+    #[test]
+    fn qiniu_endpoint_for_region_leaves_a_custom_domain_untouched() {
+        // A CNAME'd domain can't be mapped to another region by substitution;
+        // `client_for` is expected to fall back to the default client.
+        assert_eq!(
+            qiniu_endpoint_for_region("https://files.example.com", "cn-east-1", "cn-north-1"),
+            "https://files.example.com"
+        );
+    }
+
+    #[test]
+    fn qiniu_endpoint_for_region_preserves_scheme_port_and_path() {
+        assert_eq!(
+            qiniu_endpoint_for_region(
+                "http://s3.cn-east-1.qiniucs.com:8080/prefix",
+                "cn-east-1",
+                "cn-south-1"
+            ),
+            "http://s3.cn-south-1.qiniucs.com:8080/prefix"
+        );
+    }
+
+    #[test]
+    fn qiniu_endpoint_for_region_only_rewrites_the_authority() {
+        // A path segment that happens to spell the source region must survive
+        // untouched -- only the host's region label is a routing decision.
+        assert_eq!(
+            qiniu_endpoint_for_region(
+                "https://s3.cn-east-1.qiniucs.com/s3.cn-east-1.",
+                "cn-east-1",
+                "cn-north-1"
+            ),
+            "https://s3.cn-north-1.qiniucs.com/s3.cn-east-1."
+        );
+    }
+
+    #[test]
+    fn qiniu_uses_path_style_and_keeps_batch_delete() {
+        // Two sentinels against a future "let's align qiniu with oss" change:
+        //
+        // - Path-style: verified live 2026-07-30 that Qiniu accepts both
+        //   path-style and virtual-hosted, and this app stays on path-style
+        //   like every other non-AWS, non-OSS backend.
+        // - Batch delete: OSS and Rainyun both hard-require the legacy
+        //   `Content-MD5` header on Multi-Object Delete, which aws-sdk-s3
+        //   cannot send. Qiniu does NOT -- it accepts the
+        //   `x-amz-checksum-crc32` that aws-sdk-s3 actually sends (verified
+        //   live 2026-07-30: 200, while the same request with no checksum
+        //   header at all got `400 ... Content-MD5`). So Qiniu keeps the fast
+        //   batch path.
+        assert!(uses_path_style("qiniu", "https://s3.cn-east-1.qiniucs.com"));
+        assert!(supports_batch_delete("qiniu"));
+    }
+
+    #[test]
+    fn s3_compat_endpoint_leaves_qiniu_endpoints_untouched() {
+        // The `s3.` rewrite is OSS-only. Qiniu hosts already start with `s3.`,
+        // so a provider-blind rewrite would produce `s3.s3.cn-east-1...`.
+        assert_eq!(
+            s3_compat_endpoint("qiniu", "https://s3.cn-east-1.qiniucs.com"),
+            "https://s3.cn-east-1.qiniucs.com"
+        );
+    }
+
+    #[test]
+    fn incorrect_region_maps_to_wrong_region() {
+        // Qiniu's cross-region rejection code, distinct from OSS's
+        // `PermanentRedirect` (verified live 2026-07-30).
+        let app_err = classify_error_code("IncorrectRegion", Some("mybucket"));
+        assert!(
+            matches!(app_err, Some(AppError::WrongRegion { ref bucket }) if bucket == "mybucket"),
+            "unexpected classification: {app_err:?}"
         );
     }
 

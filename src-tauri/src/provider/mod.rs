@@ -35,14 +35,25 @@ pub fn clamp_expiry(secs: u64) -> u64 {
 /// than an SDK `DateTime`/`chrono` value so the frontend never needs an
 /// AWS-flavored date parser.
 ///
-/// `region` is `Some(..)` only for Aliyun OSS connections, whose native
-/// `ListBuckets` API (see [`oss_admin::list_buckets`]) reports each
-/// bucket's own region -- unlike every other provider here, where a
-/// connection's buckets are all implicitly in the connection's configured
-/// region, so there's nothing per-bucket to report. `Some("")` is possible
-/// (an OSS bucket whose `<Region>`/`<Location>` were both absent) and is
-/// distinct from `None` ("this provider doesn't report per-bucket region at
-/// all").
+/// `region` is `Some(..)` only for the two providers whose bucket list spans
+/// regions, because for every other provider a connection's buckets are all
+/// implicitly in the connection's configured region, so there's nothing
+/// per-bucket to report:
+///
+/// - **Aliyun OSS**, whose native `ListBuckets` API (see
+///   [`oss_admin::list_buckets`]) reports each bucket's own region. `Some("")`
+///   is possible here (a bucket whose `<Region>`/`<Location>` were both
+///   absent).
+/// - **Qiniu Kodo**, whose `ListBuckets` is account-wide but doesn't usably
+///   report regions, so each bucket's region is resolved with a separate
+///   `GetBucketLocation` (see `S3Provider::list_buckets_qiniu`). Here `None`
+///   on an individual bucket also means "that lookup didn't succeed", which
+///   is deliberately non-fatal: the bucket still lists, just without a region
+///   badge.
+///
+/// Either way `None` is distinct from `Some("")`: the former means no region
+/// is known for this bucket, the latter that the server answered with an empty
+/// one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Bucket {
     pub name: String,

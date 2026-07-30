@@ -176,6 +176,7 @@
     "minio": "Self-hosted · S3 compatible",
     "oss": "Alibaba Cloud object storage",
     "rainyun": "Rainyun object storage",
+    "qiniu": "Qiniu Cloud object storage",
     "cos": "Tencent Cloud object storage",
     "b2": "Cost-effective archive storage",
     "generic": "Any S3-compatible service",

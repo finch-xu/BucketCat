@@ -27,6 +27,7 @@ export type ProviderKind =
   | "minio"
   | "oss"
   | "rainyun"
+  | "qiniu"
   | "cos"
   | "b2"
   | "generic"
@@ -58,10 +59,12 @@ export interface ConnectionDto {
 
 /** A bucket as returned by `list_buckets`. Mirrors `Bucket` in
  * `src-tauri/src/provider/mod.rs`; `creation_date` is a pre-formatted
- * RFC 3339 string, not a Date. `region` is only ever set for Aliyun OSS
- * connections (whose native `ListBuckets` reports each bucket's own
- * region) -- `null`/absent for every other provider, where a connection's
- * buckets are all implicitly in the connection's configured region. */
+ * RFC 3339 string, not a Date. `region` is only ever set for the providers
+ * whose bucket list spans regions -- Aliyun OSS (its native `ListBuckets`
+ * reports each bucket's own region) and Qiniu Kodo (resolved per bucket via
+ * `GetBucketLocation`). `null`/absent for every other provider, where a
+ * connection's buckets are all implicitly in the connection's configured
+ * region. */
 export interface Bucket {
   name: string;
   creation_date: string | null;
