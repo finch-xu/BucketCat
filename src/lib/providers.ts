@@ -57,9 +57,9 @@ export interface ProviderMeta {
 export const PROVIDERS: ProviderMeta[] = [
   { id: "s3", name: "Amazon S3", descKey: "providers.s3", color: "#E67C29", icon: AwsIcon, colorLogo: true, endpoint: "https://s3.amazonaws.com", region: "us-east-1" },
   // R2's endpoint is built from the account id (see `R2Fields` / `src/lib/r2.ts`),
-  // so there is no fixed default to prefill -- the empty string keeps the form
-  // from seeding a placeholder host the user would have to edit by hand. The
-  // value below is still shown as the field's *placeholder*.
+  // so there is no fixed default to prefill: the empty string keeps the form
+  // from seeding a host the user would have to edit by hand. `R2Fields` renders
+  // its own read-only, derived endpoint field and never reads this value.
   { id: "r2", name: "Cloudflare R2", descKey: "providers.r2", color: "#F6821F", icon: CloudflareIcon, colorLogo: true, endpoint: "", region: "auto" },
   { id: "minio", name: "MinIO", descKey: "providers.minio", color: "#C72E49", icon: MinioIcon, colorLogo: false, endpoint: "https://minio.local:9000", region: "us-east-1" },
   { id: "oss", name: "Aliyun OSS", descKey: "providers.oss", color: "#FF6A00", icon: AlibabaCloudIcon, colorLogo: true, endpoint: "https://oss-cn-hangzhou.aliyuncs.com", region: "cn-hangzhou" },

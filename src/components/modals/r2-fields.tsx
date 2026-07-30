@@ -172,9 +172,12 @@ export function R2Fields({
                     onApiTokenChange(e.target.value);
                     if (probe.kind !== "idle") setProbe({ kind: "idle" });
                   }}
-                  placeholder={
-                    isEdit && hasApiToken ? t("r2.apiTokenKeep") : "cfut_••••••••••••••••"
-                  }
+                  // No bullet-dot placeholder: in a password field it is
+                  // indistinguishable from a value that has already been
+                  // typed, so users read an empty required field as filled.
+                  // Only the edit-mode "leave blank to keep" copy, which is
+                  // plainly a message rather than a value, is shown.
+                  placeholder={isEdit && hasApiToken ? t("r2.apiTokenKeep") : ""}
                   className="flex-1 border-none bg-transparent font-mono text-[13px] text-foreground outline-none"
                 />
               </div>
@@ -239,10 +242,10 @@ export function R2Fields({
             <label className="mb-1.5 block text-xs font-medium text-fg2">
               {t("addConn.accessKey")}
             </label>
+            {/* No placeholder at all -- see the API token field above. */}
             <input
               value={accessKeyId}
               onChange={(e) => onAccessKeyIdChange(e.target.value)}
-              placeholder="••••••••••••••••••••••••••••••••"
               className={cn(
                 INPUT_CLASS,
                 "font-mono",
@@ -265,7 +268,7 @@ export function R2Fields({
                 type="password"
                 value={secretAccessKey}
                 onChange={(e) => onSecretAccessKeyChange(e.target.value)}
-                placeholder={isEdit ? t("addConn.secretKeep") : "••••••••••••••••••••"}
+                placeholder={isEdit ? t("addConn.secretKeep") : ""}
                 className="flex-1 border-none bg-transparent font-mono text-[13px] text-foreground outline-none"
               />
             </div>
@@ -282,10 +285,13 @@ export function R2Fields({
         <label className="mb-1.5 block text-xs font-medium text-fg2">
           {t("r2.accountId")}
         </label>
+        {/* No placeholder: a sample 32-hex account id is indistinguishable
+            from a real one at a glance, so it reads as a value the form
+            already filled in. The hint below carries the same information
+            without ever appearing to be data. */}
         <input
           value={accountId}
           onChange={(e) => handleAccountInput(e.target.value)}
-          placeholder="a1b2c3d4e5f60718293a4b5c6d7e8f90"
           className={cn(INPUT_CLASS, "font-mono", fieldErrors.endpoint && INPUT_ERROR_CLASS)}
         />
         {/* The endpoint is derived and read-only, so an "endpoint missing"

@@ -574,10 +574,13 @@ export function ConnectionModal() {
             })()}
             {!isR2 && (
               <Field label={t("addConn.accessKey")} error={fieldErrors.access_key_id}>
+              {/* Deliberately no placeholder. A masked-looking one
+                  (`AKIA••••••••••••`) is indistinguishable from a credential
+                  the form already holds, so an empty required field reads as
+                  filled -- and the user only finds out at Save. */}
               <input
                 value={form.access_key_id}
                 onChange={(e) => updateField("access_key_id", e.target.value)}
-                placeholder="AKIA••••••••••••"
                 className={cn(
                   INPUT_CLASS,
                   "font-mono",
@@ -599,7 +602,7 @@ export function ConnectionModal() {
                   type="password"
                   value={form.secret_access_key}
                   onChange={(e) => updateField("secret_access_key", e.target.value)}
-                  placeholder={isEdit ? t("addConn.secretKeep") : "••••••••••••••••••••"}
+                  placeholder={isEdit ? t("addConn.secretKeep") : ""}
                   className="flex-1 border-none bg-transparent font-mono text-[13px] text-foreground outline-none"
                 />
               </div>
