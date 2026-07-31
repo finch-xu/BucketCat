@@ -75,7 +75,6 @@ pnpm tauri build      # build installers locally
 
 Backend tests live in `src-tauri` — run `cargo test` there. The per-provider e2e suites are skipped by default because they need real accounts or a local container; each `src-tauri/tests/*_e2e.rs` explains how to run it in the comment at the top of the file.
 
-Releases are built by GitHub Actions. Run `pnpm version:set <version>` to sync the version across package.json, Cargo.toml, and tauri.conf.json, then commit and push a `v<version>` tag.
 
 ## License
 

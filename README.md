@@ -75,7 +75,6 @@ pnpm tauri build      # 打本地安装包
 
 后端测试在 `src-tauri` 目录下跑 `cargo test`。各服务商的 e2e 测试默认跳过，需要真实账号或本地容器，运行方式见 `src-tauri/tests/*_e2e.rs` 文件顶部的注释。
 
-发版由 GitHub Actions 完成：先用 `pnpm version:set <版本号>` 同步 package.json、Cargo.toml、tauri.conf.json 三处版本号，提交后打 `v<版本号>` 标签推送即可。
 
 ## License
 
