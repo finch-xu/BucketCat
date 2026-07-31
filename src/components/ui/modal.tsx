@@ -3,10 +3,22 @@ import { cn } from "@/lib/utils";
 
 export function Modal({
   onClose,
+  dismissOnOverlayClick = true,
   className,
   children,
 }: {
   onClose: () => void;
+  /** 点遮罩层是否关闭弹窗。默认 `true`，因为多数弹窗（删除确认、上传冲突、
+   * 桶信息）里没有用户填过的内容，点空白关掉是顺手而非风险。
+   *
+   * 承载表单的弹窗应传 `false` —— 遮罩层用的是 `onClick`，而 DOM 的 click
+   * 事件触发在 mousedown 与 mouseup 的**共同祖先**上，所以在输入框里拖选
+   * 文字、松手时鼠标滑出了弹窗边界，click 就落在遮罩层上，弹窗关闭、已填
+   * 内容全部丢失。用户不会觉得那是一次「点击」，只会觉得东西凭空没了。
+   *
+   * Escape 不受这个参数影响：主动敲键比鼠标滑出边界难误触得多，且是普遍
+   * 约定。 */
+  dismissOnOverlayClick?: boolean;
   className?: string;
   children: ReactNode;
 }) {
@@ -34,7 +46,7 @@ export function Modal({
 
   return (
     <div
-      onClick={onClose}
+      onClick={dismissOnOverlayClick ? onClose : undefined}
       className="absolute inset-0 z-40 flex items-center justify-center bg-[rgba(20,18,14,0.42)] backdrop-blur-[3px]"
     >
       <div

@@ -487,8 +487,13 @@ export function ConnectionModal() {
     }
   }
 
+  // `dismissOnOverlayClick={false}`：这是全应用填到一半代价最高的表单 ——
+  // 连接名、密钥对、默认桶，其中密钥是从腾讯云/AWS 控制台一次性复制来的，
+  // 弹窗一关就得重新去取（腾讯云的 SecretKey 更是创建后再也查不到）。见
+  // `Modal` 的 `dismissOnOverlayClick` 注释里那条「拖选文字时鼠标滑出边界」
+  // 的误触路径。✕、取消按钮和 Escape 三条主动关闭途径都保留。
   return (
-    <Modal onClose={handleClose} className="w-[560px]">
+    <Modal onClose={handleClose} dismissOnOverlayClick={false} className="w-[560px]">
       {step === 1 && (
         <>
           <div className="flex items-start justify-between px-[22px] pt-[22px] pb-1">
