@@ -17,7 +17,7 @@ jobs:
   # 一份，而 latest.json 的 version 取自 tag、二进制的真实版本取自 tauri.conf.json。
   # 两者不一致会发出一份"声称 0.2.0、装上去还是 0.1.0"的 manifest，把用户锁进
   # 永远提示有更新的死循环 —— 那种 release 一旦发出去就收不回来，所以在这里拦死。
-  # 本地用 `node scripts/bump-version.mjs <version>` 一次改完可避免撞上。
+  # 本地用 `pnpm version:set <version>` 一次改完可避免撞上。
   verify-version:
     name: Verify version consistency
     runs-on: ubuntu-latest
@@ -42,7 +42,7 @@ jobs:
           [ "$conf"  = "$want" ] || { echo "::error::tauri.conf.json 是 $conf，tag 是 $want"; fail=1; }
           [ "$cargo" = "$want" ] || { echo "::error::Cargo.toml 是 $cargo，tag 是 $want"; fail=1; }
           if [ "$fail" -eq 1 ]; then
-            echo "::error::跑 node scripts/bump-version.mjs $want，提交后重新打 tag。"
+            echo "::error::跑 pnpm version:set $want，提交后重新打 tag。"
             exit 1
           fi
           echo "版本号三处一致: $want"
