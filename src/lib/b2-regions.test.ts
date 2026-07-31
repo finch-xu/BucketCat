@@ -156,12 +156,11 @@ describe("b2 provider preset", () => {
     expect(regionFromEndpoint(B2_CATALOG, preset!.endpoint)?.id).toBe(preset!.region);
   });
 
-  // Backblaze's official brand red. The icon is simple-icons' monochrome mark,
-  // so `colorLogo` must be false -- otherwise `ProviderGlyph` skips the
-  // coloring and it renders black.
-  it("uses the official brand color and is marked as a monochrome logo", () => {
+  // Backblaze's official brand red. The icon itself is a neutral lucide glyph
+  // (trademark compliance -- see `providers.ts`), so this color is B2's *only*
+  // brand cue in the wizard; nothing else catches it if this drifts.
+  it("uses the official brand color", () => {
     const preset = PROVIDERS.find((p) => p.id === "b2");
     expect(preset!.color).toBe("#E21E29");
-    expect(preset!.colorLogo).toBe(false);
   });
 });

@@ -72,11 +72,11 @@ describe("qiniu provider preset", () => {
     expect(regionFromEndpoint(QINIU_CATALOG, preset!.endpoint)?.id).toBe(preset!.region);
   });
 
-  // 七牛官方品牌色。图标是 lobehub 的原色变体，所以 `colorLogo` 必须为 true
-  // —— 否则 `ProviderGlyph` 会试图给它着色（无效，且会误导后来的人）。
-  it("uses the official brand color and is marked as a full-color logo", () => {
+  // 七牛官方品牌色。图标本身是中性的 lucide 线性图标（商标合规，见
+  // `providers.ts`），所以这个色值是七牛在向导里**唯一**的品牌识别，改错了
+  // 没有别的东西能兜住。
+  it("uses the official brand color", () => {
     const preset = PROVIDERS.find((p) => p.id === "qiniu");
     expect(preset!.color).toBe("#06AEEF");
-    expect(preset!.colorLogo).toBe(true);
   });
 });

@@ -11,19 +11,13 @@ You may obtain a copy of the License at
 
 --------------------------------------------------------------------------------
 
-This product bundles brand icons, inlined as source in
-src/components/icons/providers.tsx, from the following projects:
+BucketCat bundles no third-party brand logos. Every provider in the
+add-connection wizard is drawn with a neutral line icon from Lucide
+(https://lucide.dev, ISC License), which ships as the `lucide-react`
+dependency rather than as vendored source.
 
-  - @lobehub/icons (https://github.com/lobehub/lobe-icons)
-    MIT License.
-    Icons used: aws-color, cloudflare-color, alibabacloud-color,
-    tencentcloud-color, qiniu-color.
-
-  - simple-icons (https://github.com/simple-icons/simple-icons)
-    CC0-1.0 (public domain dedication).
-    Icons used: minio, backblaze.
-
-All third-party brand names and logos are trademarks of their respective
-owners, used here solely to identify the object storage services BucketCat
-can connect to. BucketCat is not affiliated with, endorsed by, or sponsored
-by any of them.
+All product names, logos, and brands are the property of their respective
+owners. All company, product, and service names used in this application are
+for identification purposes only -- specifically, to identify the object
+storage services BucketCat can connect to. Use of these names does not imply
+endorsement, sponsorship, or affiliation.

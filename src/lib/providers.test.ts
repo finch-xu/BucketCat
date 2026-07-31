@@ -3,11 +3,6 @@ import { PROVIDERS, providerMeta } from "./providers";
 import { R2_REGION } from "./r2";
 import { regionCatalog, findRegion, regionFromEndpoint } from "./regions";
 
-/** 只有这些 provider 没有官方品牌 logo，用 lucide 线性图标 + 品牌色顶上
- * （见 `providers.ts` 的图标来源规则）。`minio` / `b2` 用的是 simple-icons 的
- * 单色 logo，同样需要着色，所以也在这里。改这张表时请一并更新这个集合。 */
-const MONOCHROME_ICON_PROVIDERS = new Set(["minio", "rainyun", "b2", "generic"]);
-
 describe("PROVIDERS", () => {
   it("has no duplicate ids", () => {
     const ids = PROVIDERS.map((p) => p.id);
@@ -21,9 +16,8 @@ describe("PROVIDERS", () => {
   });
 
   // 真正要防的失败模式是「图标名写错 / 导入被删」导致 `icon` 成了
-  // `undefined`，渲染时才炸。这里不能断言 `typeof === "function"`：内联的品牌
-  // SVG 是普通函数组件，而 lucide 的图标是 `forwardRef` 出来的**对象**
-  // （`{$$typeof, render}`），两种都是合法的 React 组件类型。
+  // `undefined`，渲染时才炸。这里不能断言 `typeof === "function"`：lucide 的
+  // 图标是 `forwardRef` 出来的**对象**（`{$$typeof, render}`），不是函数。
   it("gives every provider a defined icon and a label", () => {
     for (const p of PROVIDERS) {
       expect(p.icon, `${p.id} icon`).toBeTruthy();
@@ -40,12 +34,12 @@ describe("PROVIDERS", () => {
     }
   });
 
-  // `colorLogo` 驱动 `ProviderGlyph` 要不要着色，两边不能各写一套：原色 logo
-  // 着色无效（fill 优先），单色 logo 不着色就丢品牌色。
-  it("marks exactly the monochrome-icon providers as colorLogo: false", () => {
-    for (const p of PROVIDERS) {
-      expect(p.colorLogo).toBe(!MONOCHROME_ICON_PROVIDERS.has(p.id));
-    }
+  // 图标必须两两不同：出于商标合规，这里全是中性的 lucide 线性图标（见
+  // `providers.ts` 的图标规则），厂商之间**只**靠图形与品牌色区分。两家共用一个
+  // 图标不会报错，只会让向导里两行看起来像同一个服务。
+  it("gives every provider a distinct icon", () => {
+    const icons = PROVIDERS.map((p) => p.icon);
+    expect(new Set(icons).size).toBe(icons.length);
   });
 
   // 有地区目录的 provider，其预填的 endpoint/region 必须能在目录里解析出来
