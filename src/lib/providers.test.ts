@@ -15,23 +15,26 @@ describe("PROVIDERS", () => {
     expect(providerMeta("qiniu").id).toBe("qiniu");
   });
 
-  // 隐藏一个 provider 必须是「向导里选不到」，而不是「从表里删掉」。两者在
-  // 向导上看起来一样，差别只在已保存的连接上才暴露：删掉之后 `providerMeta`
-  // 会静默回落到 `generic`，用户什么都没做，他那条腾讯云连接却变成了方块图标
-  // 加「通用 S3 兼容」。这条断言就是钉住这个区别的。
-  it("hides cos from the wizard while keeping it resolvable for saved connections", () => {
-    expect(SELECTABLE_PROVIDERS.some((p) => p.id === "cos")).toBe(false);
-    expect(providerMeta("cos").id).toBe("cos");
-    expect(providerMeta("cos").name).toBe("Tencent COS");
-  });
-
-  // 反过来：可选列表不能把没标 `hidden` 的 provider 漏掉，否则某个厂商会
-  // 在无人察觉的情况下从向导里消失。
+  // 可选列表不能把没标 `hidden` 的 provider 漏掉，否则某个厂商会在无人察觉的
+  // 情况下从向导里消失。
   it("offers every provider that is not explicitly hidden", () => {
     expect(SELECTABLE_PROVIDERS.map((p) => p.id)).toEqual(
       PROVIDERS.filter((p) => !p.hidden).map((p) => p.id),
     );
-    expect(SELECTABLE_PROVIDERS.length).toBe(PROVIDERS.length - 1);
+  });
+
+  // 今天没有任何 provider 被隐藏。腾讯云 COS 曾经是最后一个 —— 它在
+  // `tests/cos_e2e.rs` 对着真实账号跑绿之前一直挂着 `hidden`。
+  //
+  // `hidden` 机制本身保留，因为它是「还没验证过的 provider 先别让用户选到」的
+  // 唯一正确做法：整条从 `PROVIDERS` 删掉会让已保存的该类连接掉进 `generic`
+  // 兜底，用户什么都没做，图标却变成方块、名字变成「通用 S3 兼容」。这条断言
+  // 的作用是，下次有人给某个 provider 加 `hidden` 时会被迫回来读这段话，顺带
+  // 想清楚解禁条件是什么。
+  it("hides nothing from the wizard today", () => {
+    expect(SELECTABLE_PROVIDERS.length).toBe(PROVIDERS.length);
+    expect(SELECTABLE_PROVIDERS.some((p) => p.id === "cos")).toBe(true);
+    expect(providerMeta("cos").name).toBe("Tencent COS");
   });
 
   // 真正要防的失败模式是「图标名写错 / 导入被删」导致 `icon` 成了

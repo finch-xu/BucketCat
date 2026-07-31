@@ -101,11 +101,14 @@ export const PROVIDERS: ProviderMeta[] = [
   { id: "oss", name: "Aliyun OSS", descKey: "providers.oss", color: "#FF6A00", icon: Boxes, endpoint: "https://oss-cn-hangzhou.aliyuncs.com", region: "cn-hangzhou" },
   { id: "rainyun", name: "Rainyun ROS", descKey: "providers.rainyun", color: "#3E8BD6", icon: CloudRain, endpoint: "https://cn-nb1.rains3.com", region: "cn-nb1" },
   { id: "qiniu", name: "Qiniu Kodo", descKey: "providers.qiniu", color: "#06AEEF", icon: Cloud, endpoint: "https://s3.cn-east-1.qiniucs.com", region: "cn-east-1" },
-  // 腾讯云 COS 还没有正式接入、也没有对着真实账号跑过 e2e，所以先不让用户在
-  // 向导里选到它 —— 不是「不支持」，是「还没验证过，不该假装可用」。等有了
-  // `tests/cos_e2e.rs` 并跑绿，把 `hidden` 去掉即可。条目本身保留，见 `hidden`
-  // 的注释。
-  { id: "cos", name: "Tencent COS", descKey: "providers.cos", color: "#006EFF", icon: HardDrive, endpoint: "https://cos.ap-guangzhou.myqcloud.com", region: "ap-guangzhou", hidden: true },
+  // COS 是唯一被拉出**两个**默认分支的 provider：`uses_path_style` 和
+  // `supports_batch_delete` 都得为它返回 `false`（前者因为腾讯云 2024-01-01
+  // 起对新桶停用了 path-style，后者因为它和 OSS/雨云一样硬要 `Content-MD5`）。
+  // 两条都由 `tests/cos_e2e.rs` 对真账号实测钉住，改动前先读那份模块注释。
+  //
+  // 另外注意：COS 的地域端点是硬边界，一条连接只能看到一个地域的桶 —— 详见
+  // `cos-regions.ts`。
+  { id: "cos", name: "Tencent COS", descKey: "providers.cos", color: "#006EFF", icon: HardDrive, endpoint: "https://cos.ap-guangzhou.myqcloud.com", region: "ap-guangzhou" },
   { id: "b2", name: "Backblaze B2", descKey: "providers.b2", color: "#E21E29", icon: Warehouse, endpoint: "https://s3.us-west-004.backblazeb2.com", region: "us-west-004" },
   { id: "generic", name: "", nameKey: "providers.genericName", descKey: "providers.generic", color: "#7d90a0", icon: Box, endpoint: "https://", region: "" },
 ];

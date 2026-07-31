@@ -1,20 +1,21 @@
 /**
  * Provider-agnostic region catalog layer.
  *
- * Four providers ship a built-in region table today (Aliyun OSS with 35
- * regions across 3 groups plus internal/public endpoints, Qiniu Kodo with 8
- * flat regions, Backblaze B2 with 7, Rainyun ROS with 2). Everything the
- * connection form needs to do with such a table -- look a region up, map an
- * endpoint back to a region, build an endpoint, derive the edit form's
- * initial state -- is identical for all of them, so it lives here once and
- * takes the catalog as a parameter.
+ * Five providers ship a built-in region table today (Aliyun OSS with 35
+ * regions across 3 groups plus internal/public endpoints, Tencent COS with
+ * 17 flat regions, Qiniu Kodo with 8, Backblaze B2 with 7, Rainyun ROS with
+ * 2). Everything the connection form needs to do with such a table -- look a
+ * region up, map an endpoint back to a region, build an endpoint, derive the
+ * edit form's initial state -- is identical for all of them, so it lives here
+ * once and takes the catalog as a parameter.
  *
  * The per-provider *data* (and only the data) lives in `oss-regions.ts` /
- * `qiniu-regions.ts` / `b2-regions.ts` / `rainyun-regions.ts`, which import
- * types from this module with `import type` so there is no runtime import
- * cycle.
+ * `cos-regions.ts` / `qiniu-regions.ts` / `b2-regions.ts` /
+ * `rainyun-regions.ts`, which import types from this module with
+ * `import type` so there is no runtime import cycle.
  */
 import { B2_CATALOG } from "./b2-regions";
+import { COS_CATALOG } from "./cos-regions";
 import { OSS_CATALOG } from "./oss-regions";
 import { QINIU_CATALOG } from "./qiniu-regions";
 import { RAINYUN_CATALOG } from "./rainyun-regions";
@@ -57,6 +58,7 @@ export interface RegionCatalog {
  * don't ship one (the form then falls back to free-text endpoint/region). */
 export function regionCatalog(provider: string): RegionCatalog | undefined {
   if (provider === "oss") return OSS_CATALOG;
+  if (provider === "cos") return COS_CATALOG;
   if (provider === "qiniu") return QINIU_CATALOG;
   if (provider === "rainyun") return RAINYUN_CATALOG;
   // B2 ships a catalog, but its form (`B2Fields`) only falls back to the

@@ -61,15 +61,27 @@ pub fn is_aws_endpoint(endpoint: &str) -> bool {
 ///   own docs state it supports *only* virtual-hosted addressing for
 ///   security reasons and rejects path-style requests outright, unlike
 ///   every other backend this app targets.
-/// - Everything else (MinIO / R2 / COS / B2 / generic / unknown) -> `true`,
-///   unchanged from the pre-OSS behavior: those backends don't support
-///   wildcard DNS for bucket subdomains, so virtual-hosted addressing
-///   breaks for them.
+/// - Tencent COS (`provider` case-insensitively `"cos"`) -> `false`: COS
+///   retired path-style for new buckets. Its "存储桶域名使用安全管理通知"
+///   (in force since 2024-01-01) states that buckets created on or after
+///   that date support *only* virtual-hosted-style domains. Confirmed live
+///   on 2026-07-31 against a bucket created that day: the same
+///   `ListObjectsV2` that succeeds virtual-hosted comes back
+///   `PathStyleDomainForbidden` -- "The bucket you are attempting to access
+///   must be addressed using COS virtual-styled domain." Buckets predating
+///   the cutoff still accept path-style, but they accept virtual-hosted too
+///   (Tencent's own docs recommend it), so one blanket `false` is correct
+///   for old and new alike -- no need to branch on a creation date this app
+///   cannot see at client-build time.
+/// - Everything else (MinIO / R2 / B2 / RustFS / generic / unknown) ->
+///   `true`, unchanged from the pre-OSS behavior: those backends don't
+///   support wildcard DNS for bucket subdomains, so virtual-hosted
+///   addressing breaks for them.
 pub fn uses_path_style(provider: &str, endpoint: &str) -> bool {
     if is_aws_endpoint(endpoint) {
         return false;
     }
-    if provider.eq_ignore_ascii_case("oss") {
+    if provider.eq_ignore_ascii_case("oss") || provider.eq_ignore_ascii_case("cos") {
         return false;
     }
     true
@@ -191,11 +203,27 @@ pub fn with_scheme(endpoint: &str) -> String {
 /// backends hard-require the legacy `Content-MD5` header on this endpoint,
 /// and aws-sdk-s3 simply has no way to send it.
 ///
+/// Tencent COS (`provider` case-insensitively `"cos"`) is the third. This
+/// one is worth spelling out because the pre-implementation reasoning got it
+/// **wrong**: COS was expected to keep the batch path (like Qiniu, the other
+/// Chinese provider whose S3 surface is otherwise AWS-faithful), and only a
+/// live probe with a real `aws-sdk-s3` `DeleteObjects` -- not a hand-rolled
+/// `curl` -- caught it. Run on 2026-07-31 against `cos.ap-beijing.
+/// myqcloud.com`, the SDK's own request (which carries
+/// `x-amz-checksum-crc32` and no `Content-MD5`) came back
+/// `400 InvalidRequest: Missing required header for this request:
+/// Content-MD5` -- verbatim the same rejection OSS and Rainyun give. Taking
+/// the `curl` shortcut here is exactly what produced a wrong answer for
+/// Rainyun, whose suite then failed 4 of 6 on its first live run.
+///
 /// Connections this returns `false` for fall back to one `DeleteObject` per
 /// key instead: single-object delete has no request body, so it's never
-/// subject to this requirement.
+/// subject to this requirement. Confirmed live for COS in the same probe:
+/// every key the failed batch left behind deleted cleanly one at a time.
 pub fn supports_batch_delete(provider: &str) -> bool {
-    !(provider.eq_ignore_ascii_case("oss") || provider.eq_ignore_ascii_case("rainyun"))
+    !(provider.eq_ignore_ascii_case("oss")
+        || provider.eq_ignore_ascii_case("rainyun")
+        || provider.eq_ignore_ascii_case("cos"))
 }
 
 /// Rewrites an OSS endpoint from one region to another.
@@ -463,8 +491,8 @@ impl fmt::Debug for RegionRouting {
 pub struct S3Provider {
     client: aws_sdk_s3::Client,
     /// Whether this connection's backend supports S3's Multi-Object Delete
-    /// (see [`supports_batch_delete`]) -- `false` for Aliyun OSS and Rainyun
-    /// ROS today. A plain capability flag computed once in
+    /// (see [`supports_batch_delete`]) -- `false` for Aliyun OSS, Rainyun ROS
+    /// and Tencent COS today. A plain capability flag computed once in
     /// [`from_connection`]; never the [`Connection`] itself, and never
     /// credentials.
     batch_delete: bool,
@@ -845,8 +873,8 @@ fn to_list_page(
 const DELETE_BATCH_MAX: usize = 1000;
 
 /// Maximum concurrent single-key `DeleteObject` requests when a connection
-/// can't use Multi-Object Delete (see [`supports_batch_delete`] -- OSS and
-/// Rainyun ROS today). Deleting one key per request instead of one request
+/// can't use Multi-Object Delete (see [`supports_batch_delete`] -- OSS,
+/// Rainyun ROS and Tencent COS today). Deleting one key per request instead of one request
 /// per ≤1000 keys multiplies the round-trips a `delete_prefix` walk needs;
 /// running them fully sequentially would make deleting a large OSS folder
 /// painfully slow. 8 bounds the fan-out to something that still
@@ -1422,7 +1450,8 @@ impl S3Provider {
     /// Deletes `keys` one `DeleteObject` at a time, in batches of up to
     /// [`SINGLE_DELETE_CONCURRENCY`] concurrent requests -- the fallback
     /// [`Provider::delete_objects`] dispatches to when `self.batch_delete`
-    /// is `false` (OSS and Rainyun ROS today; see [`supports_batch_delete`]).
+    /// is `false` (OSS, Rainyun ROS and Tencent COS today; see
+    /// [`supports_batch_delete`]).
     /// `DeleteObject` (`DELETE /bucket/key`) has no request body, so unlike
     /// Multi-Object Delete it never needs the `Content-MD5` header these
     /// backends demand and aws-sdk-s3 has no way to send.
@@ -2095,6 +2124,23 @@ mod tests {
         }
     }
 
+    fn cos_connection() -> Connection {
+        Connection {
+            id: "c9".to_string(),
+            provider: "cos".to_string(),
+            name: "tencent".to_string(),
+            // Exactly what `src/lib/providers.ts` prefills. Unlike OSS, this
+            // host needs no rewrite: it already *is* the S3-compatible
+            // endpoint (confirmed live 2026-07-31).
+            endpoint: "https://cos.ap-beijing.myqcloud.com".to_string(),
+            region: "ap-beijing".to_string(),
+            access_key_id: "AKIDexample".to_string(),
+            secret_access_key: "secret".to_string(),
+            default_bucket: None,
+            api_token: None,
+        }
+    }
+
     fn oss_connection() -> Connection {
         Connection {
             id: "c3".to_string(),
@@ -2366,6 +2412,81 @@ mod tests {
         );
     }
 
+    // --- Tencent COS: two forced choices and two defaults ------------------
+    //
+    // Probed directly against a live account on 2026-07-31 -- one bucket in
+    // `ap-beijing`, created that same day, so squarely inside the post-
+    // 2024-01-01 rules -- before any of this code was written. See
+    // `tests/cos_e2e.rs` for the suite that keeps those findings honest.
+    //
+    // COS is the first provider that has to be pulled out of TWO default
+    // branches. The `supports_batch_delete` one is the interesting half: the
+    // pre-implementation guess was that COS would keep the batch path (Qiniu,
+    // the other Chinese provider here, does), and only running a real
+    // `aws-sdk-s3` `DeleteObjects` disproved it. A hand-rolled `curl` probe
+    // would have "confirmed" the guess -- which is exactly how Rainyun's
+    // suite came to fail 4 of 6 on its first live run.
+
+    /// **COS requires virtual-hosted addressing.** Not a preference: Tencent
+    /// retired path-style for buckets created on or after 2024-01-01, and the
+    /// live probe got `PathStyleDomainForbidden` ("The bucket you are
+    /// attempting to access must be addressed using COS virtual-styled
+    /// domain.") on the very same `ListObjectsV2` that succeeded
+    /// virtual-hosted. Moving COS back into the default branch does not
+    /// degrade it, it breaks it outright.
+    #[test]
+    fn cos_uses_virtual_hosted_style() {
+        assert!(!uses_path_style(
+            "cos",
+            "https://cos.ap-beijing.myqcloud.com"
+        ));
+        assert!(!uses_path_style(
+            "COS",
+            "https://cos.ap-guangzhou.myqcloud.com"
+        ));
+    }
+
+    /// **COS cannot use Multi-Object Delete.** It hard-requires the legacy
+    /// `Content-MD5` header there, which `aws-sdk-s3` has no way to send --
+    /// the live probe's real `DeleteObjects` came back `400 InvalidRequest:
+    /// Missing required header for this request: Content-MD5`, verbatim what
+    /// OSS and Rainyun return. The per-key `DeleteObject` fallback works
+    /// (same probe deleted every leftover key one at a time).
+    #[test]
+    fn cos_cannot_use_batch_delete() {
+        assert!(!supports_batch_delete("cos"));
+        assert!(!supports_batch_delete("COS"));
+    }
+
+    /// The `s3.` hostname rewrite is Aliyun-OSS-only. `cos.<region>.
+    /// myqcloud.com` already *is* the S3-compatible endpoint -- prefixing it
+    /// would point the SDK at a host that resolves to nothing.
+    #[test]
+    fn cos_endpoint_is_never_rewritten() {
+        let endpoint = "https://cos.ap-beijing.myqcloud.com";
+        assert_eq!(s3_compat_endpoint("cos", endpoint), endpoint);
+    }
+
+    /// **COS gets no `RegionRouting`.** Its regional endpoints are hard
+    /// boundaries, not alternate routes: the live probe found the account's
+    /// single `ap-beijing` bucket via the `ap-beijing` host and via
+    /// `service.cos.myqcloud.com`, while `ap-guangzhou`, `ap-shanghai`,
+    /// `ap-nanjing`, `ap-chengdu` and `ap-hongkong` each reported zero
+    /// buckets. Tencent's own third-party-app guide says the same thing --
+    /// "在应用中只能在服务地址指定的地域创建或选择存储桶". One connection is
+    /// one region, so there is nothing to route between; that is unlike OSS
+    /// and Qiniu, whose `ListBuckets` is account-wide and therefore *does*
+    /// hand the object plane buckets its own endpoint cannot serve.
+    #[test]
+    fn cos_does_not_get_region_routing() {
+        let provider = from_connection(&cos_connection()).unwrap();
+        assert!(
+            provider.routing.is_none(),
+            "a COS connection addresses exactly one region -- its endpoint cannot even see \
+             buckets elsewhere, so there is nothing to route to"
+        );
+    }
+
     // --- default_bucket: the low-privilege test_connection fallback --------
 
     /// `test_connection`'s `AccessDenied` fallback needs a bucket to probe, so
@@ -2489,10 +2610,6 @@ mod tests {
             "https://acct.r2.cloudflarestorage.com"
         ));
         assert!(uses_path_style("generic", "https://storage.example.com"));
-        assert!(uses_path_style(
-            "cos",
-            "https://cos.ap-guangzhou.myqcloud.com"
-        ));
     }
 
     #[test]
