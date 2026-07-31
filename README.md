@@ -56,7 +56,7 @@
 
 **macOS** — Apple Silicon 下 `bucketcat_macOS-arm64.dmg`，Intel 下 `bucketcat_macOS-x64.dmg`。打开 dmg 把 BucketCat 拖进「应用程序」即可。安装包已做签名与公证，不会被 Gatekeeper 拦。
 
-**Windows** — 下载 `bucketcat_windows-x64-setup.exe`（ARM 设备用 `bucketcat_windows-arm64-setup.exe`），双击安装。x64 另提供 `.msi` 版本。安装包尚未购买代码签名证书，首次运行 SmartScreen 会弹提示，点「更多信息」→「仍要运行」即可。
+**Windows** — 下载 `bucketcat_windows-x64-setup.exe`（ARM 设备用 `bucketcat_windows-arm64-setup.exe`），双击安装。安装包尚未购买代码签名证书，首次运行 SmartScreen 会弹提示，点「更多信息」→「仍要运行」即可。
 
 **Linux** — `bucketcat_linux-x64.AppImage` 下载后 `chmod +x` 直接运行；也提供 `bucketcat_linux-x64.deb`。
 

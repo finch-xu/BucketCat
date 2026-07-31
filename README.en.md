@@ -56,7 +56,7 @@ Grab the installer for your platform from the [Releases](https://github.com/finc
 
 **macOS** — `bucketcat_macOS-arm64.dmg` for Apple Silicon, `bucketcat_macOS-x64.dmg` for Intel. Open the dmg and drag BucketCat into Applications. Builds are signed and notarized, so Gatekeeper lets them through.
 
-**Windows** — `bucketcat_windows-x64-setup.exe` (or `bucketcat_windows-arm64-setup.exe` on ARM devices); run it to install. An `.msi` is also published for x64. Builds are not code-signed yet, so SmartScreen will warn on first run — click **More info** → **Run anyway**.
+**Windows** — `bucketcat_windows-x64-setup.exe` (or `bucketcat_windows-arm64-setup.exe` on ARM devices); run it to install. Builds are not code-signed yet, so SmartScreen will warn on first run — click **More info** → **Run anyway**.
 
 **Linux** — `chmod +x` the `bucketcat_linux-x64.AppImage` and run it directly. A `bucketcat_linux-x64.deb` is available too.
 
