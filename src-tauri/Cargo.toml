@@ -29,7 +29,19 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
-aws-sdk-s3 = "1.137.0"
+# `default-features = false` + the four features below == the upstream `default`
+# set MINUS `rustls`. That one name is misleading: it does NOT select the TLS
+# stack the SDK actually dials with -- `default-https-client` does, and it
+# resolves to `aws-smithy-http-client/rustls-aws-lc`, i.e. rustls 0.23 +
+# rustls-webpki 0.103.x. `rustls` is the deprecated hyper-0.14 escape hatch
+# (`aws-smithy-runtime/tls-rustls` -> `aws-smithy-http-client/legacy-rustls-ring`),
+# only reachable by hand-building a legacy connector, which this crate never does.
+# Leaving it on cost a second, dead TLS stack in Cargo.lock -- rustls 0.21.12 with
+# rustls-webpki 0.101.7, a version line that has no patched release and therefore
+# permanently trips RUSTSEC-2026-0104 / -0099 / -0098. Turning it off drops nine
+# lock entries (hyper 0.14, h2 0.3, rustls 0.21, rustls-webpki 0.101, tokio-rustls
+# 0.24, hyper-rustls 0.24, sct, httpdate, socket2 0.5) and adds none.
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aes-gcm = "0.11.0"
 hkdf = "0.13.0"
 sha2 = "0.11.0"
