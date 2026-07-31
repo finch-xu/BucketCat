@@ -23,4 +23,17 @@ describe("source hygiene", () => {
     );
     expect(offenders).toEqual([]);
   });
+
+  // `target="_blank"` 在浏览器里正确、在 Tauri 的 webview 里静默失效：它请求
+  // 宿主再开一个 webview，wry 没有注册这个 handler，点击被直接丢弃 —— 不报错、
+  // 不跳转。曾经因此让「关于」和「更新」两个面板的外链同时点不动。去掉该属性
+  // 也不是修法，裸 `href` 会把应用自己的 webview 导航到外部页面且无法返回。
+  // 外链一律走 `lib/external-link.ts` 的 `openExternal`。
+  it("has no anchor that asks the webview to open a new window", () => {
+    // 本测试文件自身写有该模式，扫描时排除测试文件，否则它会举报自己。
+    const offenders = sourceFiles("src")
+      .filter((f) => !/\.test\.tsx?$/.test(f))
+      .filter((f) => /target=["']_blank["']/.test(readFileSync(f, "utf8")));
+    expect(offenders).toEqual([]);
+  });
 });

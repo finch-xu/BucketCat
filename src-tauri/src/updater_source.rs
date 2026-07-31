@@ -108,6 +108,59 @@ mod tests {
         assert_eq!(ids.len(), total, "duplicate id in SOURCES");
     }
 
+    /// Every `release_page_url` must be inside the `opener:allow-open-url`
+    /// scope, or the "open release page" button silently does nothing when
+    /// clicked -- the plugin rejects out-of-scope URLs at runtime, and the UI
+    /// only logs that rejection to the console.
+    ///
+    /// This exists because `SOURCES` is explicitly designed to grow mirrors
+    /// (see the doc comment above it), and a mirror's release page will not be
+    /// on github.com. Without this test, adding one compiles, ships, and fails
+    /// only when a user clicks the button -- with the exact "nothing happens"
+    /// symptom the capability entry was introduced to fix.
+    #[test]
+    fn every_release_page_is_within_the_opener_scope() {
+        // `glob` and `serde_json` both already resolve in Cargo.lock (the
+        // former via `tauri`, the latter as a direct dependency), so reaching
+        // for them here adds no lock entry -- the same bar the rest of this
+        // manifest holds itself to.
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("capabilities/default.json must be valid JSON");
+
+        let patterns: Vec<glob::Pattern> = capability["permissions"]
+            .as_array()
+            .expect("`permissions` must be an array")
+            .iter()
+            .filter(|p| p["identifier"] == "opener:allow-open-url")
+            .flat_map(|p| {
+                p["allow"]
+                    .as_array()
+                    .expect("`allow` must be an array")
+                    .iter()
+                    .map(|entry| {
+                        let url = entry["url"].as_str().expect("`url` must be a string");
+                        glob::Pattern::new(url).expect("`url` must be a valid glob")
+                    })
+            })
+            .collect();
+
+        assert!(
+            !patterns.is_empty(),
+            "no opener:allow-open-url entry found -- external links cannot open"
+        );
+
+        for s in SOURCES {
+            assert!(
+                patterns.iter().any(|p| p.matches(s.release_page_url)),
+                "source {}'s release page {} is outside the opener scope; \
+                 add it to capabilities/default.json",
+                s.id,
+                s.release_page_url
+            );
+        }
+    }
+
     #[test]
     fn every_url_is_https() {
         // The updater refuses plain HTTP in release builds anyway; failing

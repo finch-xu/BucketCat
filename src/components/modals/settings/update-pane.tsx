@@ -6,6 +6,7 @@ import { Loader2 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { useErrorText } from "@/hooks/use-error-text";
 import { settingsKey, useSettings } from "@/hooks/use-settings";
+import { openExternal } from "@/lib/external-link";
 import { formatSize } from "@/lib/format";
 import {
   listUpdateSources,
@@ -171,14 +172,13 @@ export function UpdatePane() {
       >
         <div className="flex shrink-0 items-center gap-2">
           {status === "available" && detected && !detected.installable && selectedSource && (
-            <a
-              href={selectedSource.release_page_url}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-block rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] font-medium text-fg2 hover:bg-hover"
+            <button
+              type="button"
+              onClick={() => void openExternal(selectedSource.release_page_url)}
+              className={SECONDARY_BUTTON}
             >
               {t("settings.openReleasePage")}
-            </a>
+            </button>
           )}
           {status === "available" && detected?.installable && (
             <button

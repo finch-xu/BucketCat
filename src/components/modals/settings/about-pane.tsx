@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { getVersion } from "@tauri-apps/api/app";
 import logo from "@/assets/logo-icon.png";
+import { openExternal } from "@/lib/external-link";
 import { Row } from "./shared";
 
 const REPO_URL = "https://github.com/finch-xu/BucketCat";
@@ -67,14 +68,13 @@ export function AboutPane() {
       </div>
 
       <div className="mt-3">
-        <a
-          href={REPO_URL}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-block rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] text-fg2 hover:bg-hover"
+        <button
+          type="button"
+          onClick={() => void openExternal(REPO_URL)}
+          className="cursor-pointer rounded-lg border border-border px-[13px] py-[7px] text-[12.5px] text-fg2 hover:bg-hover"
         >
           {t("settings.github")}
-        </a>
+        </button>
       </div>
     </div>
   );

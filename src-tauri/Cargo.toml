@@ -1,6 +1,6 @@
 [package]
 name = "bucketcat"
-version = "0.1.0"
+version = "0.2.0"
 description = "BucketCat — a small and beautiful object storage manager"
 authors = ["虚拟世界的懒猫"]
 license = "Apache-2.0"
@@ -97,9 +97,28 @@ tauri-plugin-autostart = "2"
 # capability entry, because the frontend never invokes the plugin's own
 # commands -- exactly the arrangement `tauri-plugin-autostart` already has.
 tauri-plugin-updater = "2"
+# Opening the two external links the UI has (the repo in Settings > About, the
+# release page in Settings > Update) in the user's browser. `<a target="_blank">`
+# cannot do this: inside the webview it asks the host to spawn a second webview,
+# wry registers no handler, and the click is silently dropped -- while dropping
+# the attribute would navigate the app's own webview away instead. The third
+# deliberate exception to the "zero new lock entries" rule; the entries it adds
+# are listed in Cargo.lock and come from the `open` crate. Preferred over
+# hand-rolling `Command::new("open" | "xdg-open" | "cmd /c start")` because that
+# spawns a shell with a URL on Windows and needs its own argument-injection
+# guard, whereas this plugin's capability entry pins the allowed URLs at build
+# time -- see `capabilities/default.json`, which permits exactly this repo's
+# GitHub paths and nothing else.
+tauri-plugin-opener = "2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Matching `capabilities/default.json`'s `opener:allow-open-url` globs against
+# `updater_source::SOURCES` (see `every_release_page_is_within_the_opener_scope`)
+# with the very crate `tauri-plugin-opener` uses for that check, so the test
+# cannot drift from the runtime rule. Already resolved via `tauri`, so it adds
+# no lock entry.
+glob = "0.3"
 tokio = { version = "1.53.1", features = ["test-util", "macros", "rt-multi-thread"] }
 # Already resolved at 0.11.0 in the main dependency tree (see `[dependencies]`
 # above and Cargo.lock), so adding it here as a dev-dependency for the MinIO

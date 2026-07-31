@@ -77,6 +77,12 @@ pub fn wants_silent_start(args: impl Iterator<Item = String>) -> bool {
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Hands the two external links in Settings to the user's browser.
+        // Unlike the plugins below this one *is* invoked from the frontend, so
+        // it is the only one here that needs a `capabilities` entry -- and that
+        // entry pins the URLs it will open, which is why `open_url` is safe to
+        // expose at all.
+        .plugin(tauri_plugin_opener::init())
         // Registration only wires the plugin up; the endpoint it would use
         // from `tauri.conf.json` is overridden per call in
         // `commands::updater::build_updater` so the source dropdown takes
