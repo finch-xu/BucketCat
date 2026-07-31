@@ -25,6 +25,7 @@ export type ProviderKind =
   | "s3"
   | "r2"
   | "minio"
+  | "rustfs"
   | "oss"
   | "rainyun"
   | "qiniu"

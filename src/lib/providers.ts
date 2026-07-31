@@ -8,6 +8,7 @@ import {
   Globe,
   HardDrive,
   Server,
+  ServerCog,
   Warehouse,
 } from "lucide-react";
 
@@ -84,6 +85,12 @@ export const PROVIDERS: ProviderMeta[] = [
   // its own read-only, derived endpoint field and never reads this value.
   { id: "r2", name: "Cloudflare R2", descKey: "providers.r2", color: "#F6821F", icon: Globe, endpoint: "", region: "auto" },
   { id: "minio", name: "MinIO", descKey: "providers.minio", color: "#C72E49", icon: Server, endpoint: "https://minio.local:9000", region: "us-east-1" },
+  // Self-hosted like MinIO, and reached through exactly the same code path:
+  // `provider/s3.rs` branches only on `"oss"` / `"qiniu"` / real-AWS endpoints,
+  // so `"rustfs"` lands on path-style addressing, no endpoint rewrite and no
+  // region routing -- which is precisely what RustFS documents wanting. See the
+  // four assertions in `s3.rs`'s `mod tests` that pin those defaults down.
+  { id: "rustfs", name: "RustFS", descKey: "providers.rustfs", color: "#0196D0", icon: ServerCog, endpoint: "https://rustfs.local:9000", region: "us-east-1" },
   { id: "oss", name: "Aliyun OSS", descKey: "providers.oss", color: "#FF6A00", icon: Boxes, endpoint: "https://oss-cn-hangzhou.aliyuncs.com", region: "cn-hangzhou" },
   { id: "rainyun", name: "Rainyun ROS", descKey: "providers.rainyun", color: "#3E8BD6", icon: CloudRain, endpoint: "https://cn-nb1.rains3.com", region: "cn-nb1" },
   { id: "qiniu", name: "Qiniu Kodo", descKey: "providers.qiniu", color: "#06AEEF", icon: Cloud, endpoint: "https://s3.cn-east-1.qiniucs.com", region: "cn-east-1" },

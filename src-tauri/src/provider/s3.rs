@@ -2081,6 +2081,20 @@ mod tests {
         }
     }
 
+    fn rustfs_connection() -> Connection {
+        Connection {
+            id: "c8".to_string(),
+            provider: "rustfs".to_string(),
+            name: "rustfs".to_string(),
+            endpoint: "http://localhost:9010".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "rustfsadmin".to_string(),
+            secret_access_key: "rustfsadmin".to_string(),
+            default_bucket: None,
+            api_token: None,
+        }
+    }
+
     fn oss_connection() -> Connection {
         Connection {
             id: "c3".to_string(),
@@ -2281,6 +2295,74 @@ mod tests {
             provider.routing.is_none(),
             "R2 jurisdictions are separate namespaces, not regions -- routing between them is \
              impossible by construction and must not be attempted"
+        );
+    }
+
+    // --- RustFS: the four properties that are choices, not defaults --------
+    //
+    // Verified live on 2026-07-31 against `rustfs/rustfs:latest` in Docker
+    // (see `tests/rustfs_e2e.rs`, 26 tests, all green on the first run).
+    //
+    // RustFS is the purest case of the pattern B2 and R2 already established:
+    // not one line of this module names `"rustfs"`. It works entirely because
+    // every default happens to be what RustFS wants -- which is exactly why
+    // the defaults are asserted here. Nothing else in the crate would notice
+    // one moving.
+    //
+    // The `s3s`-based server also does not enforce `RUSTFS_REGION`: a request
+    // whose SigV4 credential scope names a different region is accepted
+    // (`a_mismatched_region_is_not_rejected` proves it live). That is why the
+    // wizard can prefill a fixed `us-east-1` for a server whose real region
+    // nobody asked about.
+
+    /// RustFS requires path-style addressing in the deployment everyone
+    /// actually runs. Its docs present virtual-hosted as merely opt-in
+    /// (`RUSTFS_SERVER_DOMAINS` plus wildcard DNS), but `rustfs/src/server/http.rs`
+    /// only wires the virtual-hosted router up when server domains are set
+    /// **and the console is disabled** -- and the console is on by default. So
+    /// for a stock container, path-style is not the recommendation, it is the
+    /// only thing that works.
+    #[test]
+    fn rustfs_uses_path_style_addressing() {
+        assert!(uses_path_style("rustfs", "http://localhost:9010"));
+        assert!(uses_path_style("rustfs", "https://rustfs.example.com:9000"));
+    }
+
+    /// The `s3.` hostname rewrite is Aliyun-OSS-only. A self-hosted RustFS
+    /// endpoint is whatever host the user runs it on; prefixing it would point
+    /// the SDK at a name that resolves to nothing.
+    #[test]
+    fn rustfs_endpoint_is_never_rewritten() {
+        let endpoint = "http://localhost:9010";
+        assert_eq!(s3_compat_endpoint("rustfs", endpoint), endpoint);
+    }
+
+    /// RustFS keeps the fast Multi-Object Delete path.
+    ///
+    /// Confirmed with a real `aws-sdk-s3` `DeleteObjects` over five seeded
+    /// keys in `tests/rustfs_e2e.rs::batch_delete_uses_the_multi_object_path`,
+    /// not a hand-rolled probe -- taking that shortcut is what produced a wrong
+    /// answer for Rainyun, whose suite then failed 4 of 6 on its first live run.
+    /// RustFS accepts the `x-amz-checksum-*` family the SDK sends; Aliyun OSS
+    /// and Rainyun ROS accept only the legacy `Content-MD5`, which is why they
+    /// are excluded and RustFS is not.
+    #[test]
+    fn rustfs_keeps_the_batch_delete_path() {
+        assert!(supports_batch_delete("rustfs"));
+    }
+
+    /// **RustFS gets no `RegionRouting`.** A RustFS deployment is a single
+    /// endpoint serving every bucket it holds; there is no second region to
+    /// route to, and the server does not even enforce the region a request
+    /// claims. Building routing state would be useless and would mislead the
+    /// next reader into thinking RustFS spans regions the way OSS and Qiniu do.
+    #[test]
+    fn rustfs_does_not_get_region_routing() {
+        let provider = from_connection(&rustfs_connection()).unwrap();
+        assert!(
+            provider.routing.is_none(),
+            "a RustFS deployment is one endpoint serving all of its buckets -- there is nothing \
+             to route between"
         );
     }
 

@@ -178,6 +178,7 @@
     "s3": "Amazon object storage",
     "r2": "Zero egress fees · global edge",
     "minio": "Self-hosted · S3 compatible",
+    "rustfs": "Self-hosted · S3 compatible, in Rust",
     "oss": "Alibaba Cloud object storage",
     "rainyun": "Rainyun object storage",
     "qiniu": "Qiniu Cloud object storage",
