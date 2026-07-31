@@ -39,6 +39,13 @@ export interface ProviderMeta {
   icon: IconComponent;
   endpoint: string;
   region: string;
+  /** 从新建连接向导里隐藏，但仍然可以被 `providerMeta` 查到。
+   *
+   * 「隐藏」和「删除」不是一回事：这张表有两个用途，一是给向导列出**可以新建
+   * 什么**，二是给侧栏拿已保存连接的 `provider` 字符串**反查怎么显示**。整条
+   * 删掉会让任何已存在的该类连接掉进 `generic` 兜底，图标变成方块、名字变成
+   * 「通用 S3 兼容」—— 用户没做任何操作，他的连接却改头换面了。 */
+  hidden?: boolean;
 }
 
 /**
@@ -94,10 +101,21 @@ export const PROVIDERS: ProviderMeta[] = [
   { id: "oss", name: "Aliyun OSS", descKey: "providers.oss", color: "#FF6A00", icon: Boxes, endpoint: "https://oss-cn-hangzhou.aliyuncs.com", region: "cn-hangzhou" },
   { id: "rainyun", name: "Rainyun ROS", descKey: "providers.rainyun", color: "#3E8BD6", icon: CloudRain, endpoint: "https://cn-nb1.rains3.com", region: "cn-nb1" },
   { id: "qiniu", name: "Qiniu Kodo", descKey: "providers.qiniu", color: "#06AEEF", icon: Cloud, endpoint: "https://s3.cn-east-1.qiniucs.com", region: "cn-east-1" },
-  { id: "cos", name: "Tencent COS", descKey: "providers.cos", color: "#006EFF", icon: HardDrive, endpoint: "https://cos.ap-guangzhou.myqcloud.com", region: "ap-guangzhou" },
+  // 腾讯云 COS 还没有正式接入、也没有对着真实账号跑过 e2e，所以先不让用户在
+  // 向导里选到它 —— 不是「不支持」，是「还没验证过，不该假装可用」。等有了
+  // `tests/cos_e2e.rs` 并跑绿，把 `hidden` 去掉即可。条目本身保留，见 `hidden`
+  // 的注释。
+  { id: "cos", name: "Tencent COS", descKey: "providers.cos", color: "#006EFF", icon: HardDrive, endpoint: "https://cos.ap-guangzhou.myqcloud.com", region: "ap-guangzhou", hidden: true },
   { id: "b2", name: "Backblaze B2", descKey: "providers.b2", color: "#E21E29", icon: Warehouse, endpoint: "https://s3.us-west-004.backblazeb2.com", region: "us-west-004" },
   { id: "generic", name: "", nameKey: "providers.genericName", descKey: "providers.generic", color: "#7d90a0", icon: Box, endpoint: "https://", region: "" },
 ];
+
+/** 新建连接向导第一步列出的 provider —— 即 `PROVIDERS` 去掉 `hidden` 的那些。
+ *
+ * 过滤放在这里而不是渲染处：向导是唯一「让用户挑一个新 provider」的地方，但
+ * 反查 meta 的地方有好几处（侧栏、向导第二步的头部），它们**必须**能看到隐藏
+ * 条目。把规则摆在数据旁边，比让每个调用点自己记得该不该过滤更难写错。 */
+export const SELECTABLE_PROVIDERS: ProviderMeta[] = PROVIDERS.filter((p) => !p.hidden);
 
 /** Looks up display metadata for a saved connection's `provider` string,
  * falling back to the generic entry for ids this build doesn't recognize

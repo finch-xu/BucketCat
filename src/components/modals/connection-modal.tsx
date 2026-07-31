@@ -29,7 +29,7 @@ import {
   regionFormState,
   type Network,
 } from "@/lib/regions";
-import { PROVIDERS, providerMeta } from "@/lib/providers";
+import { SELECTABLE_PROVIDERS, providerMeta } from "@/lib/providers";
 import { useApp } from "@/store/app-store";
 
 /** Controlled form fields, snake_case to map 1:1 onto `ConnectionInput` --
@@ -507,7 +507,7 @@ export function ConnectionModal() {
             </button>
           </div>
           <div className="grid grid-cols-2 gap-2.5 px-[22px] pt-4 pb-6">
-            {PROVIDERS.map((p) => (
+            {SELECTABLE_PROVIDERS.map((p) => (
               <button
                 key={p.id}
                 type="button"

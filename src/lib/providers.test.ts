@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PROVIDERS, providerMeta } from "./providers";
+import { PROVIDERS, SELECTABLE_PROVIDERS, providerMeta } from "./providers";
 import { R2_REGION } from "./r2";
 import { regionCatalog, findRegion, regionFromEndpoint } from "./regions";
 
@@ -13,6 +13,25 @@ describe("PROVIDERS", () => {
     expect(PROVIDERS.some((p) => p.id === "generic")).toBe(true);
     expect(providerMeta("something-a-newer-build-saved").id).toBe("generic");
     expect(providerMeta("qiniu").id).toBe("qiniu");
+  });
+
+  // 隐藏一个 provider 必须是「向导里选不到」，而不是「从表里删掉」。两者在
+  // 向导上看起来一样，差别只在已保存的连接上才暴露：删掉之后 `providerMeta`
+  // 会静默回落到 `generic`，用户什么都没做，他那条腾讯云连接却变成了方块图标
+  // 加「通用 S3 兼容」。这条断言就是钉住这个区别的。
+  it("hides cos from the wizard while keeping it resolvable for saved connections", () => {
+    expect(SELECTABLE_PROVIDERS.some((p) => p.id === "cos")).toBe(false);
+    expect(providerMeta("cos").id).toBe("cos");
+    expect(providerMeta("cos").name).toBe("Tencent COS");
+  });
+
+  // 反过来：可选列表不能把没标 `hidden` 的 provider 漏掉，否则某个厂商会
+  // 在无人察觉的情况下从向导里消失。
+  it("offers every provider that is not explicitly hidden", () => {
+    expect(SELECTABLE_PROVIDERS.map((p) => p.id)).toEqual(
+      PROVIDERS.filter((p) => !p.hidden).map((p) => p.id),
+    );
+    expect(SELECTABLE_PROVIDERS.length).toBe(PROVIDERS.length - 1);
   });
 
   // 真正要防的失败模式是「图标名写错 / 导入被删」导致 `icon` 成了
