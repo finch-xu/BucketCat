@@ -575,6 +575,8 @@ export interface Settings {
   max_parts: number;
   share_expiry_secs: number;
   close_to_tray: boolean;
+  update_source: string;
+  auto_check_update: boolean;
 }
 
 /** Reads the whole persisted `Settings`, e.g. to initialize the Settings
@@ -655,4 +657,84 @@ export interface CleanResult {
  * `src-tauri/src/commands/settings.rs`. */
 export function cleanCheckpointResidue(): Promise<CleanResult> {
   return invokeCommand<CleanResult>("clean_checkpoint_residue");
+}
+
+// --- In-app updates -------------------------------------------------------
+//
+// Every call below is a BucketCat command, not `@tauri-apps/plugin-updater`.
+// The plugin is driven entirely from Rust (`src-tauri/src/commands/updater.rs`)
+// so the update source can be switched without a restart -- and so this file
+// stays the only place the frontend does IPC.
+
+/** One selectable update source. Mirrors `UpdateSourceDto` in
+ * `src-tauri/src/commands/updater.rs`. `id` is also the i18n lookup key
+ * (`settings.updateSourceName.<id>`); `manifest_url` is display-only, shown so
+ * users can see which host their app talks to. The list is a compile-time
+ * constant on the Rust side -- users choose among these and cannot enter a URL
+ * of their own. */
+export interface UpdateSourceDto {
+  id: string;
+  manifest_url: string;
+  /** Download page offered when this install cannot replace itself. Carried
+   * per source so a future mirror can point somewhere reachable rather than
+   * back at GitHub. */
+  release_page_url: string;
+}
+
+/** What a successful update check found. Mirrors `UpdateInfo` in
+ * `src-tauri/src/commands/updater.rs`. `body` is the manifest's release notes
+ * and is often empty. `installable` is false only for a Linux `.deb`/`.rpm`
+ * install, which cannot replace itself -- those users get a download link
+ * instead of an install button. */
+export interface UpdateInfo {
+  version: string;
+  current_version: string;
+  body: string | null;
+  installable: boolean;
+}
+
+/** Download-progress event payload, mirroring `UpdaterProgress` in
+ * `src-tauri/src/commands/updater.rs`. Arrives as `started` once,
+ * `progress` many times, then `finished` once. */
+export type UpdaterProgressEvent =
+  | { phase: "started"; content_length: number | null }
+  | { phase: "progress"; chunk_length: number }
+  | { phase: "finished" };
+
+/** Name of the update download-progress event. */
+export const UPDATE_PROGRESS_EVENT = "update://progress";
+
+/** The built-in update sources, in display order. */
+export function listUpdateSources(): Promise<UpdateSourceDto[]> {
+  return invokeCommand<UpdateSourceDto[]>("list_update_sources");
+}
+
+/** Persists which built-in source to check. Rejects an id the backend does
+ * not know rather than storing it. */
+export function setUpdateSource(id: string): Promise<void> {
+  return invokeCommand<void>("set_update_source", { id });
+}
+
+/** Persists whether to check for updates once on startup. */
+export function setAutoCheckUpdate(enabled: boolean): Promise<void> {
+  return invokeCommand<void>("set_auto_check_update", { enabled });
+}
+
+/** Checks the configured source. Resolves to `null` when already up to date;
+ * rejects with `update/check-failed` when the manifest cannot be reached. */
+export function checkForUpdate(): Promise<UpdateInfo | null> {
+  return invokeCommand<UpdateInfo | null>("check_for_update");
+}
+
+/** Downloads and applies the update, emitting `UPDATE_PROGRESS_EVENT` as it
+ * goes. Does not restart -- call `restartApp` once the user is ready. (On
+ * Windows the NSIS installer terminates the process itself, so control may
+ * never return here.) */
+export function downloadInstallUpdate(): Promise<void> {
+  return invokeCommand<void>("download_install_update");
+}
+
+/** Restarts into the freshly installed version. */
+export function restartApp(): Promise<void> {
+  return invokeCommand<void>("restart_app");
 }

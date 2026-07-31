@@ -9,9 +9,9 @@ use std::collections::HashMap;
 
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 
-/// Application-wide error. Variants are grouped into four families by the
+/// Application-wide error. Variants are grouped into five families by the
 /// prefix of their [`AppError::code`]: `auth/*`, `network/*`, `storage/*`,
-/// `local/*`, plus a catch-all `internal`.
+/// `local/*`, `update/*`, plus a catch-all `internal`.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("invalid credentials")]
@@ -50,6 +50,16 @@ pub enum AppError {
     #[error("local file io error at {path}: {message}")]
     FileIo { path: String, message: String },
 
+    /// Fetching or parsing the update manifest failed. Deliberately its own
+    /// family rather than an `Internal`: reaching GitHub is the single most
+    /// likely thing to fail for a user behind a restrictive network, and
+    /// "发生未知错误" tells them nothing about what to try next.
+    #[error("update check failed: {message}")]
+    UpdateCheckFailed { message: String },
+    /// Downloading, verifying or applying the update package failed.
+    #[error("update install failed: {message}")]
+    UpdateInstallFailed { message: String },
+
     #[error("internal error: {message}")]
     Internal { message: String },
 }
@@ -72,6 +82,8 @@ impl AppError {
             AppError::DecryptFailed => "local/decrypt-failed",
             AppError::KeyDerivationFailed => "local/key-derivation-failed",
             AppError::FileIo { .. } => "local/file-io",
+            AppError::UpdateCheckFailed { .. } => "update/check-failed",
+            AppError::UpdateInstallFailed { .. } => "update/install-failed",
             AppError::Internal { .. } => "internal",
         }
     }

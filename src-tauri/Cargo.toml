@@ -84,6 +84,19 @@ tauri-plugin-dialog = "2"
 # capability entry, since the frontend never invokes the plugin's own
 # commands.
 tauri-plugin-autostart = "2"
+# In-app updates. The second deliberate exception to the "zero new lock
+# entries" rule above (`tauri-plugin-autostart` was the first), and a much
+# larger one -- it pulls minisign verification, an archive reader and the
+# per-platform install machinery. Hand-rolling that means owning signature
+# verification of a downloaded executable, macOS bundle replacement, and the
+# Windows path where the NSIS installer takes over and kills the running
+# process. Getting any of those subtly wrong ships a remote-code-execution
+# hole, not a bug. The plugin is the same code Tauri's own release tooling
+# signs artifacts for, so it stays in lockstep with `createUpdaterArtifacts`.
+# Used from Rust only (see `commands::updater`): no npm package and no
+# capability entry, because the frontend never invokes the plugin's own
+# commands -- exactly the arrangement `tauri-plugin-autostart` already has.
+tauri-plugin-updater = "2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

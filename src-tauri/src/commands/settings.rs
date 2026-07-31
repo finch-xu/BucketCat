@@ -26,6 +26,7 @@ use crate::commands::AppState;
 use crate::error::{AppError, AppResult};
 use crate::provider::clamp_expiry;
 use crate::store::settings::{self, clamp_parts, clamp_tasks, Settings};
+use crate::updater_source;
 use crate::transfer::{
     bcpart_path, checkpoint, checkpoint_dir, plan_restore, Checkpoint, Direction, RestoreAction,
     TransferEngine,
@@ -94,7 +95,7 @@ pub fn apply_close_to_tray_setting(
 
 /// The same `<app_config_dir>/settings.json` path `lib.rs`'s `setup` loads
 /// `Settings` from at startup.
-fn settings_path(app: &AppHandle) -> AppResult<PathBuf> {
+pub(crate) fn settings_path(app: &AppHandle) -> AppResult<PathBuf> {
     let dir = app
         .path()
         .app_config_dir()
@@ -147,6 +148,30 @@ pub fn set_share_expiry(app: AppHandle, secs: u64) -> AppResult<()> {
     apply_settings_patch(&settings_path(&app)?, |s| {
         s.share_expiry_secs = clamp_expiry(secs)
     })
+}
+
+/// Persists which built-in update source to check.
+///
+/// Rejects an id this build does not know rather than storing it: the read
+/// path treats an unknown id as "use the tauri.conf.json endpoint", which is
+/// the right leniency for a file written by some *other* version but the wrong
+/// outcome for a typo arriving through the UI, where it would silently ignore
+/// the user's choice.
+#[tauri::command]
+pub fn set_update_source(app: AppHandle, id: String) -> AppResult<()> {
+    if !updater_source::is_known(&id) {
+        return Err(AppError::Internal {
+            message: format!("unknown update source: {id}"),
+        });
+    }
+    apply_settings_patch(&settings_path(&app)?, |s| s.update_source = id)
+}
+
+/// Persists whether to check for updates once on startup. Read by the
+/// frontend's updater store on mount; no runtime atomic to flip.
+#[tauri::command]
+pub fn set_auto_check_update(app: AppHandle, enabled: bool) -> AppResult<()> {
+    apply_settings_patch(&settings_path(&app)?, |s| s.auto_check_update = enabled)
 }
 
 /// Current value of the runtime resume flag.
@@ -427,6 +452,12 @@ mod tests {
                 max_parts: 8,
                 share_expiry_secs: 120,
                 close_to_tray: false,
+                // A source id this build does not know, on purpose: `load`
+                // deliberately does not validate (only the write path does),
+                // so this doubles as proof that a patch rewrites the file
+                // without normalizing away a value some other version wrote.
+                update_source: "some-future-mirror".to_string(),
+                auto_check_update: false,
             },
         )
         .unwrap();
@@ -443,6 +474,14 @@ mod tests {
             "must not reset share_expiry_secs"
         );
         assert!(!loaded.close_to_tray, "must not reset close_to_tray");
+        assert_eq!(
+            loaded.update_source, "some-future-mirror",
+            "must not reset update_source"
+        );
+        assert!(
+            !loaded.auto_check_update,
+            "must not reset auto_check_update"
+        );
     }
 
     #[test]
@@ -475,6 +514,8 @@ mod tests {
                 max_parts: 8,
                 share_expiry_secs: 120,
                 close_to_tray: true,
+                update_source: "some-future-mirror".to_string(),
+                auto_check_update: false,
             },
         )
         .unwrap();
@@ -490,6 +531,14 @@ mod tests {
         assert_eq!(
             loaded.share_expiry_secs, 120,
             "must not reset share_expiry_secs"
+        );
+        assert_eq!(
+            loaded.update_source, "some-future-mirror",
+            "must not reset update_source"
+        );
+        assert!(
+            !loaded.auto_check_update,
+            "must not reset auto_check_update"
         );
     }
 

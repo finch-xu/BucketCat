@@ -19,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { isMac } from "@/lib/platform";
 import { providerMeta } from "@/lib/providers";
 import { useApp } from "@/store/app-store";
+import { useUpdater } from "@/store/updater-store";
 import { useBuckets, useConnections } from "@/hooks/use-connections";
 import { useErrorText } from "@/hooks/use-error-text";
 import type { ConnectionDto } from "@/lib/api";
@@ -302,6 +303,7 @@ export function Sidebar() {
     openDeleteConnection,
   } = useApp();
   const connectionsQuery = useConnections();
+  const { hasUpdate } = useUpdater();
 
   return (
     <aside className="flex w-[248px] shrink-0 flex-col border-r border-border bg-sidebar">
@@ -407,6 +409,16 @@ export function Sidebar() {
         >
           <Settings className="size-4" />
           {t("sidebar.settings")}
+          {/* The only place a pending update announces itself outside the
+           * settings modal. Silent by design -- no dialog interrupts a launch
+           * (least of all a `--silent-start` one), so this dot is what makes
+           * the update discoverable at all. */}
+          {hasUpdate && (
+            <span
+              aria-label={t("settings.updateAvailableDot")}
+              className="ml-auto size-1.5 shrink-0 rounded-full bg-primary"
+            />
+          )}
         </button>
         <button
           type="button"

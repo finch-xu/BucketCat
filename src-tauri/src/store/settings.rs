@@ -32,10 +32,26 @@ pub struct Settings {
     /// worse surprise of the two.
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    /// Which built-in update source to fetch the manifest from. Values are the
+    /// `id`s in [`crate::updater_source::SOURCES`]; an unknown value (a
+    /// hand-edited file, or a source removed in a later version) falls back to
+    /// the endpoint baked into `tauri.conf.json` rather than erroring, so a
+    /// stale settings file can never lock a user out of updates entirely.
+    #[serde(default = "default_update_source")]
+    pub update_source: String,
+    /// Check for a new version once on startup. The result only ever lights a
+    /// dot on the settings entry -- nothing is downloaded and no dialog
+    /// appears -- so this defaults on.
+    #[serde(default = "default_true")]
+    pub auto_check_update: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_update_source() -> String {
+    crate::updater_source::DEFAULT_SOURCE.to_string()
 }
 
 fn default_tasks() -> usize {
@@ -58,6 +74,8 @@ impl Default for Settings {
             max_parts: default_parts(),
             share_expiry_secs: default_expiry(),
             close_to_tray: true,
+            update_source: default_update_source(),
+            auto_check_update: true,
         }
     }
 }
@@ -154,6 +172,8 @@ mod tests {
                 max_parts: 6,
                 share_expiry_secs: 120,
                 close_to_tray: false,
+                update_source: "github".to_string(),
+                auto_check_update: false,
             },
         )
         .unwrap();
@@ -163,6 +183,8 @@ mod tests {
         assert_eq!(loaded.max_parts, 6);
         assert_eq!(loaded.share_expiry_secs, 120);
         assert!(!loaded.close_to_tray);
+        assert_eq!(loaded.update_source, "github");
+        assert!(!loaded.auto_check_update);
         // 原子写不留 .tmp
         assert!(!p.with_extension("json.tmp").exists());
     }
@@ -179,6 +201,12 @@ mod tests {
         // A settings.json written before M7 has no `close_to_tray` key at
         // all; it must read back as enabled, not as `false`.
         assert!(s.close_to_tray);
+        // Same contract for the updater fields: an existing install that
+        // upgrades into the updater release must land on the GitHub source
+        // with auto-check on, not on an empty source string that would make
+        // every check fall back to the baked-in endpoint by accident.
+        assert_eq!(s.update_source, crate::updater_source::DEFAULT_SOURCE);
+        assert!(s.auto_check_update);
     }
 
     #[test]

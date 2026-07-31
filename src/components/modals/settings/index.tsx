@@ -1,16 +1,18 @@
-import { ArrowUpDown, Info, Settings2, Wrench, X, type LucideIcon } from "lucide-react";
+import { ArrowUpDown, Info, RefreshCw, Settings2, Wrench, X, type LucideIcon } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
 import { useApp } from "@/store/app-store";
+import { useUpdater } from "@/store/updater-store";
 import { AboutPane } from "./about-pane";
 import { AdvancedPane } from "./advanced-pane";
 import { GeneralPane } from "./general-pane";
 import { SectionTitle } from "./shared";
 import { TransfersPane } from "./transfers-pane";
+import { UpdatePane } from "./update-pane";
 
-type CategoryId = "general" | "transfers" | "advanced" | "about";
+type CategoryId = "general" | "transfers" | "advanced" | "update" | "about";
 
 const CATEGORIES: {
   id: CategoryId;
@@ -26,6 +28,7 @@ const CATEGORIES: {
     titleKey: "settings.transfers",
   },
   { id: "advanced", icon: Wrench, navKey: "settings.navAdvanced", titleKey: "settings.advanced" },
+  { id: "update", icon: RefreshCw, navKey: "settings.navUpdate", titleKey: "settings.update" },
   { id: "about", icon: Info, navKey: "settings.navAbout", titleKey: "settings.about" },
 ];
 
@@ -43,6 +46,7 @@ export function SettingsModal() {
 function SettingsContent() {
   const { t } = useTranslation();
   const { closeSettings } = useApp();
+  const { hasUpdate } = useUpdater();
   // Pane-local view state, deliberately not in the app store: reopening the
   // modal back on "General" is the intuitive default. It stays that way
   // because this component unmounts on close (see `SettingsModal` above),
@@ -82,6 +86,12 @@ function SettingsContent() {
             >
               <Icon className="size-[15px] shrink-0" />
               {t(navKey)}
+              {id === "update" && hasUpdate && (
+                <span
+                  aria-label={t("settings.updateAvailableDot")}
+                  className="ml-auto size-1.5 shrink-0 rounded-full bg-primary"
+                />
+              )}
             </button>
           ))}
         </nav>
@@ -98,6 +108,7 @@ function SettingsContent() {
               {id === "general" && <GeneralPane />}
               {id === "transfers" && <TransfersPane />}
               {id === "advanced" && <AdvancedPane />}
+              {id === "update" && <UpdatePane />}
               {id === "about" && <AboutPane />}
             </div>
           ))}
