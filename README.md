@@ -6,9 +6,21 @@
 
 <p align="center">简单漂亮的跨平台对象存储客户端</p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-4c566a" alt="平台">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-4c8eda" alt="许可证">
+  <img src="https://img.shields.io/badge/Tauri-2-24c8db" alt="Tauri 2">
+  <img src="https://img.shields.io/badge/Rust-1.94%2B-ce422b" alt="Rust 1.94+">
+  <img src="https://img.shields.io/badge/React-19-61dafb" alt="React 19">
+</p>
+
 <p align="center"><b>简体中文</b> · <a href="README.en.md">English</a> · <a href="https://deepwiki.com/finch-xu/BucketCat">DeepWiki</a></p>
 
 ---
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="BucketCat 主界面">
+</p>
 
 ## 功能特性
 
@@ -30,11 +42,11 @@
 | Amazon S3 | |
 | Cloudflare R2 | 填账号 ID 即可，端点自动生成 |
 | MinIO | 自建，填自己的服务地址 |
-| RustFS | 自建，填自己的服务地址 |
+| [RustFS](https://github.com/rustfs/rustfs) | 自建，填自己的服务地址 |
 | 阿里云 OSS | 按地域选择端点 |
 | 腾讯云 COS | 一条连接对应一个地域，跨地域请分别新建 |
 | 七牛云 Kodo | 按地域选择端点 |
-| 雨云 ROS | 按地域选择端点 |
+| [雨云 ROS](https://www.rainyun.com/ODA1MzUy_?s=bucketcat) | 按地域选择端点 |
 | Backblaze B2 | 需用应用密钥（非主密钥），地区自动识别 |
 | 通用 S3 兼容 | 上面没有的服务，手填端点和地域即可接入 |
 

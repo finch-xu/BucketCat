@@ -6,9 +6,21 @@
 
 <p align="center">A simple, beautiful object storage client for macOS, Windows, and Linux</p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-4c566a" alt="Platform">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-4c8eda" alt="License">
+  <img src="https://img.shields.io/badge/Tauri-2-24c8db" alt="Tauri 2">
+  <img src="https://img.shields.io/badge/Rust-1.94%2B-ce422b" alt="Rust 1.94+">
+  <img src="https://img.shields.io/badge/React-19-61dafb" alt="React 19">
+</p>
+
 <p align="center"><a href="README.md">简体中文</a> · <b>English</b> · <a href="https://deepwiki.com/finch-xu/BucketCat">DeepWiki</a></p>
 
 ---
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="The BucketCat main window">
+</p>
 
 ## Features
 
@@ -30,11 +42,11 @@ Pick a provider when creating a connection and the endpoint and region are fille
 | Amazon S3 | |
 | Cloudflare R2 | Enter your account ID; the endpoint is derived from it |
 | MinIO | Self-hosted — point it at your own server |
-| RustFS | Self-hosted — point it at your own server |
+| [RustFS](https://github.com/rustfs/rustfs) | Self-hosted — point it at your own server |
 | Aliyun OSS | Endpoint follows the region you choose |
 | Tencent COS | One connection covers one region; add a separate connection per region |
 | Qiniu Kodo | Endpoint follows the region you choose |
-| Rainyun ROS | Endpoint follows the region you choose |
+| [Rainyun ROS](https://www.rainyun.com/ODA1MzUy_?s=bucketcat) | Endpoint follows the region you choose |
 | Backblaze B2 | Requires an application key, not the master key; the region is detected for you |
 | Generic S3-compatible | Anything not listed above — enter the endpoint and region by hand |
 
