@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/React-19-61dafb" alt="React 19">
 </p>
 
-<p align="center"><b>简体中文</b> · <a href="README.en.md">English</a> · <a href="https://deepwiki.com/finch-xu/BucketCat">DeepWiki</a></p>
+<p align="center"><b>简体中文</b> · <a href="README.en.md">English</a> · <a href="https://deepwiki.com/finch-xu/BucketCat">DeepWiki</a> · <a href="https://bucketcat.pidan.dev/">官方网站 bucketcat.pidan.dev</a></p>
 
 ---
 
