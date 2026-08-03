@@ -314,6 +314,15 @@ mod tests {
         // every check fall back to the baked-in endpoint by accident.
         assert_eq!(s.update_source, crate::updater_source::DEFAULT_SOURCE);
         assert!(s.auto_check_update);
+        // New transfer tuning fields must default to balanced preset values
+        assert_eq!(s.transfer_preset, "balanced");
+        let balanced = crate::transfer::TransferTuning::balanced();
+        assert_eq!(s.upload_threshold, balanced.upload_threshold);
+        assert_eq!(s.upload_part_floor, balanced.upload_part_floor);
+        assert_eq!(s.upload_target_parts, balanced.upload_target_parts);
+        assert_eq!(s.download_threshold, balanced.download_threshold);
+        assert_eq!(s.download_chunk_floor, balanced.download_chunk_floor);
+        assert_eq!(s.download_target_parts, balanced.download_target_parts);
     }
 
     #[test]
@@ -322,6 +331,29 @@ mod tests {
         assert_eq!(clamp_tasks(99), 5);
         assert_eq!(clamp_parts(0), 1);
         assert_eq!(clamp_parts(99), 8);
+    }
+
+    #[test]
+    fn clamps_transfer_tuning_ranges() {
+        const MB: u64 = 1024 * 1024;
+        // clamp_threshold: [16MB, 1GB]
+        assert_eq!(clamp_threshold(1), 16 * MB);
+        assert_eq!(clamp_threshold(16 * MB), 16 * MB);
+        assert_eq!(clamp_threshold(500 * MB), 500 * MB);
+        assert_eq!(clamp_threshold(1024 * MB), 1024 * MB);
+        assert_eq!(clamp_threshold(2 * 1024 * MB), 1024 * MB);
+        // clamp_part_floor: [8MB, 256MB]
+        assert_eq!(clamp_part_floor(1), 8 * MB);
+        assert_eq!(clamp_part_floor(8 * MB), 8 * MB);
+        assert_eq!(clamp_part_floor(100 * MB), 100 * MB);
+        assert_eq!(clamp_part_floor(256 * MB), 256 * MB);
+        assert_eq!(clamp_part_floor(512 * MB), 256 * MB);
+        // clamp_target_parts: [4, 1000]
+        assert_eq!(clamp_target_parts(0), 4);
+        assert_eq!(clamp_target_parts(4), 4);
+        assert_eq!(clamp_target_parts(32), 32);
+        assert_eq!(clamp_target_parts(1000), 1000);
+        assert_eq!(clamp_target_parts(99_999), 1000);
     }
 
     #[test]
@@ -363,11 +395,37 @@ mod tests {
 
     #[test]
     fn tuning_clamps_hand_edited_values() {
+        const MB: u64 = 1024 * 1024;
         let mut s = Settings::default();
+        // Test lower bounds
         s.upload_threshold = 1;            // 低于 16MB 下限
-        s.download_target_parts = 999_999; // 高于 1000 上限
+        s.upload_part_floor = 1;           // 低于 8MB 下限
+        s.download_threshold = 1;          // 低于 16MB 下限
+        s.download_chunk_floor = 1;        // 低于 8MB 下限
+        s.upload_target_parts = 2;         // 低于 4 下限
+        s.download_target_parts = 2;       // 低于 4 下限
         let t = s.tuning();
-        assert_eq!(t.upload_threshold, 16 * 1024 * 1024);
-        assert_eq!(t.download_target_parts, 1000);
+        assert_eq!(t.upload_threshold, 16 * MB, "upload_threshold lower bound");
+        assert_eq!(t.upload_part_floor, 8 * MB, "upload_part_floor lower bound");
+        assert_eq!(t.download_threshold, 16 * MB, "download_threshold lower bound");
+        assert_eq!(t.download_chunk_floor, 8 * MB, "download_chunk_floor lower bound");
+        assert_eq!(t.upload_target_parts, 4, "upload_target_parts lower bound");
+        assert_eq!(t.download_target_parts, 4, "download_target_parts lower bound");
+
+        // Test upper bounds
+        let mut s = Settings::default();
+        s.upload_threshold = 2 * 1024 * MB;         // 高于 1GB 上限
+        s.upload_part_floor = 512 * MB;             // 高于 256MB 上限
+        s.download_threshold = 2 * 1024 * MB;       // 高于 1GB 上限
+        s.download_chunk_floor = 512 * MB;          // 高于 256MB 上限
+        s.upload_target_parts = 999_999;            // 高于 1000 上限
+        s.download_target_parts = 999_999;          // 高于 1000 上限
+        let t = s.tuning();
+        assert_eq!(t.upload_threshold, 1024 * MB, "upload_threshold upper bound");
+        assert_eq!(t.upload_part_floor, 256 * MB, "upload_part_floor upper bound");
+        assert_eq!(t.download_threshold, 1024 * MB, "download_threshold upper bound");
+        assert_eq!(t.download_chunk_floor, 256 * MB, "download_chunk_floor upper bound");
+        assert_eq!(t.upload_target_parts, 1000, "upload_target_parts upper bound");
+        assert_eq!(t.download_target_parts, 1000, "download_target_parts upper bound");
     }
 }
