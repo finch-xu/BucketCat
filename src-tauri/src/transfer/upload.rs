@@ -25,6 +25,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,7 +34,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, AppResult};
-use crate::provider::{Provider, UploadedPart};
+use crate::provider::{BodyProgress, BodyProgressFn, Provider, UploadedPart};
 use crate::transfer::engine::{
     CheckpointWriter, MultipartState, ResumeState, RunOutcome, StopKind, TaskContext,
     TransferRunner,
@@ -108,6 +109,11 @@ struct UploadJob {
     token: CancellationToken,
     stop: StopFn,
     progress: ProgressFn,
+    /// Rolls back bytes a failed or abandoned provider-call attempt already
+    /// reported, before the retry loop decides to retry or fail (Task 3).
+    /// Wired to [`crate::transfer::ProgressHandle::retract`] exactly as
+    /// `progress` is wired to `add` -- mirrors `DownloadJob.regress`.
+    regress: ProgressFn,
     /// Reports a transient in-flight retry notice (Task 7). Cloned straight
     /// from [`TaskContext::notice`]; every `with_retry` call site gets its own
     /// clone (or a further clone into a spawned part task).
@@ -123,6 +129,7 @@ impl UploadJob {
     fn from_context(ctx: &TaskContext) -> Self {
         let control = ctx.control.clone();
         let progress = ctx.progress.clone();
+        let regress_handle = ctx.progress.clone();
         Self {
             task_id: ctx.task.id.clone(),
             bucket: ctx.task.bucket.clone(),
@@ -136,6 +143,7 @@ impl UploadJob {
             // stop intent.
             stop: Arc::new(move || control.requested()),
             progress: Arc::new(move |bytes| progress.add(bytes)),
+            regress: Arc::new(move |bytes| regress_handle.retract(bytes)),
             notice: Arc::clone(&ctx.notice),
             resume: Arc::clone(&ctx.resume),
             checkpoint: ctx.checkpoint.clone(),
@@ -148,6 +156,10 @@ impl UploadJob {
 
     fn report(&self, bytes: u64) {
         (*self.progress)(bytes);
+    }
+
+    fn regress(&self, bytes: u64) {
+        (*self.regress)(bytes);
     }
 
     /// Mirrors `state` to the checkpoint file (coalesced/gated/best-effort);
@@ -221,24 +233,92 @@ where
     }
 }
 
+/// Builds the [`BodyProgressFn`] for one provider-call attempt: `Sent(n)`
+/// (the transport pulled `n` more bytes from the request body) adds to both
+/// `attempt_reported` and the live progress bar; `Rewound(n)` (the SDK
+/// rebuilding the body for its own internal retry) undoes both. See
+/// `upload_single`'s doc comment on `attempt_reported` for the accounting
+/// scheme this is one piece of.
+fn attempt_body_progress(
+    attempt_reported: &Arc<AtomicU64>,
+    progress: &ProgressFn,
+    regress: &ProgressFn,
+) -> BodyProgressFn {
+    let attempt_reported = Arc::clone(attempt_reported);
+    let progress = Arc::clone(progress);
+    let regress = Arc::clone(regress);
+    Arc::new(move |event| match event {
+        BodyProgress::Sent(n) => {
+            attempt_reported.fetch_add(n, Ordering::SeqCst);
+            progress(n);
+        }
+        BodyProgress::Rewound(n) => {
+            let _ = attempt_reported.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                Some(cur.saturating_sub(n))
+            });
+            regress(n);
+        }
+    })
+}
+
 async fn upload_single<P>(job: &UploadJob, provider: Arc<P>, length: u64) -> AppResult<RunOutcome>
 where
     P: Provider + Send + Sync + 'static,
 {
     tracing::info!(task = %job.task_id, bytes = length, "uploading as a single stream");
 
+    // Bytes this call's request body has reported `Sent` to the progress bar
+    // but the server has not (yet, or ever) confirmed by returning `Ok`.
+    // Declared here, outside the `with_retry` closure, because `with_retry`'s
+    // signature stays generic over `T` and gives the caller no hook into a
+    // cancelled attempt -- this is the one channel by which a mid-flight
+    // `Ok(None)` (the token fired while `PutObject` was still in flight,
+    // dropping the future before it resolved) can still be retracted after
+    // the fact.
+    //
+    // Accounting scheme (mirrored in `upload_one_part`):
+    // - Reset to 0 at the top of every attempt: a defensive no-op in the
+    //   normal case (the previous attempt's `Err` path below already cleaned
+    //   up before returning), but it means a bug in that cleanup shows up as
+    //   under-reporting, never as a permanent phantom balance.
+    // - `Sent(n)` adds to both this counter and the live progress bar;
+    //   `Rewound(n)` (an SDK-internal retry rebuilding the body) undoes both.
+    // - `Err` retracts and zeroes the counter before returning, so a retried
+    //   attempt starts from a clean slate.
+    // - `Ok` leaves the counter holding this attempt's net total so the code
+    //   after `with_retry` can true it up against `length`.
+    // - `with_retry` returning `Ok(None)` (cancelled) retracts whatever the
+    //   aborted attempt left behind.
+    //
+    // Invariant: every byte ever added here is either (a) still held by a
+    // live counter that will be trued-up or retracted, or (b) has already
+    // been retracted -- never both, never neither.
+    let attempt_reported = Arc::new(AtomicU64::new(0));
+
     let put = with_retry(&job.token, &job.notice, || {
         let provider = Arc::clone(&provider);
         let bucket = job.bucket.clone();
         let key = job.key.clone();
         let path = job.path.clone();
+        let attempt_reported = Arc::clone(&attempt_reported);
+        let progress = Arc::clone(&job.progress);
+        let regress = Arc::clone(&job.regress);
         async move {
-            provider
-                // Task 3 wires this into real per-body progress; for now a
-                // no-op keeps the trait's new parameter satisfied without
-                // changing upload behavior.
-                .put_object_from_file(&bucket, &key, &path, length, Arc::new(|_| {}))
-                .await
+            let leftover = attempt_reported.swap(0, Ordering::SeqCst);
+            if leftover > 0 {
+                regress(leftover);
+            }
+            let body_progress = attempt_body_progress(&attempt_reported, &progress, &regress);
+            let result = provider
+                .put_object_from_file(&bucket, &key, &path, length, body_progress)
+                .await;
+            if result.is_err() {
+                let counted = attempt_reported.swap(0, Ordering::SeqCst);
+                if counted > 0 {
+                    regress(counted);
+                }
+            }
+            result
         }
     })
     .await?;
@@ -247,13 +327,26 @@ where
         // The token fired, so `PutObject` was abandoned rather than observed
         // succeeding: neither the bytes nor the completion may be claimed. No
         // cleanup is owed -- a single `PutObject` writes the whole object or
-        // nothing, and there is no multipart state to abort.
+        // nothing, and there is no multipart state to abort. Whatever this
+        // aborted attempt had already reported must still come back off the
+        // bar, though.
+        let counted = attempt_reported.swap(0, Ordering::SeqCst);
+        if counted > 0 {
+            job.regress(counted);
+        }
         return Ok(RunOutcome::Stopped);
     }
 
     // Truthful only here: the request returned `Ok`, so the object exists even
-    // if a stop was requested while it was in flight.
-    job.report(length);
+    // if a stop was requested while it was in flight. The incremental `Sent`
+    // notches already moved the bar close to `length`; true up whatever
+    // coalescing (`PROGRESS_QUANTUM`) left short.
+    let counted = attempt_reported.load(Ordering::SeqCst);
+    debug_assert!(
+        counted <= length,
+        "a successful upload attempt must never report more than it sent"
+    );
+    job.report(length - counted);
     Ok(RunOutcome::Completed)
 }
 
@@ -420,11 +513,12 @@ where
         let target = Arc::clone(&target);
         let token = part_token.clone();
         let progress = Arc::clone(&job.progress);
+        let regress = Arc::clone(&job.regress);
         let notice = Arc::clone(&job.notice);
 
         set.spawn(async move {
             let _permit = permit;
-            upload_one_part(provider, target, spec, token, progress, notice).await
+            upload_one_part(provider, target, spec, token, progress, regress, notice).await
         });
     }
 
@@ -547,19 +641,29 @@ async fn upload_one_part<P>(
     spec: PartSpec,
     token: CancellationToken,
     progress: ProgressFn,
+    regress: ProgressFn,
     notice: NoticeFn,
 ) -> AppResult<Option<UploadedPart>>
 where
     P: Provider + Send + Sync + 'static,
 {
+    // See `upload_single`'s doc comment on `attempt_reported` for the
+    // accounting scheme; this is the per-part mirror of it.
+    let attempt_reported = Arc::new(AtomicU64::new(0));
+
     let etag = with_retry(&token, &notice, || {
         let provider = Arc::clone(&provider);
         let target = Arc::clone(&target);
+        let attempt_reported = Arc::clone(&attempt_reported);
+        let progress = Arc::clone(&progress);
+        let regress = Arc::clone(&regress);
         async move {
-            provider
-                // Task 3 wires this into real per-body progress; for now a
-                // no-op keeps the trait's new parameter satisfied without
-                // changing upload behavior.
+            let leftover = attempt_reported.swap(0, Ordering::SeqCst);
+            if leftover > 0 {
+                regress(leftover);
+            }
+            let body_progress = attempt_body_progress(&attempt_reported, &progress, &regress);
+            let result = provider
                 .upload_part_from_file(
                     &target.bucket,
                     &target.key,
@@ -568,17 +672,40 @@ where
                     &target.path,
                     spec.offset,
                     spec.length,
-                    Arc::new(|_| {}),
+                    body_progress,
                 )
-                .await
+                .await;
+            if result.is_err() {
+                let counted = attempt_reported.swap(0, Ordering::SeqCst);
+                if counted > 0 {
+                    regress(counted);
+                }
+            }
+            result
         }
     })
     .await?;
 
     let Some(etag) = etag else {
+        // Cancelled mid-flight: whatever this aborted attempt already
+        // reported must come back off the bar. Only this part's in-flight
+        // count is affected -- sibling parts that already finished keep
+        // their reports.
+        let counted = attempt_reported.swap(0, Ordering::SeqCst);
+        if counted > 0 {
+            regress(counted);
+        }
         return Ok(None);
     };
-    progress(spec.length);
+
+    // Incremental `Sent` notches already moved the bar close to
+    // `spec.length`; true up whatever coalescing left short.
+    let counted = attempt_reported.load(Ordering::SeqCst);
+    debug_assert!(
+        counted <= spec.length,
+        "a successful part upload must never report more than it sent"
+    );
+    progress(spec.length - counted);
     Ok(Some(UploadedPart {
         number: spec.number,
         etag,
@@ -650,15 +777,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+
+    use tokio::sync::Notify;
 
     use crate::provider::{BatchResult, BodyProgressFn, Bucket, ListPage, ObjectHead};
 
     const UPLOAD_ID: &str = "u-1";
+    const MB: u64 = 1024 * 1024;
 
     /// The default (balanced) preset's upload threshold -- 32MB. Multipart-
     /// trigger sizes below are expressed relative to this and `part_floor()`
@@ -763,6 +893,52 @@ mod tests {
         }
     }
 
+    /// A one-shot rendezvous a scripted upload call parks on after applying a
+    /// triggering `Sent` notch, so a test can observe progress strictly
+    /// between two notches -- or fire a cancel while the call is genuinely
+    /// still in flight -- instead of racing a real concurrent write against
+    /// the runner.
+    ///
+    /// `pass` is called from inside the fake: it signals `reached` (so a test
+    /// already waiting on it wakes up) and then blocks on `release`. A test
+    /// either calls `open()` to let the call continue, or -- for a cancel
+    /// test -- never does, and instead fires the stop switch; the runner's
+    /// own `with_retry` select then drops the parked call's future outright,
+    /// which is exactly the "abandoned mid-flight" case under test.
+    #[derive(Default)]
+    struct Gate {
+        reached: Notify,
+        release: Notify,
+    }
+
+    impl Gate {
+        async fn pass(&self) {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+
+        /// Test-side: block until a scripted call reaches its pause point.
+        async fn wait(&self) {
+            self.reached.notified().await;
+        }
+
+        /// Test-side: let a parked call continue.
+        fn open(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    /// Identifies exactly which scripted part call should park on
+    /// `FakeProvider::part_gate`: the `attempt`'th call (1-based, retries
+    /// included) to part `part`, right after it has applied the notch at
+    /// index `after` (0-based).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PartPause {
+        part: i32,
+        attempt: u32,
+        after: usize,
+    }
+
     /// A stand-in for [`crate::transfer::TaskControl`], whose constructor is
     /// private to the engine. Writes the intent *before* firing the token,
     /// exactly as the real one does, so a reader woken by the token is always
@@ -830,6 +1006,25 @@ mod tests {
         /// the checkpoint claims part 1 is done -- which is exactly the case
         /// the server-authoritative reconciliation must get right.
         listed: StdMutex<Vec<UploadedPart>>,
+        /// `Sent`-notch sizes `put_object_from_file` emits, in order, before
+        /// it resolves -- simulates the transport pulling the single-stream
+        /// body incrementally. Empty (the default) emits nothing, matching
+        /// every pre-existing single-stream test's expectations.
+        put_notches: Vec<u64>,
+        /// If set, `put_object_from_file` parks on `put_gate` right after
+        /// applying the notch at this index (0-based).
+        put_pause_after: Option<usize>,
+        put_gate: Arc<Gate>,
+        /// part_number -> queue of `Sent`-notch sequences, one popped per
+        /// call attempt -- so a retried part can script a different sequence
+        /// for its second attempt than its first. A part with no entry (or
+        /// an exhausted queue) gets no notches, matching every pre-existing
+        /// multipart test's expectations.
+        part_notches: StdMutex<HashMap<i32, VecDeque<Vec<u64>>>>,
+        /// If set, the matching call to `upload_part_from_file` parks on
+        /// `part_gate` right after applying the triggering notch.
+        part_pause: Option<PartPause>,
+        part_gate: Arc<Gate>,
     }
 
     impl FakeProvider {
@@ -850,6 +1045,12 @@ mod tests {
                 abort_fails: false,
                 complete_fails: false,
                 listed: StdMutex::new(Vec::new()),
+                put_notches: Vec::new(),
+                put_pause_after: None,
+                put_gate: Arc::new(Gate::default()),
+                part_notches: StdMutex::new(HashMap::new()),
+                part_pause: None,
+                part_gate: Arc::new(Gate::default()),
             }
         }
 
@@ -962,10 +1163,16 @@ mod tests {
             _key: &str,
             _path: &Path,
             _length: u64,
-            _progress: BodyProgressFn,
+            progress: BodyProgressFn,
         ) -> AppResult<()> {
             if !self.op_delay.is_zero() {
                 tokio::time::sleep(self.op_delay).await;
+            }
+            for (i, n) in self.put_notches.iter().enumerate() {
+                progress(BodyProgress::Sent(*n));
+                if self.put_pause_after == Some(i) {
+                    self.put_gate.pass().await;
+                }
             }
             // Counted *after* the delay, so `puts()` means "puts the server
             // accepted" rather than "puts that were started and possibly
@@ -989,13 +1196,15 @@ mod tests {
             _path: &Path,
             _offset: u64,
             _length: u64,
-            _progress: BodyProgressFn,
+            progress: BodyProgressFn,
         ) -> AppResult<String> {
             assert_eq!(
                 upload_id, UPLOAD_ID,
                 "parts must be sent under the id multipart_init returned"
             );
             self.attempts.lock().unwrap().push(part_number);
+            // 1-based: the count above just recorded this call.
+            let attempt_no = self.attempts_of(part_number) as u32;
 
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(live, Ordering::SeqCst);
@@ -1003,6 +1212,27 @@ mod tests {
                 tokio::time::sleep(self.op_delay).await;
             }
             self.live.fetch_sub(1, Ordering::SeqCst);
+
+            let notches = self
+                .part_notches
+                .lock()
+                .unwrap()
+                .get_mut(&part_number)
+                .and_then(|queue| queue.pop_front())
+                .unwrap_or_default();
+            for (i, n) in notches.into_iter().enumerate() {
+                progress(BodyProgress::Sent(n));
+                let pause = self.part_pause;
+                if pause
+                    == Some(PartPause {
+                        part: part_number,
+                        attempt: attempt_no,
+                        after: i,
+                    })
+                {
+                    self.part_gate.pass().await;
+                }
+            }
 
             let stop_at = *self.stop_at_part.lock().unwrap();
             if let Some((number, kind)) = stop_at {
@@ -1113,6 +1343,10 @@ mod tests {
         provider: Arc<FakeProvider>,
         resume: Arc<Mutex<Option<ResumeState>>>,
         reported: Arc<AtomicU64>,
+        /// Cumulative bytes `regress` has retracted -- gross, like `reported`,
+        /// so `reported() - retracted()` is the net figure the real progress
+        /// bar would show (Task 3, mirrors download.rs's `regressed`).
+        retracted: Arc<AtomicU64>,
         part_limit: usize,
         /// Every notice `with_retry` emitted, in arrival order -- `Some` for a
         /// retryable failure, `None` for the clear that follows an eventual
@@ -1129,6 +1363,7 @@ mod tests {
             provider: Arc::new(provider),
             resume: Arc::new(Mutex::new(None)),
             reported: Arc::new(AtomicU64::new(0)),
+            retracted: Arc::new(AtomicU64::new(0)),
             part_limit,
             notices: Arc::new(StdMutex::new(Vec::new())),
         }
@@ -1138,6 +1373,7 @@ mod tests {
         fn job(&self) -> UploadJob {
             let switch = Arc::clone(&self.switch);
             let reported = Arc::clone(&self.reported);
+            let retracted = Arc::clone(&self.retracted);
             let notices = Arc::clone(&self.notices);
             UploadJob {
                 task_id: "task-1".to_string(),
@@ -1152,6 +1388,9 @@ mod tests {
                 stop: Arc::new(move || switch.requested()),
                 progress: Arc::new(move |bytes| {
                     reported.fetch_add(bytes, Ordering::SeqCst);
+                }),
+                regress: Arc::new(move |bytes| {
+                    retracted.fetch_add(bytes, Ordering::SeqCst);
                 }),
                 notice: Arc::new(move |n| notices.lock().unwrap().push(n)),
                 resume: Arc::clone(&self.resume),
@@ -1184,6 +1423,10 @@ mod tests {
 
         fn reported(&self) -> u64 {
             self.reported.load(Ordering::SeqCst)
+        }
+
+        fn retracted(&self) -> u64 {
+            self.retracted.load(Ordering::SeqCst)
         }
 
         /// Like `job`, but pointed at a real file instead of `job()`'s
@@ -1907,5 +2150,179 @@ mod tests {
             .await
             .expect("a rejected commit must leave the upload id behind for a retry");
         assert_eq!(state.upload_id, UPLOAD_ID);
+    }
+
+    // ---- Task 3: incremental progress + retry-safe rollback ---------------
+    //
+    // Below `upload_single`/`upload_one_part` used to report a whole
+    // file/part's length in one shot, only once the provider call returned
+    // `Ok`. Now the body reports `Sent` notches as the transport pulls it, so
+    // the bar can move while a large upload is still in flight -- which
+    // means a failed, cancelled or rewound attempt can leave bytes on the
+    // bar that the server never actually kept. These four tests are the
+    // conservation invariant from the task brief: `reported - retracted`
+    // never overstates what the server holds, and lands exactly on the true
+    // length once a part/file lands.
+
+    #[tokio::test]
+    async fn sent_notches_move_the_bar_before_the_put_resolves_and_true_up_covers_the_rest() {
+        let total = 20 * MB;
+        assert!(
+            total < threshold(),
+            "this exercises the single-stream path, not multipart"
+        );
+
+        let rig = Arc::new(rig(4, |fake| {
+            fake.put_notches = vec![8 * MB, 8 * MB, 4 * MB];
+            fake.put_pause_after = Some(0);
+        }));
+
+        let runner = {
+            let rig = Arc::clone(&rig);
+            tokio::spawn(async move { rig.run(total).await })
+        };
+
+        // Parked right after the first notch: the put has not resolved yet,
+        // so this is strictly "before completion".
+        rig.provider.put_gate.wait().await;
+        let mid_flight = rig.reported();
+        assert!(
+            mid_flight > 0 && mid_flight < total,
+            "the first Sent notch must move the bar before PutObject resolves, but not claim \
+             the whole file yet: reported={mid_flight}"
+        );
+        rig.provider.put_gate.open();
+
+        let outcome = runner.await.unwrap().unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.reported(),
+            total,
+            "true-up must land the bar exactly on the full length once PutObject succeeds"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_parts_failed_attempt_retracts_exactly_what_it_sent_and_the_retry_true_ups_the_rest()
+    {
+        let rig = rig(4, |fake| {
+            fake.failures
+                .lock()
+                .unwrap()
+                .insert(1, (1, Fail::Transient));
+            fake.part_notches
+                .lock()
+                .unwrap()
+                .insert(1, VecDeque::from(vec![vec![5 * MB]]));
+        });
+
+        let outcome = rig.run(threshold()).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.attempts_of(1),
+            2,
+            "one timeout must cost one retry, not the task"
+        );
+        assert_eq!(
+            rig.retracted(),
+            5 * MB,
+            "the failed attempt's 5MB must be retracted before the retry, not left dangling"
+        );
+        assert_eq!(
+            rig.reported() - rig.retracted(),
+            threshold(),
+            "no permanent over-count despite the retry: net reported (gross reported minus \
+             what was retracted) must land exactly on the total"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_mid_part_retracts_only_that_parts_in_flight_bytes() {
+        // part_limit=1 so the two parts run strictly in sequence: part 1
+        // finishes normally (nothing to retract), then part 2 is caught
+        // mid-flight and cancelled. "已完成片保留" -- part 1's report must
+        // survive; only part 2's dangling bytes come back off the bar.
+        let rig = Arc::new(rig(1, |fake| {
+            fake.part_notches
+                .lock()
+                .unwrap()
+                .insert(2, VecDeque::from(vec![vec![5 * MB]]));
+            fake.part_pause = Some(PartPause {
+                part: 2,
+                attempt: 1,
+                after: 0,
+            });
+        }));
+
+        let runner = {
+            let rig = Arc::clone(&rig);
+            tokio::spawn(async move { rig.run(threshold()).await })
+        };
+
+        // Part 2 has sent 5MB and is parked mid-attempt, still "in flight".
+        rig.provider.part_gate.wait().await;
+        assert_eq!(
+            rig.reported(),
+            part_floor() + 5 * MB,
+            "part 1 landed in full and part 2's first notch already moved the bar"
+        );
+        rig.switch.request(StopKind::Cancel);
+        // Never opened: the runner's own `with_retry` select drops the
+        // parked call once the token fires, which is the abandonment this
+        // test exercises.
+
+        let outcome = runner.await.unwrap().unwrap();
+
+        assert_eq!(outcome, RunOutcome::Stopped);
+        assert_eq!(
+            rig.provider.aborts(),
+            1,
+            "a cancel must abort the multipart upload"
+        );
+        assert!(rig.provider.never_assembled());
+        assert_eq!(
+            rig.retracted(),
+            5 * MB,
+            "exactly the aborted attempt's in-flight bytes must be retracted -- no more, no less"
+        );
+        assert_eq!(
+            rig.reported() - rig.retracted(),
+            part_floor(),
+            "net reported must fall back to only the completed part; the cancelled part's \
+             in-flight bytes must net to zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_parts_completion_true_ups_reported_to_exactly_the_completed_length_sum() {
+        // Four parts, each scripted to stream a different, partial amount of
+        // its own length before the fake resolves the call. True-up must
+        // make each one up to exactly its own length -- never more, never
+        // less -- however the parts interleave under real concurrency.
+        let rig = rig(4, |fake| {
+            let mut notches = fake.part_notches.lock().unwrap();
+            notches.insert(1, VecDeque::from(vec![vec![3 * MB]]));
+            notches.insert(2, VecDeque::from(vec![vec![7 * MB]]));
+            notches.insert(3, VecDeque::from(vec![vec![MB, 2 * MB]]));
+            notches.insert(4, VecDeque::from(vec![vec![]]));
+        });
+
+        let outcome = rig.run(4 * part_floor()).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(rig.provider.assembled_numbers(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            rig.reported(),
+            4 * part_floor(),
+            "every part's Sent notches plus its true-up must sum to exactly its own length -- \
+             summed across all four parts, reported must equal the total exactly"
+        );
+        assert_eq!(
+            rig.retracted(),
+            0,
+            "nothing failed or was cancelled, so nothing should ever have been retracted"
+        );
     }
 }
