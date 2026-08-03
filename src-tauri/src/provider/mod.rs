@@ -17,6 +17,8 @@ pub mod s3;
 pub use hub::ProviderHub;
 pub use s3::{from_connection, is_aws_endpoint, S3Provider};
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +139,41 @@ pub struct ObjectHead {
     pub content_type: Option<String>,
 }
 
+/// A progress notch from an upload request body as the transport pulls bytes
+/// out of it -- **not** as the server acknowledges them, so this always runs
+/// ahead of a true "bytes safely on the server" figure. See
+/// [`crate::provider::s3`]'s counting body (module doc / `counting_body_range`)
+/// for the exact coalescing and rewind contract that produces these.
+///
+/// - `Sent(n)`: `n` more bytes were pulled from the body since the last
+///   event (this attempt's own progress, coalesced to whole
+///   [`PROGRESS_QUANTUM`]s plus a final tail flush at EOF) -- **not** a
+///   running total.
+/// - `Rewound(n)`: the body is being rebuilt for a retry (the SDK's own
+///   internal retry, not the app-level one in `crate::transfer`), so the `n`
+///   bytes already reported `Sent` for the attempt just abandoned must be
+///   subtracted back out by the receiver before any new `Sent` for the
+///   fresh attempt is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyProgress {
+    Sent(u64),
+    Rewound(u64),
+}
+
+/// A sink for [`BodyProgress`] notches, threaded into [`Provider::put_object_from_file`]
+/// and [`Provider::upload_part_from_file`]. `Arc`-wrapped (rather than a bare
+/// `Box<dyn Fn>`) because the same callback is cloned into every retry
+/// rebuild of the same request body, and cloning an `Arc` is the cheap way to
+/// share it across those without re-boxing per attempt.
+pub type BodyProgressFn = Arc<dyn Fn(BodyProgress) + Send + Sync>;
+
+/// The coalescing granularity for [`BodyProgress::Sent`]: a counting body
+/// buffers reads and only emits once at least this many un-reported bytes
+/// have accumulated (plus a final flush of whatever's left at EOF), so a
+/// multi-GB upload doesn't turn into one callback invocation per 8-64KB
+/// transport read.
+pub const PROGRESS_QUANTUM: u64 = 1024 * 1024;
+
 /// Admin-plane operations against an object storage backend.
 ///
 /// Implementations (currently just [`S3Provider`]) must not leak any
@@ -219,12 +256,18 @@ pub trait Provider {
 
     /// Uploads the first `length` bytes of `path` as a single `PutObject`.
     /// Used for files below the multipart threshold.
+    ///
+    /// `progress` is called with [`BodyProgress`] notches as the request
+    /// body is read by the transport -- see that type's doc comment for the
+    /// exact contract. Implementations that don't build a counting body
+    /// (none currently) are free to never call it.
     async fn put_object_from_file(
         &self,
         bucket: &str,
         key: &str,
         path: &std::path::Path,
         length: u64,
+        progress: BodyProgressFn,
     ) -> AppResult<()>;
 
     /// Starts a multipart upload, returning the server's `upload_id`.
@@ -232,6 +275,8 @@ pub trait Provider {
 
     /// Uploads `path[offset .. offset + length]` as part `part_number`
     /// (1-based), returning the part's ETag.
+    ///
+    /// `progress` -- see [`Provider::put_object_from_file`]'s doc comment.
     #[allow(clippy::too_many_arguments)]
     async fn upload_part_from_file(
         &self,
@@ -242,6 +287,7 @@ pub trait Provider {
         path: &std::path::Path,
         offset: u64,
         length: u64,
+        progress: BodyProgressFn,
     ) -> AppResult<String>;
 
     /// Assembles the object from `parts`. The implementation sorts by part

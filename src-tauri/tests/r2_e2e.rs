@@ -305,7 +305,7 @@ async fn batch_delete_uses_the_multi_object_path() {
     let keys: Vec<String> = (0..3).map(|i| format!("{prefix}batch-{i}.bin")).collect();
     for key in &keys {
         provider
-            .put_object_from_file(&bucket, key, &path, 32)
+            .put_object_from_file(&bucket, key, &path, 32, Arc::new(|_| {}))
             .await
             .expect("uploading a batch-delete fixture should succeed");
     }
@@ -370,7 +370,16 @@ async fn multipart_upload_round_trip() {
     while offset < size {
         let length = part_size.min(size - offset);
         let etag = provider
-            .upload_part_from_file(&bucket, &key, &upload_id, number, &path, offset, length)
+            .upload_part_from_file(
+                &bucket,
+                &key,
+                &upload_id,
+                number,
+                &path,
+                offset,
+                length,
+                Arc::new(|_| {}),
+            )
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -436,7 +445,7 @@ async fn range_get_reads_exact_slices() {
     let source = std::fs::read(&path).expect("reading the fixture back should succeed");
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("PutObject of the range fixture should succeed");
 
@@ -484,7 +493,7 @@ async fn rename_object_copies_then_deletes() {
     let source = std::fs::read(&path).expect("reading the fixture back should succeed");
 
     provider
-        .put_object_from_file(&bucket, &from_key, &path, size)
+        .put_object_from_file(&bucket, &from_key, &path, size, Arc::new(|_| {}))
         .await
         .expect("PutObject of the rename fixture should succeed");
 
@@ -533,7 +542,7 @@ async fn presigned_get_works() {
     let source = std::fs::read(&path).expect("reading the fixture back should succeed");
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("PutObject of the presign fixture should succeed");
 

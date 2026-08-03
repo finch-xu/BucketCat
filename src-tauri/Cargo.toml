@@ -77,6 +77,16 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http = "1"
 http-body-util = "0.1"
+# Promoted to a direct dependency for `provider::s3`'s counting upload body,
+# which implements `http_body::Body` itself (to wrap a file read in a
+# progress-emitting adapter passed to `SdkBody::from_body_1_x`). Already
+# resolved at 1.1.0 in Cargo.lock -- both as `http-body-util`'s own
+# dependency and, via `aws-smithy-types`'s `http-body-1-x` feature (already
+# enabled transitively by `aws-sdk-s3`'s own `http-1x` feature), as
+# `aws-smithy-types`'s renamed `http-body-1-0` dependency -- so this adds
+# zero new lock entries, same test as the `rustls`/`hyper-rustls` block
+# above.
+http-body = "1"
 bytes = "1"
 # HTTP Basic auth for Backblaze's native `b2_authorize_account` (see
 # `provider::b2_admin`), which is the only credential scheme that API accepts.

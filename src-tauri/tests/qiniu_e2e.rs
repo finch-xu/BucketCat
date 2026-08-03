@@ -483,7 +483,7 @@ async fn small_object_round_trip() {
     ));
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live Qiniu");
 
@@ -563,7 +563,16 @@ async fn multipart_upload_round_trip() {
         let mut done: Vec<UploadedPart> = Vec::with_capacity(2);
         for (number, offset, length) in [(1i32, 0u64, first), (2i32, first, last)] {
             let etag = provider
-                .upload_part_from_file(&bucket, &key, &upload_id, number, &path, offset, length)
+                .upload_part_from_file(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    number,
+                    &path,
+                    offset,
+                    length,
+                    Arc::new(|_| {}),
+                )
                 .await
                 .map_err(|e| {
                     format!(
@@ -695,7 +704,7 @@ async fn batch_delete_uses_the_multi_object_path() {
     let keys: Vec<String> = (0..3).map(|i| format!("{prefix}batch-{i}.bin")).collect();
     for key in &keys {
         provider
-            .put_object_from_file(&bucket, key, &path, size)
+            .put_object_from_file(&bucket, key, &path, size, Arc::new(|_| {}))
             .await
             .expect("put_object_from_file should succeed against live Qiniu");
     }
@@ -813,7 +822,7 @@ async fn cross_region_bucket_is_routed_automatically() {
     ));
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file must succeed through the routed client");
     let downloaded = get_range_bytes(&provider, &bucket, &key, 0, size)
@@ -848,7 +857,7 @@ async fn presigned_get_works() {
     let source = std::fs::read(&path).expect("reading the fixture back should succeed");
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live Qiniu");
 
@@ -897,7 +906,7 @@ async fn rename_object_moves_the_object() {
     write_pseudo_random_file(&path, size, 0x0999_0006);
 
     provider
-        .put_object_from_file(&bucket, &from_key, &path, size)
+        .put_object_from_file(&bucket, &from_key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live Qiniu");
 
@@ -954,7 +963,7 @@ async fn delete_prefix_removes_every_object_under_it() {
         .expect("create_folder should write a zero-byte marker");
     for key in [format!("{prefix}a.bin"), format!("{prefix}sub/b.bin")] {
         provider
-            .put_object_from_file(&bucket, &key, &path, size)
+            .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
             .await
             .expect("put_object_from_file should succeed against live Qiniu");
     }

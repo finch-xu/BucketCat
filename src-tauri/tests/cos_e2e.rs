@@ -581,7 +581,7 @@ async fn small_object_round_trip() {
     ));
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live COS");
 
@@ -661,7 +661,16 @@ async fn multipart_upload_round_trip() {
     let mut parts = Vec::new();
     for (number, offset, length) in [(1i32, 0u64, first), (2, first, last)] {
         match provider
-            .upload_part_from_file(&bucket, &key, &upload_id, number, &path, offset, length)
+            .upload_part_from_file(
+                &bucket,
+                &key,
+                &upload_id,
+                number,
+                &path,
+                offset,
+                length,
+                Arc::new(|_| {}),
+            )
             .await
         {
             Ok(etag) => parts.push(UploadedPart {
@@ -753,7 +762,7 @@ async fn batch_delete_is_unavailable_and_deletes_fall_back_to_single_requests() 
     let keys: Vec<String> = (0..3).map(|i| format!("{prefix}batch-{i}.bin")).collect();
     for key in &keys {
         provider
-            .put_object_from_file(&bucket, key, &path, size)
+            .put_object_from_file(&bucket, key, &path, size, Arc::new(|_| {}))
             .await
             .expect("put_object_from_file should succeed against live COS");
     }
@@ -849,7 +858,13 @@ async fn delete_prefix_removes_every_object_under_it() {
         .expect("create_folder should succeed against live COS");
     for i in 0..3 {
         provider
-            .put_object_from_file(&bucket, &format!("{folder}f{i}.bin"), &path, size)
+            .put_object_from_file(
+                &bucket,
+                &format!("{folder}f{i}.bin"),
+                &path,
+                size,
+                Arc::new(|_| {}),
+            )
             .await
             .expect("put_object_from_file should succeed against live COS");
     }
@@ -905,7 +920,7 @@ async fn rename_object_moves_the_object() {
     write_pseudo_random_file(&path, size, 0x0BBB_0005);
 
     provider
-        .put_object_from_file(&bucket, &from_key, &path, size)
+        .put_object_from_file(&bucket, &from_key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live COS");
 
@@ -963,7 +978,7 @@ async fn presigned_get_works() {
     let source = std::fs::read(&path).expect("reading the fixture back should succeed");
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live COS");
 
@@ -1031,7 +1046,7 @@ async fn apk_download_is_forbidden_on_the_default_domain() {
 
     // Uploading is fine -- the restriction is read-side only.
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("uploading an .apk should succeed; COS only restricts reading it back");
 

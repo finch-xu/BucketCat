@@ -234,7 +234,10 @@ where
         let path = job.path.clone();
         async move {
             provider
-                .put_object_from_file(&bucket, &key, &path, length)
+                // Task 3 wires this into real per-body progress; for now a
+                // no-op keeps the trait's new parameter satisfied without
+                // changing upload behavior.
+                .put_object_from_file(&bucket, &key, &path, length, Arc::new(|_| {}))
                 .await
         }
     })
@@ -554,6 +557,9 @@ where
         let target = Arc::clone(&target);
         async move {
             provider
+                // Task 3 wires this into real per-body progress; for now a
+                // no-op keeps the trait's new parameter satisfied without
+                // changing upload behavior.
                 .upload_part_from_file(
                     &target.bucket,
                     &target.key,
@@ -562,6 +568,7 @@ where
                     &target.path,
                     spec.offset,
                     spec.length,
+                    Arc::new(|_| {}),
                 )
                 .await
         }
@@ -649,7 +656,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
-    use crate::provider::{BatchResult, Bucket, ListPage, ObjectHead};
+    use crate::provider::{BatchResult, BodyProgressFn, Bucket, ListPage, ObjectHead};
 
     const UPLOAD_ID: &str = "u-1";
 
@@ -955,6 +962,7 @@ mod tests {
             _key: &str,
             _path: &Path,
             _length: u64,
+            _progress: BodyProgressFn,
         ) -> AppResult<()> {
             if !self.op_delay.is_zero() {
                 tokio::time::sleep(self.op_delay).await;
@@ -971,6 +979,7 @@ mod tests {
             Ok(UPLOAD_ID.to_string())
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn upload_part_from_file(
             &self,
             _bucket: &str,
@@ -980,6 +989,7 @@ mod tests {
             _path: &Path,
             _offset: u64,
             _length: u64,
+            _progress: BodyProgressFn,
         ) -> AppResult<String> {
             assert_eq!(
                 upload_id, UPLOAD_ID,

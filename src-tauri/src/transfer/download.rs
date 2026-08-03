@@ -677,7 +677,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
-    use crate::provider::{BatchResult, Bucket, ListPage, ObjectHead, UploadedPart};
+    use crate::provider::{BatchResult, BodyProgressFn, Bucket, ListPage, ObjectHead, UploadedPart};
     use crate::transfer::partfile::bcpart_path;
 
     const MB: u64 = 1024 * 1024;
@@ -1004,6 +1004,7 @@ mod tests {
             _key: &str,
             _path: &Path,
             _length: u64,
+            _progress: BodyProgressFn,
         ) -> AppResult<()> {
             unimplemented!("a download never puts objects")
         }
@@ -1022,6 +1023,7 @@ mod tests {
             _path: &Path,
             _offset: u64,
             _length: u64,
+            _progress: BodyProgressFn,
         ) -> AppResult<String> {
             unimplemented!("a download never uploads parts")
         }
@@ -1707,6 +1709,7 @@ mod tests {
             _key: &str,
             _path: &Path,
             _length: u64,
+            _progress: BodyProgressFn,
         ) -> AppResult<()> {
             unimplemented!("not exercised by these tests")
         }
@@ -1723,6 +1726,7 @@ mod tests {
             _path: &Path,
             _offset: u64,
             _length: u64,
+            _progress: BodyProgressFn,
         ) -> AppResult<String> {
             unimplemented!("not exercised by these tests")
         }

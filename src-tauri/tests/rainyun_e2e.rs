@@ -481,7 +481,7 @@ async fn small_object_round_trip() {
     write_pseudo_random_file(&path, size, 0x0777_0001);
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live Rainyun");
 
@@ -611,7 +611,16 @@ async fn multipart_upload_round_trip() {
         let mut done: Vec<UploadedPart> = Vec::with_capacity(2);
         for (number, offset, length) in [(1i32, 0u64, first), (2i32, first, last)] {
             let etag = provider
-                .upload_part_from_file(&bucket, &key, &upload_id, number, &path, offset, length)
+                .upload_part_from_file(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    number,
+                    &path,
+                    offset,
+                    length,
+                    Arc::new(|_| {}),
+                )
                 .await
                 .map_err(|e| {
                     format!(
@@ -775,7 +784,7 @@ async fn presigned_get_works() {
     write_pseudo_random_file(&path, size, 0x0777_0003);
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live Rainyun");
 
@@ -900,7 +909,7 @@ async fn delete_prefix_removes_every_object_under_it() {
         let size = 4 * 1024; // a few KB is plenty; this test is about fan-out, not payload size
         write_pseudo_random_file(&path, size, 0x0777_0010 + i as u64);
         provider
-            .put_object_from_file(&bucket, key, &path, size)
+            .put_object_from_file(&bucket, key, &path, size, Arc::new(|_| {}))
             .await
             .unwrap_or_else(|e| {
                 panic!("put_object_from_file for `{key}` should succeed against live Rainyun: {e}")

@@ -759,7 +759,7 @@ async fn upload_via_primitives(
     match plan_upload_with(total, &TransferTuning::default()) {
         UploadPlan::Single { length } => {
             provider
-                .put_object_from_file(bucket, key, path, length)
+                .put_object_from_file(bucket, key, path, length, Arc::new(|_| {}))
                 .await
                 .unwrap_or_else(|e| panic!("single-stream put of {key} should succeed: {e}"));
         }
@@ -772,7 +772,14 @@ async fn upload_via_primitives(
             for p in &parts {
                 let etag = provider
                     .upload_part_from_file(
-                        bucket, key, &upload_id, p.number, path, p.offset, p.length,
+                        bucket,
+                        key,
+                        &upload_id,
+                        p.number,
+                        path,
+                        p.offset,
+                        p.length,
+                        Arc::new(|_| {}),
                     )
                     .await
                     .unwrap_or_else(|e| {
@@ -834,7 +841,7 @@ async fn upload_small_file_round_trips() {
 
     let key = "uploads/small.bin";
     provider
-        .put_object_from_file(&bucket, key, &path, size)
+        .put_object_from_file(&bucket, key, &path, size, Arc::new(|_| {}))
         .await
         .expect("single-stream put_object_from_file should succeed against live RustFS");
 
@@ -915,7 +922,14 @@ async fn parts_uploaded_out_of_order_still_complete() {
         let p = parts[(number - 1) as usize];
         let etag = provider
             .upload_part_from_file(
-                &bucket, key, &upload_id, p.number, &path, p.offset, p.length,
+                &bucket,
+                key,
+                &upload_id,
+                p.number,
+                &path,
+                p.offset,
+                p.length,
+                Arc::new(|_| {}),
             )
             .await
             .unwrap_or_else(|e| panic!("upload_part {} should succeed: {e}", p.number));
@@ -976,7 +990,14 @@ async fn a_shrinking_file_fails_before_uploading_a_short_part() {
     let p = parts[0];
     let err = provider
         .upload_part_from_file(
-            &bucket, key, &upload_id, p.number, &path, p.offset, p.length,
+            &bucket,
+            key,
+            &upload_id,
+            p.number,
+            &path,
+            p.offset,
+            p.length,
+            Arc::new(|_| {}),
         )
         .await
         .expect_err("uploading a part that no longer fits the shrunk file must fail");
@@ -1010,7 +1031,16 @@ async fn aborting_a_multipart_upload_removes_the_fragments() {
     let key = "uploads/abort.bin";
     let upload_id = provider.multipart_init(&bucket, key).await.expect("init");
     provider
-        .upload_part_from_file(&bucket, key, &upload_id, 1, &path, 0, size)
+        .upload_part_from_file(
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            &path,
+            0,
+            size,
+            Arc::new(|_| {}),
+        )
         .await
         .expect("first part should upload");
     provider
@@ -1019,7 +1049,16 @@ async fn aborting_a_multipart_upload_removes_the_fragments() {
         .expect("abort should succeed");
 
     provider
-        .upload_part_from_file(&bucket, key, &upload_id, 2, &path, 0, size)
+        .upload_part_from_file(
+            &bucket,
+            key,
+            &upload_id,
+            2,
+            &path,
+            0,
+            size,
+            Arc::new(|_| {}),
+        )
         .await
         .expect_err("uploading to an aborted upload id must fail; the fragments are gone");
 
@@ -1052,7 +1091,14 @@ async fn multipart_list_returns_the_accepted_parts() {
     for p in plan.iter().take(2) {
         provider
             .upload_part_from_file(
-                &bucket, key, &upload_id, p.number, &path, p.offset, p.length,
+                &bucket,
+                key,
+                &upload_id,
+                p.number,
+                &path,
+                p.offset,
+                p.length,
+                Arc::new(|_| {}),
             )
             .await
             .expect("upload_part");
@@ -1089,7 +1135,7 @@ async fn zero_byte_file_round_trips() {
 
     let key = "uploads/empty.bin";
     provider
-        .put_object_from_file(&bucket, key, &path, 0)
+        .put_object_from_file(&bucket, key, &path, 0, Arc::new(|_| {}))
         .await
         .expect("a zero-byte put must succeed");
 
@@ -1230,7 +1276,7 @@ async fn presigned_get_works() {
     let path = dir.path().join("share.bin");
     write_pseudo_random_file(&path, 2 * MB, 0x5EED_6001);
     provider
-        .put_object_from_file(&bucket, "share.bin", &path, 2 * MB)
+        .put_object_from_file(&bucket, "share.bin", &path, 2 * MB, Arc::new(|_| {}))
         .await
         .expect("put");
 

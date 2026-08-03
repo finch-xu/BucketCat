@@ -110,6 +110,7 @@ use bucketcat_lib::provider::{from_connection, Provider, S3Provider, UploadedPar
 use bucketcat_lib::store::Connection;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 
 /// 1 MiB, the unit the multipart fixture is sized in.
 const MB: u64 = 1024 * 1024;
@@ -399,7 +400,7 @@ async fn small_object_round_trip() {
     write_pseudo_random_file(&path, size, 0x0555_0001);
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live OSS");
 
@@ -516,7 +517,16 @@ async fn multipart_upload_round_trip() {
         let mut done: Vec<UploadedPart> = Vec::with_capacity(2);
         for (number, offset) in [(1i32, 0u64), (2i32, part_size)] {
             let etag = provider
-                .upload_part_from_file(&bucket, &key, &upload_id, number, &path, offset, part_size)
+                .upload_part_from_file(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    number,
+                    &path,
+                    offset,
+                    part_size,
+                    Arc::new(|_| {}),
+                )
                 .await
                 .map_err(|e| {
                     format!(
@@ -667,7 +677,7 @@ async fn delete_prefix_removes_every_object_under_it() {
         let size = 4 * 1024; // a few KB is plenty; this test is about fan-out, not payload size
         write_pseudo_random_file(&path, size, 0x0555_0010 + i as u64);
         provider
-            .put_object_from_file(&bucket, key, &path, size)
+            .put_object_from_file(&bucket, key, &path, size, Arc::new(|_| {}))
             .await
             .unwrap_or_else(|e| {
                 panic!("put_object_from_file for `{key}` should succeed against live OSS: {e}")
@@ -731,7 +741,7 @@ async fn presigned_get_works() {
     write_pseudo_random_file(&path, size, 0x0555_0003);
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect("put_object_from_file should succeed against live OSS");
 
@@ -859,7 +869,7 @@ async fn cross_region_bucket_is_routed_automatically() {
     write_pseudo_random_file(&path, size, 0x0555_0004);
 
     provider
-        .put_object_from_file(&bucket, &key, &path, size)
+        .put_object_from_file(&bucket, &key, &path, size, Arc::new(|_| {}))
         .await
         .expect(
             "put_object_from_file should succeed against the sandbox bucket even though this \

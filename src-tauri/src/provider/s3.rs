@@ -9,7 +9,10 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use std::sync::RwLock;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use aws_sdk_s3::config::{
@@ -17,15 +20,18 @@ use aws_sdk_s3::config::{
 };
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::DateTimeFormat;
-use aws_sdk_s3::primitives::{ByteStream, Length};
+use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
+use bytes::{Bytes, BytesMut};
+use http_body::{Body as HttpBody, Frame, SizeHint};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::task::JoinSet;
 
 use crate::error::{AppError, AppResult};
 use crate::provider::{
-    clamp_expiry, oss_admin, BatchResult, Bucket, FailedKey, ListPage, ObjectEntry, ObjectHead,
-    Provider, UploadedPart,
+    clamp_expiry, oss_admin, BatchResult, BodyProgress, BodyProgressFn, Bucket, FailedKey,
+    ListPage, ObjectEntry, ObjectHead, Provider, UploadedPart, PROGRESS_QUANTUM,
 };
 use crate::store::Connection;
 
@@ -1166,24 +1172,234 @@ pub(crate) fn sorted_parts(parts: &[UploadedPart]) -> Vec<&UploadedPart> {
     ordered
 }
 
-/// Opens `path[offset .. offset + length]` as a request body.
+/// Bytes read from the file per `poll_frame` call. Unrelated to
+/// [`PROGRESS_QUANTUM`], which governs how often reads get *reported*, not
+/// how large each individual read is; this just bounds per-frame memory use
+/// while keeping the syscall count reasonable.
+const COUNTING_BODY_CHUNK: usize = 64 * 1024;
+
+/// Opens `path`, seeking to `offset` if nonzero -- both synchronous
+/// syscalls, safe to call from inside the non-async `SdkBody::retryable`
+/// factory in [`counting_body_range`]. `tokio::fs::File::from_std` then
+/// makes the already-open, already-seeked handle usable with
+/// `AsyncRead::poll_read` (each read is offloaded to Tokio's blocking pool;
+/// only this initial `open`/`seek` pair runs on the calling thread).
+fn open_counted_file(path: &Path, offset: u64) -> std::io::Result<tokio::fs::File> {
+    use std::io::Seek;
+    let mut file = std::fs::File::open(path)?;
+    if offset != 0 {
+        file.seek(std::io::SeekFrom::Start(offset))?;
+    }
+    Ok(tokio::fs::File::from_std(file))
+}
+
+/// [`CountingFileBody`]'s file handle, or the reason it doesn't have one.
+enum CountingFileState {
+    Ready(tokio::fs::File),
+    /// `open_counted_file` failed inside the factory. Reported exactly once
+    /// (the `Option` is taken on the first `poll_frame`) rather than at
+    /// construction time -- see [`counting_body_range`]'s doc comment for
+    /// why the factory can't fail outright.
+    Failed(Option<std::io::Error>),
+}
+
+/// The [`http_body::Body`] behind [`counting_body_range`]'s `SdkBody`. See
+/// that function's doc comment for the full progress contract; this is just
+/// the state machine that implements it.
 ///
-/// `read_from().path(..)` (rather than `.file(..)`) is deliberate: it keeps
-/// the stream **rewindable**, so the SDK can replay the body during its own
-/// internal retries. Handing over an already-open `File` produces a
-/// one-shot stream, and a retried request would send an empty body.
+/// One instance backs exactly one `SdkBody::retryable` factory invocation --
+/// `state`/`remaining`/`pending` are always fresh per attempt. `attempt` and
+/// `progress` are the same `Arc`s the factory closure holds, shared with
+/// every sibling instance it ever builds, which is what lets the *next*
+/// invocation compute how much of an abandoned attempt to report as
+/// `Rewound`.
+struct CountingFileBody {
+    state: CountingFileState,
+    /// Bytes not yet read from the file. Reaching 0 means EOF, independent
+    /// of `state` (a `Failed` body never decrements it).
+    remaining: u64,
+    /// Bytes read since the last emitted `Sent`, not yet reported.
+    pending: u64,
+    attempt: Arc<AtomicU64>,
+    progress: BodyProgressFn,
+}
+
+impl CountingFileBody {
+    /// Reports (and zeroes) whatever's in `pending`, if anything -- the
+    /// quantum-crossing path and the EOF tail flush both fall through here
+    /// so `attempt` and `progress` only ever get updated in one place.
+    fn flush_pending(&mut self) {
+        if self.pending > 0 {
+            let amount = self.pending;
+            self.pending = 0;
+            self.attempt.fetch_add(amount, Ordering::SeqCst);
+            (self.progress)(BodyProgress::Sent(amount));
+        }
+    }
+}
+
+impl HttpBody for CountingFileBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        let file = match &mut this.state {
+            CountingFileState::Failed(err) => return Poll::Ready(err.take().map(Err)),
+            CountingFileState::Ready(file) => file,
+        };
+
+        if this.remaining == 0 {
+            // EOF: flush whatever's left under the quantum as one final
+            // `Sent`, then signal end of stream. No data frame here -- this
+            // is purely the progress tail, not a read.
+            this.flush_pending();
+            return Poll::Ready(None);
+        }
+
+        let cap = this.remaining.min(COUNTING_BODY_CHUNK as u64) as usize;
+        let mut buf = BytesMut::zeroed(cap);
+        let mut read_buf = ReadBuf::new(&mut buf);
+        match Pin::new(file).poll_read(cx, &mut read_buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(err)) => {
+                this.remaining = 0;
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(Ok(())) => {
+                let n = read_buf.filled().len();
+                if n == 0 {
+                    // The file shrank below the planned range since the
+                    // plan was computed (or between this attempt's own
+                    // retries) -- stop instead of spinning on a
+                    // permanently-empty read.
+                    this.remaining = 0;
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "file ended before the planned range was fully read",
+                    ))));
+                }
+                buf.truncate(n);
+                this.remaining -= n as u64;
+                this.pending += n as u64;
+                // Quantum crossed: emit now rather than waiting for EOF, so
+                // a large upload reports progress throughout, not only at
+                // the very end.
+                if this.pending >= PROGRESS_QUANTUM {
+                    this.flush_pending();
+                }
+                Poll::Ready(Some(Ok(Frame::data(buf.freeze()))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        matches!(self.state, CountingFileState::Ready(_)) && self.remaining == 0
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining)
+    }
+}
+
+/// Opens `path[offset .. offset + length]` as a **counting**, replayable
+/// request body: as the transport pulls bytes out of it, `progress` is
+/// called with [`BodyProgress`] notches.
 ///
-/// `Length::Exact` also doubles as an integrity check: if the file shrank
-/// since the plan was computed, this fails here rather than silently
-/// uploading a short part.
-async fn body_range(path: &Path, offset: u64, length: u64) -> AppResult<ByteStream> {
-    ByteStream::read_from()
-        .path(path)
-        .offset(offset)
-        .length(Length::Exact(length))
-        .build()
+/// ## Why a hand-rolled body
+///
+/// The previous `body_range` handed `ByteStream::read_from()` a bare file
+/// range: rewindable (required so the SDK can replay the body across its
+/// own internal retries), but opaque -- nothing observed bytes as they were
+/// read. This keeps the same rewindable shape (`SdkBody::retryable` around a
+/// factory that reopens+reseeks the file every time it's called) but wraps
+/// it around [`CountingFileBody`], a counting [`http_body::Body`], so
+/// progress can be derived without a second pass over the file or a peek at
+/// the HTTP wire.
+///
+/// ## Contract
+///
+/// 1. **Coalesced, not per-read.** Bytes pulled by the transport accumulate
+///    in a per-attempt buffer; once that buffer holds at least
+///    [`PROGRESS_QUANTUM`] un-reported bytes, `progress` is called once with
+///    `Sent(<accumulated amount>)` and the buffer resets to 0. Whatever's
+///    left when the body reaches EOF is flushed as one final `Sent`, so a
+///    multi-GB file produces roughly `size / PROGRESS_QUANTUM` calls, not
+///    one per 64KB read.
+/// 2. **Rewind on rebuild.** `SdkBody::retryable`'s factory closure runs
+///    once up front and again every time the SDK retries the request
+///    internally (e.g. a connection reset mid-body -- distinct from
+///    `crate::transfer`'s own app-level `with_retry`, which calls this
+///    function again from scratch with a brand new counter). Each
+///    invocation first swaps a shared attempt-total counter to 0; if that
+///    swap yields a nonzero `prev`, `progress` is called with
+///    `Rewound(prev)` *before* the rebuilt body is even returned, so a
+///    receiver that's been summing `Sent` deltas can subtract the abandoned
+///    attempt's contribution before any new `Sent` for the fresh attempt
+///    arrives.
+/// 3. **Emission runs ahead of the server ack.** Both `Sent` and `Rewound`
+///    fire the moment bytes are handed to (or discarded from) the
+///    transport, not when S3 confirms it received them -- a body that's
+///    fully drained locally may still be in flight over the wire, or may
+///    still fail server-side. Callers that need a "safely stored on the
+///    server" figure must derive it from the request's own success/failure,
+///    not from this callback.
+///
+/// The file is opened synchronously (`open_counted_file`: a `std::fs::File::open`
+/// call and a sync seek) inside the factory closure -- the closure's
+/// signature (`Fn() -> SdkBody`) isn't async, so it can't `.await` an async
+/// open there. If the open or seek fails, the factory still returns a body
+/// (it must -- the closure itself can't fail), but that body errors on its
+/// first `poll_frame` rather than silently producing no data or panicking.
+async fn counting_body_range(
+    path: &Path,
+    offset: u64,
+    length: u64,
+    progress: BodyProgressFn,
+) -> AppResult<ByteStream> {
+    // Fails fast here, mirroring the old `body_range`'s eager
+    // `ByteStream::read_from().build()` check, for the common case: the
+    // source file is already missing or has shrunk below `offset + length`
+    // by the time the plan runs. A file that disappears *between* this
+    // check and a later SDK-internal retry is still caught -- just later,
+    // as a `poll_frame` error on the affected attempt.
+    let metadata = tokio::fs::metadata(path)
         .await
-        .map_err(|err| file_io_error(path, err))
+        .map_err(|err| file_io_error(path, err))?;
+    if offset.saturating_add(length) > metadata.len() {
+        return Err(file_io_error(
+            path,
+            format!(
+                "requested range [{offset}, {end}) exceeds the file's current size ({size} bytes)",
+                end = offset.saturating_add(length),
+                size = metadata.len(),
+            ),
+        ));
+    }
+
+    let path = path.to_path_buf();
+    let attempt = Arc::new(AtomicU64::new(0));
+    let body = SdkBody::retryable(move || {
+        let prev = attempt.swap(0, Ordering::SeqCst);
+        if prev > 0 {
+            progress(BodyProgress::Rewound(prev));
+        }
+        let state = match open_counted_file(&path, offset) {
+            Ok(file) => CountingFileState::Ready(file),
+            Err(err) => CountingFileState::Failed(Some(err)),
+        };
+        SdkBody::from_body_1_x(CountingFileBody {
+            state,
+            remaining: length,
+            pending: 0,
+            attempt: Arc::clone(&attempt),
+            progress: Arc::clone(&progress),
+        })
+    });
+    Ok(ByteStream::new(body))
 }
 
 /// An inclusive HTTP `Range` header value for `[offset, offset+length)`.
@@ -1895,8 +2111,9 @@ impl Provider for S3Provider {
         key: &str,
         path: &Path,
         length: u64,
+        progress: BodyProgressFn,
     ) -> AppResult<()> {
-        let body = body_range(path, 0, length).await?;
+        let body = counting_body_range(path, 0, length, progress).await?;
         let client = self.client_for(bucket).await;
         client
             .put_object()
@@ -1927,6 +2144,7 @@ impl Provider for S3Provider {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn upload_part_from_file(
         &self,
         bucket: &str,
@@ -1936,8 +2154,9 @@ impl Provider for S3Provider {
         path: &Path,
         offset: u64,
         length: u64,
+        progress: BodyProgressFn,
     ) -> AppResult<String> {
-        let body = body_range(path, offset, length).await?;
+        let body = counting_body_range(path, offset, length, progress).await?;
         let client = self.client_for(bucket).await;
         let out = client
             .upload_part()
@@ -4308,5 +4527,201 @@ mod tests {
         assert_eq!(clamp_expiry(0), 1);
         assert_eq!(clamp_expiry(3600), 3600);
         assert_eq!(clamp_expiry(999_999_999), 604_800);
+    }
+
+    // --- counting_body_range / CountingFileBody (progress) -------------------
+    //
+    // These poll the counting body directly (via `ByteStream::next`, which
+    // drives `CountingFileBody::poll_frame` the same way the SDK's HTTP
+    // client would) -- no network, no live provider, no `S3Provider`.
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Writes `len` bytes to a fresh temp file and returns `(dir, path)`.
+    /// `dir` must be kept alive for as long as `path` is read -- callers
+    /// bind it (even though they never touch it again) to keep the
+    /// directory from being cleaned up mid-test.
+    fn counted_fixture(len: u64) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("counted.bin");
+        std::fs::write(&path, vec![0xABu8; len as usize]).expect("writing the fixture");
+        (dir, path)
+    }
+
+    /// A [`BodyProgressFn`] that records every notch, plus a handle to read
+    /// them back.
+    fn recording_progress() -> (BodyProgressFn, Arc<StdMutex<Vec<BodyProgress>>>) {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let events_for_cb = Arc::clone(&events);
+        let progress: BodyProgressFn =
+            Arc::new(move |event| events_for_cb.lock().unwrap().push(event));
+        (progress, events)
+    }
+
+    /// Sum of every `Sent` amount in `events` -- `Rewound` notches don't
+    /// contribute (they report what to subtract from a receiver's own
+    /// running total, not bytes newly sent).
+    fn total_sent(events: &[BodyProgress]) -> u64 {
+        events
+            .iter()
+            .map(|event| match event {
+                BodyProgress::Sent(n) => *n,
+                BodyProgress::Rewound(_) => 0,
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn counting_body_coalesces_to_the_quantum_and_flushes_the_tail() {
+        // Two full quanta plus a half-quantum tail (2.5MB at the real 1MB
+        // quantum), so both the quantum-crossing path and the EOF flush of
+        // the remainder are exercised in the same drain.
+        let len = 2 * PROGRESS_QUANTUM + PROGRESS_QUANTUM / 2;
+        let (_dir, path) = counted_fixture(len);
+        let (progress, events) = recording_progress();
+
+        let mut stream = counting_body_range(&path, 0, len, progress)
+            .await
+            .expect("building the counting body should succeed");
+        let mut drained = 0u64;
+        while let Some(chunk) = stream.next().await {
+            drained += chunk.expect("a local file read here cannot fail").len() as u64;
+        }
+        assert_eq!(drained, len, "every byte in the file must be pulled");
+
+        let sent = events.lock().unwrap().clone();
+        assert!(
+            sent.iter().all(|e| matches!(e, BodyProgress::Sent(_))),
+            "a single, never-rebuilt attempt must never emit Rewound: {sent:?}"
+        );
+        assert!(
+            (2..=3).contains(&sent.len()),
+            "2.5MB at a 1MB quantum should coalesce into 2-3 events, not one per \
+             transport read (640 4KB reads' worth): {sent:?}"
+        );
+        assert_eq!(
+            total_sent(&sent),
+            len,
+            "the sum of every Sent notch must equal the file size"
+        );
+
+        // Every notch but the last is a full quantum -- `Sent` fires as soon
+        // as the un-reported amount crosses the line, not only at EOF. The
+        // last one is the sub-quantum tail, flushed once the body hits EOF.
+        let (last, rest) = sent.split_last().expect("at least one event must have fired");
+        for event in rest {
+            assert_eq!(
+                *event,
+                BodyProgress::Sent(PROGRESS_QUANTUM),
+                "every notch but the last must be exactly one quantum"
+            );
+        }
+        assert_eq!(
+            *last,
+            BodyProgress::Sent(PROGRESS_QUANTUM / 2),
+            "the final notch must be exactly the half-quantum tail, flushed at EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuilding_the_body_rewinds_the_previous_attempt() {
+        // Two full quanta, so a partial drain just past the first quantum
+        // still leaves the second half of the file unread -- the rebuild
+        // below discards that in-flight attempt well before its own EOF.
+        let len = 2 * PROGRESS_QUANTUM;
+        let (_dir, path) = counted_fixture(len);
+        let (progress, events) = recording_progress();
+
+        let mut stream = counting_body_range(&path, 0, len, progress)
+            .await
+            .expect("building the counting body should succeed");
+
+        // Pull past the first quantum boundary (plus one extra read) so
+        // exactly one `Sent(PROGRESS_QUANTUM)` has already fired, with the
+        // excess sitting un-flushed in the body's own `pending` buffer.
+        let target = PROGRESS_QUANTUM + COUNTING_BODY_CHUNK as u64;
+        let mut pulled = 0u64;
+        while pulled < target {
+            let chunk = stream
+                .next()
+                .await
+                .expect("the file is long enough not to hit EOF here")
+                .expect("a local file read here cannot fail");
+            pulled += chunk.len() as u64;
+        }
+
+        let before_rebuild = events.lock().unwrap().clone();
+        assert_eq!(
+            before_rebuild,
+            vec![BodyProgress::Sent(PROGRESS_QUANTUM)],
+            "exactly one quantum should have been flushed by this point"
+        );
+
+        // Simulate the SDK's own internal retry: discard this attempt's
+        // body and ask the same factory for a fresh one, exactly what
+        // `SdkBody::try_clone` does mid-request on a transport-level retry.
+        let abandoned = stream.into_inner();
+        let rebuilt = abandoned
+            .try_clone()
+            .expect("a counting body built via SdkBody::retryable must support try_clone");
+
+        let after_rebuild_call = events.lock().unwrap().clone();
+        assert_eq!(
+            after_rebuild_call,
+            vec![
+                BodyProgress::Sent(PROGRESS_QUANTUM),
+                BodyProgress::Rewound(PROGRESS_QUANTUM),
+            ],
+            "the factory rebuild must report Rewound(<amount already Sent>) \
+             before the rebuilt body is even returned"
+        );
+
+        // The fresh attempt counts from zero: draining it fully must report
+        // exactly `len` in new `Sent` notches, not `len` minus what the
+        // abandoned attempt already contributed.
+        let mut fresh = ByteStream::new(rebuilt);
+        let mut redrained = 0u64;
+        while let Some(chunk) = fresh.next().await {
+            redrained += chunk.expect("a local file read here cannot fail").len() as u64;
+        }
+        assert_eq!(redrained, len, "the rebuilt body must re-read the whole range");
+
+        let all_events = events.lock().unwrap().clone();
+        let sent_after_rebuild = total_sent(&all_events[after_rebuild_call.len()..]);
+        assert_eq!(
+            sent_after_rebuild, len,
+            "the fresh attempt must count from zero, not from where the \
+             abandoned one left off"
+        );
+    }
+
+    #[tokio::test]
+    async fn counted_total_equals_body_length_after_full_drain() {
+        // Deliberately not a multiple of the quantum, so the EOF tail flush
+        // is exercised on an arbitrary remainder rather than a clean 0.
+        let len = 3 * PROGRESS_QUANTUM + 12_345;
+        let (_dir, path) = counted_fixture(len);
+        let (progress, events) = recording_progress();
+
+        let mut stream = counting_body_range(&path, 0, len, progress)
+            .await
+            .expect("building the counting body should succeed");
+        let mut drained = 0u64;
+        while let Some(chunk) = stream.next().await {
+            drained += chunk.expect("a local file read here cannot fail").len() as u64;
+        }
+
+        assert_eq!(drained, len, "the transport must pull exactly the planned length");
+
+        let sent = events.lock().unwrap().clone();
+        assert!(
+            sent.iter().all(|e| matches!(e, BodyProgress::Sent(_))),
+            "a single, never-rebuilt attempt must never emit Rewound: {sent:?}"
+        );
+        assert_eq!(
+            total_sent(&sent),
+            len,
+            "counted total (sum of every Sent notch) must equal the body length"
+        );
     }
 }
