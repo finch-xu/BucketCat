@@ -44,7 +44,7 @@ use crate::provider::Provider;
 use crate::transfer::engine::{
     CheckpointWriter, DownloadState, ResumeState, RunOutcome, StopKind, TaskContext, TransferRunner,
 };
-use crate::transfer::part::{plan_upload, PartSpec, UploadPlan};
+use crate::transfer::part::{plan_download, PartSpec, TransferTuning};
 use crate::transfer::partfile::PartFile;
 use crate::transfer::retry::{backoff_delay, is_retryable, MAX_RETRIES};
 
@@ -61,9 +61,10 @@ type ProgressFn = Arc<dyn Fn(u64) + Send + Sync>;
 type StopFn = Arc<dyn Fn() -> Option<StopKind> + Send + Sync>;
 
 /// Chunks of `plan` not yet written to the `.bcpart`. Pure so resume
-/// arithmetic is testable without a network. Reuses upload's part planning
-/// (D1): the offset/length split is identical; the S3-multipart caps just
-/// never bind for a download.
+/// arithmetic is testable without a network. `plan` comes from
+/// [`crate::transfer::part::plan_download`], the download-specific planner
+/// (`TransferTuning`'s `download_*` fields); it no longer shares S3's
+/// multipart-upload thresholds with the upload planner.
 pub fn pending_chunks(plan: &[PartSpec], done: &[i32]) -> Vec<PartSpec> {
     let finished: HashSet<i32> = done.iter().copied().collect();
     plan.iter()
@@ -153,28 +154,18 @@ where
         _ => None,
     };
 
-    let plan = plan_upload(total);
-    let chunks: Vec<PartSpec> = match &plan {
-        UploadPlan::Single { length } => vec![PartSpec {
-            number: 1,
-            offset: 0,
-            length: *length,
-        }],
-        UploadPlan::Multipart { parts, .. } => parts.clone(),
-    };
+    let plan = plan_download(total, &TransferTuning::default());
+    let chunks = plan.chunks;
 
-    match &plan {
-        UploadPlan::Single { .. } => {
-            tracing::info!(task = %job.task_id, key = %job.key, "downloading as a single stream");
-        }
-        UploadPlan::Multipart { .. } => {
-            tracing::info!(
-                task = %job.task_id,
-                key = %job.key,
-                chunks = chunks.len(),
-                "downloading as multipart"
-            );
-        }
+    if chunks.len() == 1 {
+        tracing::info!(task = %job.task_id, key = %job.key, "downloading as a single stream");
+    } else {
+        tracing::info!(
+            task = %job.task_id,
+            key = %job.key,
+            chunks = chunks.len(),
+            "downloading as multipart"
+        );
     }
 
     // Stage the `.bcpart` and reconcile against the object (M4c). The order
@@ -716,15 +707,8 @@ mod tests {
     impl FakeProvider {
         fn new(switch: Arc<Switch>, object: Vec<u8>) -> Self {
             let mut offset_to_number = HashMap::new();
-            match plan_upload(object.len() as u64) {
-                UploadPlan::Single { .. } => {
-                    offset_to_number.insert(0, 1);
-                }
-                UploadPlan::Multipart { parts, .. } => {
-                    for p in parts {
-                        offset_to_number.insert(p.offset, p.number);
-                    }
-                }
+            for p in download_chunks(object.len() as u64) {
+                offset_to_number.insert(p.offset, p.number);
             }
             Self {
                 switch,
@@ -1032,19 +1016,36 @@ mod tests {
         }
     }
 
-    /// The multipart plan for `total`, or a panic if `total` is single-stream.
-    fn multipart_plan(total: u64) -> Vec<PartSpec> {
-        match plan_upload(total) {
-            UploadPlan::Multipart { parts, .. } => parts,
-            UploadPlan::Single { .. } => panic!("expected a multipart plan for {total}"),
-        }
+    /// The download plan's chunk table for `total`, under the default
+    /// (balanced) tuning -- what `run_download` itself derives. Works for
+    /// both single- and multi-chunk totals; callers that need more than one
+    /// chunk assert `download_chunks(total).len() > 1` themselves.
+    fn download_chunks(total: u64) -> Vec<PartSpec> {
+        plan_download(total, &TransferTuning::default()).chunks
+    }
+
+    /// The default (balanced) preset's download threshold -- 64MB. Test
+    /// sizes below derive from this and `download_floor()` rather than
+    /// hardcoding numbers, so a future preset change cannot leave a
+    /// silently-wrong multi-chunk test size behind.
+    fn download_threshold() -> u64 {
+        TransferTuning::default().download_threshold
+    }
+
+    /// The balanced preset's download chunk floor -- 32MB, and (not
+    /// coincidentally) exactly `download_threshold() / 2`: a total of
+    /// `download_threshold()` resolves to two chunks of this size.
+    fn download_floor() -> u64 {
+        TransferTuning::default().download_chunk_floor
     }
 
     // Test 1: a multi-chunk download assembles the exact source bytes (the
     // unit-level analog of the hash round-trip).
     #[tokio::test]
     async fn a_multi_chunk_download_assembles_the_exact_source_bytes() {
-        let object = make_object((17 * MB) as usize);
+        // 2 * floor + 1MB is three chunks: two full-floor chunks and a short
+        // 1MB remainder.
+        let object = make_object((2 * download_floor() + MB) as usize);
         let rig = rig(4, object.clone(), |_| {});
 
         let outcome = rig.run(object.len() as u64).await.unwrap();
@@ -1053,7 +1054,7 @@ mod tests {
         assert_eq!(
             rig.provider.chunks_seen(),
             vec![1, 2, 3],
-            "17MB is three chunks (8MB + 8MB + 1MB)"
+            "2 * floor + 1MB is three chunks (floor + floor + 1MB)"
         );
         assert_eq!(
             rig.read_target(),
@@ -1193,12 +1194,14 @@ mod tests {
     // its call count being non-zero.
     #[tokio::test]
     async fn resuming_reuses_the_bcpart_and_skips_completed_chunks() {
-        let object = make_object((16 * MB) as usize);
+        // At the threshold -> two equal chunks, so chunk 2 is left to fetch.
+        let object = make_object(download_threshold() as usize);
         let total = object.len() as u64;
         let rig = rig(4, object.clone(), |_| {});
 
         // Pre-stage: chunk 1 already sits in the .bcpart on disk.
-        let plan = multipart_plan(total);
+        let plan = download_chunks(total);
+        assert_eq!(plan.len(), 2, "expected exactly two chunks for this test");
         let c1 = plan[0];
         {
             let pf = PartFile::create(&rig.target, total).unwrap();
@@ -1312,11 +1315,14 @@ mod tests {
     }
 
     // Test 8: in-flight range reads never exceed the configured part_limit.
-    // 64MB is eight 8MB chunks, so the limit has to be enforced by the spawn
-    // loop rather than by there being nothing left to spawn.
+    // 4 * floor is four equal chunks, so the limit has to be enforced by the
+    // spawn loop rather than by there being nothing left to spawn. A plain
+    // zero-filled buffer, not `make_object`: this test never reads the bytes
+    // back, only counts chunks and concurrency, so there is nothing to gain
+    // from paying for distinctive content at this size.
     #[tokio::test(start_paused = true)]
     async fn in_flight_chunks_never_exceed_the_part_limit() {
-        let object = make_object((64 * MB) as usize);
+        let object = vec![0u8; (4 * download_floor()) as usize];
         let rig = rig(2, object.clone(), |fake| {
             fake.op_delay = Duration::from_millis(10);
         });
@@ -1324,11 +1330,11 @@ mod tests {
         let outcome = rig.run(object.len() as u64).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
-        assert_eq!(rig.provider.chunks_seen().len(), 8);
+        assert_eq!(rig.provider.chunks_seen().len(), 4);
         assert_eq!(
             rig.provider.peak(),
             2,
-            "the semaphore must be acquired before spawning, or all eight chunks go out at once"
+            "the semaphore must be acquired before spawning, or all four chunks go out at once"
         );
     }
 
@@ -1385,7 +1391,7 @@ mod tests {
     async fn a_short_range_read_fails_the_task_and_never_completes() {
         let object = make_object((16 * MB) as usize);
         let total = object.len() as u64;
-        let short = multipart_plan(total)[0].length - 1;
+        let short = download_chunks(total)[0].length - 1;
         let rig = rig(4, object.clone(), |fake| {
             *fake.short_chunk.lock().unwrap() = Some((1, short));
         });
@@ -1411,7 +1417,9 @@ mod tests {
     // bytes are gone too, so a correct restart re-fetches chunk 1 as well.
     #[tokio::test]
     async fn a_resume_with_a_missing_bcpart_restarts_cleanly() {
-        let object = make_object((16 * MB) as usize);
+        // At the threshold -> two equal chunks, so chunk 2 exists to compare
+        // against the re-fetched chunk 1.
+        let object = make_object(download_threshold() as usize);
         let total = object.len() as u64;
         let rig = rig(4, object.clone(), |_| {});
 
@@ -1454,7 +1462,8 @@ mod tests {
     // never re-fetched, and its garbage survives into the assembled file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn download_resume_restarts_when_the_etag_changed() {
-        let object = make_object((16 * MB) as usize);
+        // At the threshold -> two equal chunks.
+        let object = make_object(download_threshold() as usize);
         let total = object.len() as u64;
         let rig = rig(4, object.clone(), |fake| {
             // "current" object differs from the one the checkpoint was cut against.
@@ -1463,7 +1472,7 @@ mod tests {
 
         // Pre-stage a stale chunk 1 recorded complete under the OLD etag, with
         // deliberately wrong bytes so a reused-partial bug corrupts the file.
-        let plan = multipart_plan(total);
+        let plan = download_chunks(total);
         let c1 = plan[0];
         {
             let pf = PartFile::create(&rig.target, total).unwrap();
@@ -1513,13 +1522,14 @@ mod tests {
     // 1's call count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn download_resume_continues_when_the_etag_matches() {
-        let object = make_object((16 * MB) as usize);
+        // At the threshold -> two equal chunks, so chunk 2 is left to fetch.
+        let object = make_object(download_threshold() as usize);
         let total = object.len() as u64;
         let rig = rig(4, object.clone(), |_| {}); // default head etag == OBJECT_ETAG
 
         // Pre-stage chunk 1 with its CORRECT bytes; the resume records it done
         // under the same etag the head still reports.
-        let plan = multipart_plan(total);
+        let plan = download_chunks(total);
         let c1 = plan[0];
         {
             let pf = PartFile::create(&rig.target, total).unwrap();
@@ -1570,7 +1580,7 @@ mod tests {
             fake.head_missing.store(true, Ordering::SeqCst);
         });
 
-        let plan = multipart_plan(total);
+        let plan = download_chunks(total);
         let c1 = plan[0];
         {
             let pf = PartFile::create(&rig.target, total).unwrap();

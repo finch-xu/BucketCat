@@ -65,7 +65,7 @@ use crate::transfer::checkpoint::{self, Checkpoint};
 use crate::transfer::model::{
     next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto,
 };
-use crate::transfer::part::{plan_upload, PartSpec, UploadPlan};
+use crate::transfer::part::{plan_download, TransferTuning};
 use crate::transfer::partfile::bcpart_path;
 use crate::transfer::progress::ProgressMsg;
 
@@ -436,26 +436,21 @@ struct TaskRecord {
 /// - **Upload**: the sum of the recorded multipart parts' sizes, straight from
 ///   the [`UploadedPart`]s the previous run committed.
 /// - **Download**: the sum of the plan chunks whose 1-based `number` the
-///   checkpoint marks done. The chunk boundaries are a pure function of `total`
-///   ([`plan_upload`]), rebuilt here exactly as the download runner derives
-///   them, so no `.bcpart` or network read is needed to size them.
+///   checkpoint marks done. The chunk boundaries are a pure function of
+///   `total` ([`plan_download`]), rebuilt here exactly as the download
+///   runner derives them, so no `.bcpart` or network read is needed to size
+///   them. Rebuilt under the default (balanced) tuning until a future task
+///   records each task's actual `part_size`, at which point this can derive
+///   the chunk table from that recorded value instead (via `chunks_for`)
+///   rather than re-deriving it from `total` alone -- the two only agree
+///   when the checkpoint was cut under the default tuning.
 fn checkpoint_completed_bytes(cp: &Checkpoint) -> u64 {
     match &cp.resume {
         ResumeState::Upload(ms) => ms.completed.iter().map(|p| p.size).sum(),
         ResumeState::Download(ds) => {
             let done: std::collections::HashSet<i32> = ds.completed_parts.iter().copied().collect();
-            // Mirror the download runner's chunk derivation (see
-            // `download.rs`): a small object is one chunk numbered 1, a large
-            // one is the multipart plan's parts unchanged.
-            let chunks: Vec<PartSpec> = match plan_upload(cp.total) {
-                UploadPlan::Single { length } => vec![PartSpec {
-                    number: 1,
-                    offset: 0,
-                    length,
-                }],
-                UploadPlan::Multipart { parts, .. } => parts,
-            };
-            chunks
+            plan_download(cp.total, &TransferTuning::default())
+                .chunks
                 .iter()
                 .filter(|c| done.contains(&c.number))
                 .map(|c| c.length)
@@ -2368,10 +2363,11 @@ mod tests {
         );
     }
 
-    /// A download checkpoint marking two of a 100 MiB object's 8 MiB chunks
-    /// done. `plan_upload(100 MiB)` splits it into 13 chunks (the last short),
-    /// the first twelve exactly `MIN_PART_SIZE`, so "chunks 1 and 2 done" means
-    /// the restored task's `transferred` must be exactly `2 * 8 MiB`.
+    /// A download checkpoint marking two of a 100 MiB object's chunks done.
+    /// Under the default (balanced) tuning, `plan_download(100 MiB, ...)`
+    /// splits it into four 32 MiB chunks (the last short), so "chunks 1 and 2
+    /// done" means the restored task's `transferred` must be exactly
+    /// `2 * 32 MiB`.
     fn download_checkpoint_with_two_completed_chunks() -> Checkpoint {
         Checkpoint {
             direction: Direction::Download,
@@ -2411,8 +2407,8 @@ mod tests {
         );
         assert_eq!(
             dto.transferred,
-            16 * 1024 * 1024,
-            "the two completed 8 MiB chunks must be preset as transferred, not left at 0"
+            64 * 1024 * 1024,
+            "the two completed 32 MiB chunks must be preset as transferred, not left at 0"
         );
         // The panel learns of the restored row only through the sink -- there
         // is no IPC return value on the startup path.

@@ -81,12 +81,11 @@ use sha2::{Digest, Sha256};
 use bucketcat_lib::commands::transfer::local_target;
 use bucketcat_lib::provider::{from_connection, Provider, ProviderHub, S3Provider, UploadedPart};
 use bucketcat_lib::store::{Connection, SecureStore};
-use bucketcat_lib::transfer::part::MULTIPART_THRESHOLD;
 use bucketcat_lib::transfer::{
-    bcpart_path, checkpoint, plan_upload, restore_all, spawn_aggregator, Direction, DispatchRunner,
-    DownloadRunner, EngineConfig, EnqueueSpec, MultipartState, ProgressPayload, ProgressSink,
-    ResumeState, TransferEngine, TransferSink, TransferStatus, TransferTaskDto, UploadPlan,
-    UploadRunner,
+    bcpart_path, checkpoint, plan_download, plan_upload_with, restore_all, spawn_aggregator,
+    Direction, DispatchRunner, DownloadRunner, EngineConfig, EnqueueSpec, MultipartState,
+    ProgressPayload, ProgressSink, ResumeState, TransferEngine, TransferSink, TransferStatus,
+    TransferTaskDto, TransferTuning, UploadPlan, UploadRunner,
 };
 
 // --- M3 object data-plane helpers ------------------------------------------
@@ -895,9 +894,10 @@ async fn cleanup_bucket(client: &aws_sdk_s3::Client, provider: &S3Provider, buck
 }
 
 /// Uploads `path` (of `total` bytes) via the provider transfer primitives,
-/// following `plan_upload` exactly as `UploadRunner` does: a single
-/// `PutObject` below the threshold, otherwise create + sequential parts +
-/// complete. Parts are sent in plan order here (out-of-order is its own test).
+/// following `plan_upload_with` (under the default tuning) exactly as
+/// `UploadRunner` does: a single `PutObject` below the threshold, otherwise
+/// create + sequential parts + complete. Parts are sent in plan order here
+/// (out-of-order is its own test).
 async fn upload_via_primitives(
     provider: &S3Provider,
     bucket: &str,
@@ -905,7 +905,7 @@ async fn upload_via_primitives(
     path: &Path,
     total: u64,
 ) {
-    match plan_upload(total) {
+    match plan_upload_with(total, &TransferTuning::default()) {
         UploadPlan::Single { length } => {
             provider
                 .put_object_from_file(bucket, key, path, length)
@@ -973,7 +973,7 @@ async fn assert_round_trip_hash(
 
 // --- Group A: provider-primitive round trips -------------------------------
 
-/// A ~1MB file goes up as a single `PutObject` (below the 16MB threshold) and
+/// A ~1MB file goes up as a single `PutObject` (below the 32MB threshold) and
 /// comes back in the listing with the right key and size. Covers the
 /// single-stream path.
 #[tokio::test]
@@ -1013,7 +1013,7 @@ async fn upload_small_file_round_trips() {
 }
 
 /// ~40MB of seeded, non-compressible content, uploaded part by part per
-/// `plan_upload`, then completed, then read back with a SHA-256 equality
+/// `plan_upload_with`, then completed, then read back with a SHA-256 equality
 /// check against the source. This is design §8's explicit hash-verification
 /// requirement, and the only proof that every part landed at the right offset.
 #[tokio::test]
@@ -1032,7 +1032,10 @@ async fn upload_multipart_file_round_trips_with_matching_hash() {
     let size = 40 * MB;
     write_pseudo_random_file(&path, size, 0x5EED_0002);
     assert!(
-        matches!(plan_upload(size), UploadPlan::Multipart { .. }),
+        matches!(
+            plan_upload_with(size, &TransferTuning::default()),
+            UploadPlan::Multipart { .. }
+        ),
         "40MB must plan as a multipart upload for this test to mean anything"
     );
 
@@ -1066,17 +1069,17 @@ async fn parts_uploaded_out_of_order_still_complete() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("outoforder.bin");
-    let size = 24 * MB; // three 8MB parts at the floor part size.
+    let size = 48 * MB; // three 16MB parts at the floor part size.
     write_pseudo_random_file(&path, size, 0x5EED_0003);
 
-    let parts = match plan_upload(size) {
+    let parts = match plan_upload_with(size, &TransferTuning::default()) {
         UploadPlan::Multipart { parts, .. } => parts,
-        UploadPlan::Single { .. } => panic!("24MB must plan as multipart"),
+        UploadPlan::Single { .. } => panic!("48MB must plan as multipart"),
     };
     assert_eq!(
         parts.len(),
         3,
-        "24MB at the 8MB floor is exactly three parts"
+        "48MB at the 16MB floor is exactly three parts"
     );
 
     let key = "uploads/outoforder.bin";
@@ -1136,17 +1139,17 @@ async fn a_shrinking_file_fails_before_uploading_a_short_part() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("shrinking.bin");
-    let size = 16 * MB; // two 8MB parts.
+    let size = 32 * MB; // two 16MB parts.
     write_pseudo_random_file(&path, size, 0x5EED_0004);
-    let parts = match plan_upload(size) {
+    let parts = match plan_upload_with(size, &TransferTuning::default()) {
         UploadPlan::Multipart { parts, .. } => parts,
-        UploadPlan::Single { .. } => panic!("16MB must plan as multipart"),
+        UploadPlan::Single { .. } => panic!("32MB must plan as multipart"),
     };
 
     let key = "uploads/shrinking.bin";
     let upload_id = provider.multipart_init(&bucket, key).await.expect("init");
 
-    // Truncate AFTER planning: part 1 (offset 0, length 8MB) no longer fits.
+    // Truncate AFTER planning: part 1 (offset 0, length 16MB) no longer fits.
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
@@ -1270,12 +1273,12 @@ async fn multipart_list_returns_the_accepted_parts() {
     let key = "mp/list.bin";
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("src.bin");
-    write_pseudo_random_file(&path, 20 * MB, 0x5EED_2001);
+    write_pseudo_random_file(&path, 32 * MB, 0x5EED_2001);
 
     let upload_id = provider.multipart_init(&bucket, key).await.expect("init");
-    let plan = match plan_upload(20 * MB) {
+    let plan = match plan_upload_with(32 * MB, &TransferTuning::default()) {
         UploadPlan::Multipart { parts, .. } => parts,
-        _ => panic!("20MB must be multipart"),
+        _ => panic!("32MB must be multipart"),
     };
     for p in plan.iter().take(2) {
         provider
@@ -1299,8 +1302,8 @@ async fn multipart_list_returns_the_accepted_parts() {
 }
 
 /// A 0-byte file lands as a real 0-byte object. The single-stream path
-/// (`plan_upload(0) == Single { length: 0 }`) must handle an empty body --
-/// this is folder-marker-adjacent and easy to get wrong.
+/// (`plan_upload_with(0, ..) == Single { length: 0 }`) must handle an empty
+/// body -- this is folder-marker-adjacent and easy to get wrong.
 #[tokio::test]
 #[ignore]
 async fn zero_byte_file_round_trips() {
@@ -1316,7 +1319,10 @@ async fn zero_byte_file_round_trips() {
     let path = dir.path().join("empty.bin");
     std::fs::write(&path, b"").expect("write empty fixture");
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-    assert_eq!(plan_upload(0), UploadPlan::Single { length: 0 });
+    assert_eq!(
+        plan_upload_with(0, &TransferTuning::default()),
+        UploadPlan::Single { length: 0 }
+    );
 
     let key = "uploads/empty.bin";
     provider
@@ -1340,9 +1346,9 @@ async fn zero_byte_file_round_trips() {
 }
 
 /// The two files straddling the multipart threshold each round-trip with a
-/// hash check: exactly `MULTIPART_THRESHOLD` (multipart) and
-/// `MULTIPART_THRESHOLD - 1` (single stream). That boundary selects between
-/// two entirely different code paths, so both sides are proven.
+/// hash check: exactly `TransferTuning::default().upload_threshold`
+/// (multipart) and one byte below it (single stream). That boundary selects
+/// between two entirely different code paths, so both sides are proven.
 #[tokio::test]
 #[ignore]
 async fn threshold_boundary_files_each_land() {
@@ -1355,13 +1361,14 @@ async fn threshold_boundary_files_each_land() {
         .expect("create bucket");
 
     let dir = tempfile::tempdir().expect("tempdir");
+    let threshold = TransferTuning::default().upload_threshold;
 
     // Exactly at the threshold -> multipart.
     let at_path = dir.path().join("at-threshold.bin");
-    write_pseudo_random_file(&at_path, MULTIPART_THRESHOLD, 0x5EED_0801);
+    write_pseudo_random_file(&at_path, threshold, 0x5EED_0801);
     assert!(
         matches!(
-            plan_upload(MULTIPART_THRESHOLD),
+            plan_upload_with(threshold, &TransferTuning::default()),
             UploadPlan::Multipart { .. }
         ),
         "the threshold itself must plan as multipart"
@@ -1372,16 +1379,16 @@ async fn threshold_boundary_files_each_land() {
         &bucket,
         "uploads/at-threshold.bin",
         &at_path,
-        MULTIPART_THRESHOLD,
+        threshold,
     )
     .await;
 
     // One byte below -> single stream.
     let below_path = dir.path().join("below-threshold.bin");
-    write_pseudo_random_file(&below_path, MULTIPART_THRESHOLD - 1, 0x5EED_0802);
+    write_pseudo_random_file(&below_path, threshold - 1, 0x5EED_0802);
     assert!(
         matches!(
-            plan_upload(MULTIPART_THRESHOLD - 1),
+            plan_upload_with(threshold - 1, &TransferTuning::default()),
             UploadPlan::Single { .. }
         ),
         "one byte below the threshold must plan as single stream"
@@ -1392,7 +1399,7 @@ async fn threshold_boundary_files_each_land() {
         &bucket,
         "uploads/below-threshold.bin",
         &below_path,
-        MULTIPART_THRESHOLD - 1,
+        threshold - 1,
     )
     .await;
 
@@ -2025,10 +2032,13 @@ async fn cancelling_a_paused_upload_reaps_fragments() {
 // These mirror the upload engine tests above: the same real `TransferEngine`
 // (now a `DispatchRunner`, so it routes by `Direction`), the same `live_hub`,
 // `CollectingSink`, `wait_for_status`/`wait_for_mid_flight` timing, and the
-// same 60MB / `max_parts = 1` recipe for a deterministic mid-flight window.
-// A download stages into `<final>.bcpart` and renames to `<final>` only on
-// completion, so `bcpart_path` + "the final path must not exist mid-flight" is
-// how the no-half-file contract is asserted. Every test is `#[ignore]`d.
+// same `max_parts = 1` recipe for a deterministic mid-flight window. Sized at
+// 80MB rather than Group C's 60MB: the M6 split gives download its own
+// threshold (64MB under the default tuning, independent of upload's 32MB), so
+// a multi-chunk download test has to clear that higher bar. A download stages
+// into `<final>.bcpart` and renames to `<final>` only on completion, so
+// `bcpart_path` + "the final path must not exist mid-flight" is how the
+// no-half-file contract is asserted. Every test is `#[ignore]`d.
 // ===========================================================================
 
 /// Seeds `key` in `bucket` with `size` bytes of deterministic pseudo-random
@@ -2129,9 +2139,10 @@ async fn folder_download_via_engine(
     ids
 }
 
-/// Test 1: a small (single-stream, below the 16MB threshold) file downloads
-/// byte-for-byte, and the degenerate 0-byte object downloads to a correct
-/// empty local file (the live mirror of the `a_zero_byte_object...` unit test).
+/// Test 1: a small (single-stream, below the download planner's own 64MB
+/// threshold) file downloads byte-for-byte, and the degenerate 0-byte object
+/// downloads to a correct empty local file (the live mirror of the
+/// `a_zero_byte_object...` unit test).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn download_small_file_round_trips() {
@@ -2231,10 +2242,12 @@ async fn download_small_file_round_trips() {
     drop(hub);
 }
 
-/// Test 2: a ~40MB multipart (Range-chunked) download hash-matches the source.
-/// This is the ONLY proof each chunk's `(offset, length)` landed at the right
-/// LOCAL offset: a per-chunk offset bug is invisible to the unit tests' fake
-/// provider but corrupts this SHA-256. 40MB is exactly five 8MB chunks.
+/// Test 2: an 80MB multipart (Range-chunked) download hash-matches the
+/// source. This is the ONLY proof each chunk's `(offset, length)` landed at
+/// the right LOCAL offset: a per-chunk offset bug is invisible to the unit
+/// tests' fake provider but corrupts this SHA-256. 80MB clears the download
+/// planner's own 64MB threshold (independent of the upload threshold since
+/// the M6 split).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn download_multipart_file_matches_hash() {
@@ -2255,12 +2268,15 @@ async fn download_multipart_file_matches_hash() {
     let engine = build_engine(Arc::clone(&hub), sink.clone(), 4);
 
     let key = "downloads/multipart.bin";
-    let size = 40 * MB;
+    let size = 80 * MB;
     let src = seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1002).await;
     // Sanity: this must genuinely exercise the chunked path, not a single GET.
+    // The DOWNLOAD plan is what matters here, not the upload plan used to seed
+    // the object above -- the two have been independently tunable since M6.
     assert!(
-        matches!(plan_upload(size), UploadPlan::Multipart { .. }),
-        "40MB must plan as multipart or this test proves nothing about chunk offsets"
+        plan_download(size, &TransferTuning::default()).chunks.len() > 1,
+        "80MB must plan as multipart for a download or this test proves nothing about chunk \
+         offsets"
     );
 
     let target = dl_dir.path().join("multipart.bin");
@@ -2289,7 +2305,7 @@ async fn download_multipart_file_matches_hash() {
     assert_eq!(
         hex(&sha256_file(&target)),
         hex(&sha256_file(&src)),
-        "every 8MB chunk must land at its own local offset: a mismatch here is a real \
+        "every download chunk must land at its own local offset: a mismatch here is a real \
          offset/length bug, not a flake"
     );
 
@@ -2298,7 +2314,7 @@ async fn download_multipart_file_matches_hash() {
 }
 
 /// Test 3: chunk offsets land correctly, verified segment-by-segment. The
-/// source is built so each 8MB segment holds a distinct constant byte (segment
+/// source is built so each segment holds a distinct constant byte (segment
 /// `i` is all `i`), so two swapped chunks -- which a whole-file hash would also
 /// catch but not localize -- are pinned to the exact offending segment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2320,9 +2336,11 @@ async fn download_chunks_land_at_correct_offsets() {
     let sink = Arc::new(CollectingSink::default());
     let engine = build_engine(Arc::clone(&hub), sink.clone(), 4);
 
-    // Five 8MB segments, aligned to the 8MB chunk plan, each a distinct byte.
-    let segment = 8 * MB as usize;
-    let segments = 5usize;
+    // Three segments at the download planner's own chunk floor (32MB under the
+    // default tuning -- independent of the upload floor since the M6 split),
+    // each a distinct byte, so the segments line up exactly with the chunk plan.
+    let segment = TransferTuning::default().download_chunk_floor as usize;
+    let segments = 3usize;
     let mut object = Vec::with_capacity(segment * segments);
     for i in 0..segments {
         object.extend(std::iter::repeat_n(i as u8, segment));
@@ -2331,6 +2349,16 @@ async fn download_chunks_land_at_correct_offsets() {
     let src = src_dir.path().join("segmented.bin");
     std::fs::write(&src, &object).expect("write segmented source");
     upload_via_primitives(&provider, &bucket, key, &src, object.len() as u64).await;
+    // Sanity: the segments above are only useful if they actually line up with
+    // real download chunk boundaries.
+    assert_eq!(
+        plan_download(object.len() as u64, &TransferTuning::default())
+            .chunks
+            .len(),
+        segments,
+        "the object size must plan into exactly `segments` download chunks for this test to \
+         localize a swapped chunk"
+    );
 
     let target = dl_dir.path().join("segmented.bin");
     let total = download_total(&provider, &bucket, key).await;
@@ -2398,7 +2426,7 @@ async fn pausing_then_resuming_download_matches_hash() {
     let engine = build_engine(Arc::clone(&hub), sink.clone(), 1);
 
     let key = "downloads/pause-resume.bin";
-    let size = 60 * MB;
+    let size = 80 * MB;
     let src = seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1004).await;
 
     let target = dl_dir.path().join("pause-resume.bin");
@@ -2503,7 +2531,7 @@ async fn cancelling_a_download_deletes_the_bcpart() {
     let engine = build_engine(Arc::clone(&hub), sink.clone(), 1);
 
     let key = "downloads/cancel.bin";
-    let size = 60 * MB;
+    let size = 80 * MB;
     seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1005).await;
 
     let target = dl_dir.path().join("cancel.bin");
@@ -2573,7 +2601,7 @@ async fn cancelling_a_paused_download_deletes_the_bcpart() {
     let engine = build_engine(Arc::clone(&hub), sink.clone(), 1);
 
     let key = "downloads/paused-cancel.bin";
-    let size = 60 * MB;
+    let size = 80 * MB;
     seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_1006).await;
 
     let target = dl_dir.path().join("paused-cancel.bin");
@@ -3078,7 +3106,7 @@ async fn download_survives_a_restart_and_resumes_without_refetching() {
     let hub = live_hub(connection_id, &hub_dir).await;
 
     let key = "downloads/restart-download.bin";
-    let size = 60 * MB;
+    let size = 80 * MB;
     let src = seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_4002).await;
     let target = dl_dir.path().join("restart-download.bin");
     let total = download_total(&provider, &bucket, key).await;
@@ -3345,7 +3373,7 @@ async fn download_restarts_from_scratch_when_the_etag_changed() {
     let hub = live_hub(connection_id, &hub_dir).await;
 
     let key = "downloads/etag-changed.bin";
-    let size = 60 * MB;
+    let size = 80 * MB;
     let old_src =
         seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_4004).await;
     let old_hash = sha256_file(&old_src);
@@ -3491,7 +3519,7 @@ async fn orphan_checkpoint_of_a_deleted_connection_is_discarded_on_startup() {
     let hub = live_hub(connection_id, &hub_dir).await;
 
     let key = "downloads/orphan.bin";
-    let size = 60 * MB;
+    let size = 80 * MB;
     seed_random_object(&provider, &bucket, key, src_dir.path(), size, 0x5EED_4005).await;
     let target = dl_dir.path().join("orphan.bin");
     let total = download_total(&provider, &bucket, key).await;

@@ -1,26 +1,40 @@
-//! Upload chunking strategy (design §5). Pure arithmetic, no IO.
-
-/// Files smaller than this go up as a single `PutObject`; multipart's three
-/// extra round trips (create / complete, plus per-part overhead) cost more
-/// than they save below it.
-pub const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
+//! Upload/download chunking strategy (design §5, §4.2). Pure arithmetic, no IO.
+//!
+//! Upload and download used to share one planner (`plan_upload`, reused
+//! verbatim by the download runner because the offset/length arithmetic is
+//! identical). [`TransferTuning`] splits them apart: the upload planner still
+//! has to respect S3's hard multipart invariants (non-final parts equal
+//! size, ≥5MB, ≤5GB, ≤10 000 parts total -- see [`MIN_PART_SIZE`],
+//! [`MAX_PART_SIZE`], [`MAX_PARTS`]), while the download planner answers a
+//! different question -- how many concurrent Range GETs to fan out -- with
+//! its own threshold, floor and target part count, capped only by
+//! [`DOWNLOAD_CHUNK_CAP`]. Both planners bottom out in the same
+//! [`chunks_for`] splitter.
 
 /// Lower bound on a part. S3 and OSS both reject non-final parts under 5MB;
-/// 8MB keeps a margin and matches design §5.
+/// 8MB keeps a margin and matches design §5. Every preset's
+/// `upload_part_floor` stays at or above this.
 pub const MIN_PART_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Upper bound on a part, imposed by S3's `UploadPart` API.
 pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Target part count for large files. S3/OSS cap an upload at 10 000 parts;
-/// aiming at 1 000 leaves an order of magnitude of headroom, so a future
-/// change to the floor can never walk into the hard limit.
-pub const PART_DIVISOR: u64 = 1_000;
-
 /// The protocol's hard ceiling, asserted against in tests.
 pub const MAX_PARTS: u64 = 10_000;
 
-/// One part of a multipart upload. `number` is 1-based, as S3 requires.
+/// Upper bound on a download chunk. A download chunk is not an S3 multipart
+/// part -- there is no protocol ceiling to respect -- but an unbounded chunk
+/// on a multi-TB object would mean a single Range GET holding a connection
+/// open for hours with nothing smaller to retry. 256MB keeps a retry cheap
+/// no matter how large the object.
+pub const DOWNLOAD_CHUNK_CAP: u64 = 256 * 1024 * 1024;
+
+const MB: u64 = 1024 * 1024;
+
+/// One part of a multipart upload, or one Range GET chunk of a download.
+/// `number` is 1-based, matching what S3's multipart API requires (a
+/// download reuses the same numbering purely so resume bookkeeping -- which
+/// tracks "finished chunk numbers" for both directions -- can stay uniform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartSpec {
     pub number: i32,
@@ -40,40 +54,111 @@ pub enum UploadPlan {
     },
 }
 
-/// Compute the size of each part in a multipart upload.
-///
-/// Returns `max(8MB, ceil(total / 1000))`, clamped to S3's 5GB per-part ceiling.
-///
-/// The ceiling only binds above roughly 5TB-scale objects (5TB/1000 ≈ 5.12GB),
-/// right at S3's own 5TB maximum object size. Without it, such a file would be
-/// rejected by the server with EntityTooLarge rather than rejected by us during
-/// planning.
-///
-/// `clamp` is used instead of `.max().min()` because it panics if the two
-/// constants are ever set in the wrong relative order, whereas the chain would
-/// silently misbehave.
-pub fn part_size_for(total: u64) -> u64 {
-    total
-        .div_ceil(PART_DIVISOR)
-        .clamp(MIN_PART_SIZE, MAX_PART_SIZE)
+/// How a given object will be downloaded. `chunk_size` is the target size
+/// used to derive `chunks` (the last chunk may be shorter); kept alongside
+/// the chunks themselves so a caller (the download runner's resume path,
+/// once it records `part_size` per task) can persist it without
+/// recomputing it from `chunks[0]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadPlan {
+    pub chunk_size: u64,
+    pub chunks: Vec<PartSpec>,
 }
 
-/// Splits `total` bytes into an upload plan.
-///
-/// The returned plan's part count stays within [`MAX_PARTS`] for `total` up to
-/// approximately 48TB, far beyond S3's 5TB maximum object size. Callers uploading
-/// real files to S3 are always within this range.
-pub fn plan_upload(total: u64) -> UploadPlan {
-    if total < MULTIPART_THRESHOLD {
-        return UploadPlan::Single { length: total };
+/// The tuning knobs behind the three presets a user picks from in Settings
+/// (M6). Upload and download are tuned independently: an upload's floor and
+/// target part count are chosen with S3's multipart protocol in mind, while
+/// a download's are a pure concurrency/throughput trade-off bounded only by
+/// [`DOWNLOAD_CHUNK_CAP`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferTuning {
+    /// Files smaller than this go up as a single `PutObject`; multipart's
+    /// extra round trips (create / complete, plus per-part overhead) cost
+    /// more than they save below it.
+    pub upload_threshold: u64,
+    /// Lower bound on a computed upload part size.
+    pub upload_part_floor: u64,
+    /// The upload part count planning aims for; `total.div_ceil(this)` is
+    /// the starting point before the floor/[`MAX_PART_SIZE`] clamp.
+    pub upload_target_parts: u64,
+    /// Objects smaller than this download as a single Range GET.
+    pub download_threshold: u64,
+    /// Lower bound on a computed download chunk size.
+    pub download_chunk_floor: u64,
+    /// The download chunk count planning aims for; `total.div_ceil(this)` is
+    /// the starting point before the floor/[`DOWNLOAD_CHUNK_CAP`] clamp.
+    pub download_target_parts: u64,
+}
+
+impl TransferTuning {
+    /// Fewer, larger parts/chunks: gentler on flaky or metered connections
+    /// at the cost of parallelism.
+    pub const fn conservative() -> Self {
+        Self {
+            upload_threshold: 64 * MB,
+            upload_part_floor: 32 * MB,
+            upload_target_parts: 16,
+            download_threshold: 128 * MB,
+            download_chunk_floor: 64 * MB,
+            download_target_parts: 8,
+        }
     }
 
-    let part_size = part_size_for(total);
-    let count = total.div_ceil(part_size);
-    let mut parts = Vec::with_capacity(count as usize);
+    /// The default preset: a middle ground suited to most connections.
+    pub const fn balanced() -> Self {
+        Self {
+            upload_threshold: 32 * MB,
+            upload_part_floor: 16 * MB,
+            upload_target_parts: 32,
+            download_threshold: 64 * MB,
+            download_chunk_floor: 32 * MB,
+            download_target_parts: 16,
+        }
+    }
 
-    let mut offset = 0u64;
-    let mut number = 1i32;
+    /// More, smaller parts/chunks: maximizes parallelism on fast, stable
+    /// connections at the cost of per-request overhead.
+    pub const fn aggressive() -> Self {
+        Self {
+            upload_threshold: 16 * MB,
+            upload_part_floor: 8 * MB,
+            upload_target_parts: 100,
+            download_threshold: 16 * MB,
+            download_chunk_floor: 8 * MB,
+            download_target_parts: 64,
+        }
+    }
+}
+
+impl Default for TransferTuning {
+    /// Balanced is the default preset (design §4.2).
+    fn default() -> Self {
+        Self::balanced()
+    }
+}
+
+/// Splits `total` bytes into equal-`part_size` chunks, the last one short.
+///
+/// Shared by both planners below, and reused directly by a resume path as
+/// `chunks_for(total, recorded_part_size)` to reproduce a prior run's exact
+/// chunk table from nothing but those two scalars -- the basis of checkpoint
+/// resume, since neither `total` nor a recorded `part_size` drift between
+/// runs of the same transfer.
+///
+/// `total == 0`, `part_size == 0` or `total <= part_size` all collapse to a
+/// single chunk spanning the whole object -- 0 bytes included, since a
+/// 0-byte object is a real, common case (an M3 folder marker) and a plan
+/// with zero parts is not.
+pub fn chunks_for(total: u64, part_size: u64) -> Vec<PartSpec> {
+    if total == 0 || part_size == 0 || total <= part_size {
+        return vec![PartSpec {
+            number: 1,
+            offset: 0,
+            length: total,
+        }];
+    }
+    let mut parts = Vec::with_capacity(total.div_ceil(part_size) as usize);
+    let (mut offset, mut number) = (0u64, 1i32);
     while offset < total {
         let length = part_size.min(total - offset);
         parts.push(PartSpec {
@@ -84,8 +169,51 @@ pub fn plan_upload(total: u64) -> UploadPlan {
         offset += length;
         number += 1;
     }
+    parts
+}
 
-    UploadPlan::Multipart { part_size, parts }
+/// Splits `total` bytes into an upload plan under tuning `t`.
+///
+/// Below `t.upload_threshold`, a single `PutObject`. At or above it, a
+/// multipart plan whose part size targets `t.upload_target_parts` equal
+/// parts, floored at `t.upload_part_floor` and ceilinged at
+/// [`MAX_PART_SIZE`] -- the ceiling only binds on multi-TB objects, where it
+/// keeps the part count within [`MAX_PARTS`] instead of the server rejecting
+/// an oversized part with `EntityTooLarge`.
+pub fn plan_upload_with(total: u64, t: &TransferTuning) -> UploadPlan {
+    if total < t.upload_threshold {
+        return UploadPlan::Single { length: total };
+    }
+    let part_size = total
+        .div_ceil(t.upload_target_parts)
+        .clamp(t.upload_part_floor, MAX_PART_SIZE);
+    UploadPlan::Multipart {
+        part_size,
+        parts: chunks_for(total, part_size),
+    }
+}
+
+/// Splits `total` bytes into a download plan under tuning `t`.
+///
+/// Below `t.download_threshold`, a single chunk spanning the whole object
+/// (a single Range GET, or for a 0-byte object a single length-0 chunk the
+/// download runner still fetches, per [`chunks_for`]). At or above it,
+/// `t.download_target_parts` equal chunks, floored at
+/// `t.download_chunk_floor` and ceilinged at [`DOWNLOAD_CHUNK_CAP`].
+pub fn plan_download(total: u64, t: &TransferTuning) -> DownloadPlan {
+    if total < t.download_threshold {
+        return DownloadPlan {
+            chunk_size: total,
+            chunks: chunks_for(total, total),
+        };
+    }
+    let chunk_size = total
+        .div_ceil(t.download_target_parts)
+        .clamp(t.download_chunk_floor, DOWNLOAD_CHUNK_CAP);
+    DownloadPlan {
+        chunk_size,
+        chunks: chunks_for(total, chunk_size),
+    }
 }
 
 #[cfg(test)]
@@ -96,120 +224,157 @@ mod tests {
     const GB: u64 = 1024 * MB;
     const TB: u64 = 1024 * GB;
 
-    fn parts_of(plan: &UploadPlan) -> &[PartSpec] {
-        match plan {
-            UploadPlan::Multipart { parts, .. } => parts,
-            UploadPlan::Single { .. } => panic!("expected a multipart plan"),
-        }
-    }
-
     #[test]
-    fn empty_file_is_a_single_zero_length_put() {
+    fn empty_upload_is_a_single_zero_length_put() {
         // A zero-byte object is legal and common (it is exactly how M3
-        // creates folder markers); multipart with zero parts is not.
-        assert_eq!(plan_upload(0), UploadPlan::Single { length: 0 });
-    }
-
-    #[test]
-    fn below_the_threshold_stays_single_stream() {
-        assert_eq!(plan_upload(1), UploadPlan::Single { length: 1 });
+        // creates folder markers); multipart with zero parts is not. Kept
+        // from the pre-split suite: `plan_upload_with` replaces `plan_upload`
+        // but must preserve this invariant for every tuning.
         assert_eq!(
-            plan_upload(MULTIPART_THRESHOLD - 1),
-            UploadPlan::Single {
-                length: MULTIPART_THRESHOLD - 1
-            }
+            plan_upload_with(0, &TransferTuning::default()),
+            UploadPlan::Single { length: 0 }
         );
     }
 
     #[test]
-    fn exactly_at_the_threshold_goes_multipart() {
-        // Design §5 says "< 16MB single stream", so 16MB itself is multipart.
-        let plan = plan_upload(MULTIPART_THRESHOLD);
-        let parts = parts_of(&plan);
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].length, MIN_PART_SIZE);
-        assert_eq!(parts[1].length, MIN_PART_SIZE);
+    fn presets_match_the_spec_table() {
+        let b = TransferTuning::balanced();
+        assert_eq!(b.upload_threshold, 32 * MB);
+        assert_eq!(b.upload_part_floor, 16 * MB);
+        assert_eq!(b.upload_target_parts, 32);
+        assert_eq!(b.download_threshold, 64 * MB);
+        assert_eq!(b.download_chunk_floor, 32 * MB);
+        assert_eq!(b.download_target_parts, 16);
+        let c = TransferTuning::conservative();
+        assert_eq!(
+            (
+                c.upload_threshold,
+                c.upload_part_floor,
+                c.upload_target_parts
+            ),
+            (64 * MB, 32 * MB, 16)
+        );
+        assert_eq!(
+            (
+                c.download_threshold,
+                c.download_chunk_floor,
+                c.download_target_parts
+            ),
+            (128 * MB, 64 * MB, 8)
+        );
+        let a = TransferTuning::aggressive();
+        assert_eq!(
+            (
+                a.upload_threshold,
+                a.upload_part_floor,
+                a.upload_target_parts
+            ),
+            (16 * MB, 8 * MB, 100)
+        );
+        assert_eq!(
+            (
+                a.download_threshold,
+                a.download_chunk_floor,
+                a.download_target_parts
+            ),
+            (16 * MB, 8 * MB, 64)
+        );
     }
 
     #[test]
-    fn hundred_megabytes_uses_the_floor_part_size() {
-        // 100MB / 1000 is far below 8MB, so the 8MB floor wins.
-        let plan = plan_upload(100 * MB);
-        assert_eq!(part_size_for(100 * MB), MIN_PART_SIZE);
-        let parts = parts_of(&plan);
-        assert_eq!(parts.len(), 13);
-        assert_eq!(parts[0].number, 1);
-        assert_eq!(parts[0].offset, 0);
-        assert_eq!(parts[12].offset, 12 * MIN_PART_SIZE);
-        assert_eq!(parts[12].length, 100 * MB - 12 * MIN_PART_SIZE);
+    fn download_request_counts_match_the_spec_examples() {
+        // spec §4.2 效果示例表:250MB → 保守 4 / 均衡 8;1GB → 保守 8 / 均衡 16;
+        // 100MB → 保守单流、均衡 4。
+        assert_eq!(
+            plan_download(250 * MB, &TransferTuning::conservative())
+                .chunks
+                .len(),
+            4
+        );
+        assert_eq!(
+            plan_download(250 * MB, &TransferTuning::balanced())
+                .chunks
+                .len(),
+            8
+        );
+        assert_eq!(
+            plan_download(1024 * MB, &TransferTuning::conservative())
+                .chunks
+                .len(),
+            8
+        );
+        assert_eq!(
+            plan_download(1024 * MB, &TransferTuning::balanced())
+                .chunks
+                .len(),
+            16
+        );
+        assert_eq!(
+            plan_download(100 * MB, &TransferTuning::conservative())
+                .chunks
+                .len(),
+            1
+        ); // 单流
+        assert_eq!(
+            plan_download(100 * MB, &TransferTuning::balanced())
+                .chunks
+                .len(),
+            4
+        );
     }
 
     #[test]
-    fn large_files_switch_to_the_divisor() {
-        // 8GB / 1000 = 8.59MB, which is above the 8MB floor, so the divisor
-        // takes over and the part count stays pinned at 1000.
-        let total = 8 * GB;
-        assert!(part_size_for(total) > MIN_PART_SIZE);
-        assert_eq!(parts_of(&plan_upload(total)).len(), 1000);
-    }
-
-    #[test]
-    fn part_size_is_clamped_to_the_s3_maximum() {
-        // 5TB (S3's max object size) / 1000 = 5.12GB, which exceeds the 5GB
-        // per-part ceiling; without the clamp the server would reject the
-        // upload with EntityTooLarge.
-        assert_eq!(part_size_for(5 * TB), MAX_PART_SIZE);
-        assert!(parts_of(&plan_upload(5 * TB)).len() as u64 <= MAX_PARTS);
-    }
-
-    #[test]
-    fn plans_are_internally_consistent() {
-        let sizes = [
-            MULTIPART_THRESHOLD,
-            MULTIPART_THRESHOLD + 1,
-            17 * MB,
-            64 * MB,
-            100 * MB,
-            1023 * MB,
-            7 * GB,
-            8 * GB,
-            64 * GB,
-            5 * TB,
-        ];
-        for total in sizes {
-            let plan = plan_upload(total);
-            let parts = parts_of(&plan);
-            let UploadPlan::Multipart { part_size, .. } = plan else {
-                unreachable!()
-            };
-
-            assert!(!parts.is_empty(), "{total}: empty plan");
-            assert!(parts.len() as u64 <= MAX_PARTS, "{total}: too many parts");
-            assert_eq!(parts[0].offset, 0, "{total}: first part must start at 0");
-
-            let mut expected_offset = 0u64;
-            for (i, part) in parts.iter().enumerate() {
-                assert_eq!(
-                    part.number as usize,
-                    i + 1,
-                    "{total}: part numbers must be 1..=n"
-                );
-                assert_eq!(part.offset, expected_offset, "{total}: gap or overlap");
-                assert!(part.length > 0, "{total}: zero-length part");
-                if i + 1 < parts.len() {
-                    assert_eq!(
-                        part.length, part_size,
-                        "{total}: only the last part may be short"
-                    );
-                } else {
-                    assert!(part.length <= part_size, "{total}: last part too long");
-                }
-                expected_offset += part.length;
+    fn download_below_threshold_is_one_chunk() {
+        let t = TransferTuning::balanced();
+        let p = plan_download(t.download_threshold - 1, &t);
+        assert_eq!(p.chunks.len(), 1);
+        assert_eq!(
+            p.chunks[0],
+            PartSpec {
+                number: 1,
+                offset: 0,
+                length: t.download_threshold - 1
             }
-            assert_eq!(
-                expected_offset, total,
-                "{total}: lengths must sum to the total"
-            );
+        );
+        // 0 字节对象:单个 length-0 chunk(下载 runner 依赖这一点)
+        assert_eq!(plan_download(0, &t).chunks.len(), 1);
+    }
+
+    #[test]
+    fn download_chunk_size_is_capped() {
+        // 10TB / 8(保守)= 1.25TB,必须被 256MB cap 压住
+        let p = plan_download(10 * TB, &TransferTuning::conservative());
+        assert_eq!(p.chunk_size, DOWNLOAD_CHUNK_CAP);
+    }
+
+    #[test]
+    fn upload_invariants_hold_for_every_preset() {
+        // 全预设 × 关键尺寸:非末片等大且 ≥5MB、片数 ≤10000、长度求和恒等
+        for t in [
+            TransferTuning::conservative(),
+            TransferTuning::balanced(),
+            TransferTuning::aggressive(),
+        ] {
+            for total in [t.upload_threshold, 100 * MB, 8 * GB, 5 * TB] {
+                let UploadPlan::Multipart { part_size, parts } = plan_upload_with(total, &t) else {
+                    panic!("{total} should be multipart");
+                };
+                assert!(parts.len() as u64 <= MAX_PARTS);
+                assert!(part_size >= MIN_PART_SIZE);
+                let sum: u64 = parts.iter().map(|p| p.length).sum();
+                assert_eq!(sum, total);
+                for p in &parts[..parts.len() - 1] {
+                    assert_eq!(p.length, part_size, "non-final parts must be equal (R2)");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn chunks_for_reproduces_a_plan_from_its_part_size() {
+        // resume 靠 (total, part_size) 完整复原分片表 —— checkpoint 防错位的基石
+        let t = TransferTuning::balanced();
+        let plan = plan_download(1024 * MB, &t);
+        assert_eq!(chunks_for(1024 * MB, plan.chunk_size), plan.chunks);
     }
 }

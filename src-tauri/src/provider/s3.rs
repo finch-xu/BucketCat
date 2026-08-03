@@ -2002,7 +2002,7 @@ impl Provider for S3Provider {
         // A zero-length range is malformed HTTP (and `range_header` would
         // have to guard against underflowing `offset + length - 1`); a
         // 0-byte object is a real case (a single zero-length chunk from
-        // `plan_upload(0)`), so answer it here without a request.
+        // `plan_download(0, ..)`), so answer it here without a request.
         if length == 0 {
             return Ok(Vec::new());
         }

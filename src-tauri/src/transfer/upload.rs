@@ -38,7 +38,7 @@ use crate::transfer::engine::{
     CheckpointWriter, MultipartState, ResumeState, RunOutcome, StopKind, TaskContext,
     TransferRunner,
 };
-use crate::transfer::part::{plan_upload, PartSpec, UploadPlan};
+use crate::transfer::part::{plan_upload_with, PartSpec, TransferTuning, UploadPlan};
 use crate::transfer::retry::{backoff_delay, is_retryable, MAX_RETRIES};
 
 /// Reports transferred bytes.
@@ -191,7 +191,7 @@ where
         return Ok(RunOutcome::Stopped);
     }
 
-    match plan_upload(total) {
+    match plan_upload_with(total, &TransferTuning::default()) {
         UploadPlan::Single { length } => upload_single(job, provider, length).await,
         UploadPlan::Multipart { parts, part_size } => {
             tracing::info!(
@@ -599,10 +599,23 @@ mod tests {
     use std::time::Duration;
 
     use crate::provider::{BatchResult, Bucket, ListPage, ObjectHead};
-    use crate::transfer::part::MULTIPART_THRESHOLD;
 
-    const MB: u64 = 1024 * 1024;
     const UPLOAD_ID: &str = "u-1";
+
+    /// The default (balanced) preset's upload threshold -- 32MB. Multipart-
+    /// trigger sizes below are expressed relative to this and `part_floor()`
+    /// rather than hardcoded, so a future preset change cannot leave a
+    /// silently-wrong test size behind.
+    fn threshold() -> u64 {
+        TransferTuning::default().upload_threshold
+    }
+
+    /// The balanced preset's upload part floor -- 16MB, and (not
+    /// coincidentally) exactly `threshold() / 2`: a total of `threshold()`
+    /// resolves to two parts of this size.
+    fn part_floor() -> u64 {
+        TransferTuning::default().upload_part_floor
+    }
 
     fn spec(number: i32) -> PartSpec {
         PartSpec {
@@ -1116,7 +1129,7 @@ mod tests {
     #[tokio::test]
     async fn a_small_file_goes_up_as_one_put_and_reports_completed() {
         let rig = rig(4, |_| {});
-        let outcome = rig.run(MULTIPART_THRESHOLD - 1).await.unwrap();
+        let outcome = rig.run(threshold() - 1).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(rig.provider.puts(), 1);
@@ -1125,7 +1138,7 @@ mod tests {
             0,
             "below the threshold there is no multipart upload to create"
         );
-        assert_eq!(rig.reported(), MULTIPART_THRESHOLD - 1);
+        assert_eq!(rig.reported(), threshold() - 1);
         assert!(rig.resume_state().await.is_none());
     }
 
@@ -1140,7 +1153,7 @@ mod tests {
         let rig = rig(4, |_| {});
         rig.switch.request(StopKind::Cancel);
 
-        let outcome = rig.run(MULTIPART_THRESHOLD).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Stopped);
         assert_eq!(rig.provider.puts(), 0);
@@ -1198,13 +1211,13 @@ mod tests {
     #[tokio::test]
     async fn a_multipart_upload_reports_completed_only_after_the_server_assembles_it() {
         let rig = rig(4, |_| {});
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(rig.provider.inits(), 1);
         assert_eq!(rig.provider.parts_seen(), vec![1, 2]);
         assert_eq!(rig.provider.assembled_numbers(), vec![1, 2]);
-        assert_eq!(rig.reported(), 16 * MB);
+        assert_eq!(rig.reported(), threshold());
         assert!(
             rig.resume_state().await.is_none(),
             "a finished upload leaves nothing to resume"
@@ -1221,7 +1234,7 @@ mod tests {
             *fake.stop_on_complete.lock().unwrap() = Some(StopKind::Cancel);
         });
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(rig.switch.requested(), Some(StopKind::Cancel));
@@ -1239,7 +1252,7 @@ mod tests {
             *fake.stop_at_part.lock().unwrap() = Some((1, StopKind::Cancel));
         });
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Stopped);
         assert_eq!(
@@ -1263,7 +1276,7 @@ mod tests {
             *fake.stop_at_part.lock().unwrap() = Some((1, StopKind::Pause));
         });
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Stopped);
         assert_eq!(
@@ -1296,7 +1309,7 @@ mod tests {
             fake.listed = StdMutex::new(vec![UploadedPart {
                 number: 1,
                 etag: "\"etag-1\"".to_string(),
-                size: 8 * MB,
+                size: part_floor(),
             }]);
         });
         rig.seed_resume(MultipartState {
@@ -1304,13 +1317,13 @@ mod tests {
             completed: vec![UploadedPart {
                 number: 1,
                 etag: "\"etag-1\"".to_string(),
-                size: 8 * MB,
+                size: part_floor(),
             }],
             ..Default::default()
         })
         .await;
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(
@@ -1326,7 +1339,7 @@ mod tests {
         assert_eq!(rig.provider.assembled_numbers(), vec![1, 2]);
         assert_eq!(
             rig.reported(),
-            16 * MB,
+            threshold(),
             "the engine zeroes `transferred` on resume, so a run that does not re-report the \
              finished parts leaves the bar stuck at half"
         );
@@ -1341,7 +1354,7 @@ mod tests {
                 .insert(1, (u32::MAX, Fail::Permanent));
         });
 
-        let err = rig.run(16 * MB).await.unwrap_err();
+        let err = rig.run(threshold()).await.unwrap_err();
 
         assert_eq!(err.code(), "auth/access-denied");
         assert_eq!(
@@ -1367,10 +1380,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_permanent_part_failure_stops_the_parts_that_had_not_started() {
-        // 64MB is eight parts, and part 1 fails for good. The spawn loop has
-        // to look at finished parts *as it goes*: a drain placed only after
-        // the loop would not see part 1's failure until parts 2..8 had all
-        // been uploaded, for an object that is never going to be assembled.
+        // 8 * part_floor() is eight parts, and part 1 fails for good. The
+        // spawn loop has to look at finished parts *as it goes*: a drain
+        // placed only after the loop would not see part 1's failure until
+        // parts 2..8 had all been uploaded, for an object that is never
+        // going to be assembled.
         let rig = rig(1, |fake| {
             fake.failures
                 .lock()
@@ -1378,7 +1392,7 @@ mod tests {
                 .insert(1, (u32::MAX, Fail::Permanent));
         });
 
-        let err = rig.run(64 * MB).await.unwrap_err();
+        let err = rig.run(8 * part_floor()).await.unwrap_err();
 
         assert_eq!(err.code(), "auth/access-denied");
         let sent = rig.provider.parts_seen();
@@ -1403,7 +1417,7 @@ mod tests {
                 .insert(1, (u32::MAX, Fail::Permanent));
         });
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Stopped);
         assert_eq!(rig.provider.aborts(), 1);
@@ -1420,7 +1434,7 @@ mod tests {
                 .insert(1, (2, Fail::Transient));
         });
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(
@@ -1440,7 +1454,7 @@ mod tests {
                 .insert(1, (u32::MAX, Fail::Transient));
         });
 
-        let err = rig.run(16 * MB).await.unwrap_err();
+        let err = rig.run(threshold()).await.unwrap_err();
 
         assert_eq!(err.code(), "network/timeout");
         assert_eq!(
@@ -1453,13 +1467,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn parts_in_flight_never_exceed_the_part_limit() {
-        // 64MB is eight 8MB parts, so the limit has to be enforced by the
-        // spawn loop rather than by there being nothing left to spawn.
+        // 8 * part_floor() is eight equal parts, so the limit has to be
+        // enforced by the spawn loop rather than by there being nothing left
+        // to spawn.
         let rig = rig(2, |fake| {
             fake.op_delay = Duration::from_millis(10);
         });
 
-        let outcome = rig.run(64 * MB).await.unwrap();
+        let outcome = rig.run(8 * part_floor()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(rig.provider.parts_seen().len(), 8);
@@ -1479,7 +1494,7 @@ mod tests {
             fake.listed = StdMutex::new(vec![UploadedPart {
                 number: 99,
                 etag: "\"stale\"".to_string(),
-                size: 8 * MB,
+                size: part_floor(),
             }]);
         });
         rig.seed_resume(MultipartState {
@@ -1487,13 +1502,13 @@ mod tests {
             completed: vec![UploadedPart {
                 number: 99,
                 etag: "\"stale\"".to_string(),
-                size: 8 * MB,
+                size: part_floor(),
             }],
             ..Default::default()
         })
         .await;
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(
@@ -1504,7 +1519,7 @@ mod tests {
         );
         assert_eq!(
             rig.reported(),
-            16 * MB,
+            threshold(),
             "a dropped entry must not be reported as transferred either"
         );
     }
@@ -1516,7 +1531,7 @@ mod tests {
             fake.abort_fails = true;
         });
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -1542,14 +1557,14 @@ mod tests {
             completed: vec![UploadedPart {
                 number: 1,
                 etag: "\"etag-1\"".to_string(),
-                size: 8 * MB,
+                size: part_floor(),
             }],
             ..Default::default()
         })
         .await;
         rig.switch.request(StopKind::Cancel);
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Stopped);
         assert_eq!(
@@ -1582,14 +1597,14 @@ mod tests {
         // just against a real file so `run_upload` has something to stat.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("src.bin");
-        std::fs::write(&path, vec![7u8; 20 * MB as usize]).unwrap(); // > MULTIPART_THRESHOLD
+        std::fs::write(&path, vec![7u8; threshold() as usize]).unwrap(); // at the threshold -> multipart
         let meta = std::fs::metadata(&path).unwrap();
 
         let rig = rig(1, |fake| {
             *fake.stop_at_part.lock().unwrap() = Some((1, StopKind::Pause));
         });
 
-        let outcome = rig.run_at(path.clone(), 20 * MB).await.unwrap();
+        let outcome = rig.run_at(path.clone(), threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Stopped);
         let state = rig
@@ -1610,7 +1625,7 @@ mod tests {
         // checkpoint's `completed`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("src.bin");
-        std::fs::write(&path, vec![9u8; 16 * MB as usize]).unwrap();
+        std::fs::write(&path, vec![9u8; threshold() as usize]).unwrap();
 
         let rig = rig(4, |_| {});
         rig.seed_resume(MultipartState {
@@ -1619,16 +1634,16 @@ mod tests {
             completed: vec![UploadedPart {
                 number: 1,
                 etag: "\"old\"".to_string(),
-                size: 8 * MB,
+                size: part_floor(),
             }],
-            // A size that cannot be the 16MB file we just wrote: the
-            // fingerprint mismatch is what forces the restart.
+            // A size that cannot be the file we just wrote: the fingerprint
+            // mismatch is what forces the restart.
             source_size: 999,
             source_mtime: 1,
         })
         .await;
 
-        let outcome = rig.run_at(path.clone(), 16 * MB).await.unwrap();
+        let outcome = rig.run_at(path.clone(), threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(
@@ -1650,7 +1665,7 @@ mod tests {
         assert_eq!(rig.provider.assembled_numbers(), vec![1, 2]);
         assert_eq!(
             rig.reported(),
-            16 * MB,
+            threshold(),
             "only the bytes actually re-sent count; the voided part 1 is not re-reported"
         );
         assert!(rig.resume_state().await.is_none());
@@ -1668,7 +1683,7 @@ mod tests {
             completed: vec![UploadedPart {
                 number: 1,
                 etag: "\"claimed-but-never-landed\"".to_string(),
-                size: 8 * MB,
+                size: part_floor(),
             }],
             // (0, 0) matches the fingerprint of the deliberately-nonexistent
             // stand-in path, so the source-change branch is not taken and the
@@ -1678,7 +1693,7 @@ mod tests {
         })
         .await;
 
-        let outcome = rig.run(16 * MB).await.unwrap();
+        let outcome = rig.run(threshold()).await.unwrap();
 
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(
@@ -1713,7 +1728,7 @@ mod tests {
             fake.complete_fails = true;
         });
 
-        let err = rig.run(16 * MB).await.unwrap_err();
+        let err = rig.run(threshold()).await.unwrap_err();
 
         assert_eq!(
             err.code(),

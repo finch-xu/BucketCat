@@ -24,7 +24,9 @@ pub use engine::{
     TransferEngine, TransferRunner, TransferSink,
 };
 pub use model::{next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto};
-pub use part::{plan_upload, PartSpec, UploadPlan};
+pub use part::{
+    chunks_for, plan_download, plan_upload_with, DownloadPlan, PartSpec, TransferTuning, UploadPlan,
+};
 pub use partfile::{bcpart_path, PartFile};
 pub use progress::{
     eta_secs, spawn_aggregator, ProgressMsg, ProgressPayload, ProgressSink, PROGRESS_INTERVAL,

@@ -86,11 +86,10 @@ use sha2::{Digest, Sha256};
 
 use bucketcat_lib::provider::{from_connection, Provider, ProviderHub, S3Provider, UploadedPart};
 use bucketcat_lib::store::{Connection, SecureStore};
-use bucketcat_lib::transfer::part::MULTIPART_THRESHOLD;
 use bucketcat_lib::transfer::{
-    checkpoint, plan_upload, restore_all, spawn_aggregator, DispatchRunner, DownloadRunner,
+    checkpoint, plan_upload_with, restore_all, spawn_aggregator, DispatchRunner, DownloadRunner,
     EngineConfig, EnqueueSpec, ProgressPayload, ProgressSink, ResumeState, TransferEngine,
-    TransferSink, TransferStatus, TransferTaskDto, UploadPlan, UploadRunner,
+    TransferSink, TransferStatus, TransferTaskDto, TransferTuning, UploadPlan, UploadRunner,
 };
 
 /// 1 MiB, the unit these fixtures are sized in.
@@ -157,12 +156,8 @@ fn raw_seed_client() -> aws_sdk_s3::Client {
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
         .credentials_provider(credentials)
         .force_path_style(true)
-        .request_checksum_calculation(
-            aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-        )
-        .response_checksum_validation(
-            aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
-        )
+        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
         .build();
     aws_sdk_s3::Client::from_conf(config)
 }
@@ -222,11 +217,7 @@ async fn pending_uploads_for_key(client: &aws_sdk_s3::Client, bucket: &str, key:
 
 /// Best-effort teardown: removes every object then the bucket, so repeated
 /// runs never collide and the container stays clean.
-async fn drain_and_delete_bucket(
-    client: &aws_sdk_s3::Client,
-    provider: &S3Provider,
-    bucket: &str,
-) {
+async fn drain_and_delete_bucket(client: &aws_sdk_s3::Client, provider: &S3Provider, bucket: &str) {
     let listed = client
         .list_objects_v2()
         .bucket(bucket)
@@ -604,14 +595,11 @@ async fn batch_delete_uses_the_multi_object_path() {
         put_text(&client, &bucket, k).await;
     }
 
-    let result = provider
-        .delete_objects(&bucket, &keys)
-        .await
-        .expect(
-            "DeleteObjects must succeed against RustFS -- if this fails with a missing-checksum \
+    let result = provider.delete_objects(&bucket, &keys).await.expect(
+        "DeleteObjects must succeed against RustFS -- if this fails with a missing-checksum \
              or Content-MD5 complaint, RustFS belongs in `supports_batch_delete`'s exclusion \
              list alongside OSS and Rainyun, and this test should assert that instead",
-        );
+    );
 
     assert_eq!(
         result.succeeded as usize,
@@ -759,7 +747,8 @@ async fn created_folder_is_visible_as_prefix_and_empty_inside() {
 // ===========================================================================
 
 /// Uploads `path` via the provider transfer primitives, following
-/// `plan_upload` exactly as `UploadRunner` does.
+/// `plan_upload_with` (under the default tuning) exactly as `UploadRunner`
+/// does.
 async fn upload_via_primitives(
     provider: &S3Provider,
     bucket: &str,
@@ -767,7 +756,7 @@ async fn upload_via_primitives(
     path: &Path,
     total: u64,
 ) {
-    match plan_upload(total) {
+    match plan_upload_with(total, &TransferTuning::default()) {
         UploadPlan::Single { length } => {
             provider
                 .put_object_from_file(bucket, key, path, length)
@@ -874,7 +863,10 @@ async fn upload_multipart_file_round_trips_with_matching_hash() {
     let size = 40 * MB;
     write_pseudo_random_file(&path, size, 0x5EED_0002);
     assert!(
-        matches!(plan_upload(size), UploadPlan::Multipart { .. }),
+        matches!(
+            plan_upload_with(size, &TransferTuning::default()),
+            UploadPlan::Multipart { .. }
+        ),
         "40MB must plan as a multipart upload for this test to mean anything"
     );
 
@@ -902,14 +894,18 @@ async fn parts_uploaded_out_of_order_still_complete() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("outoforder.bin");
-    let size = 24 * MB; // three 8MB parts at the floor part size.
+    let size = 48 * MB; // three 16MB parts at the floor part size.
     write_pseudo_random_file(&path, size, 0x5EED_0003);
 
-    let parts = match plan_upload(size) {
+    let parts = match plan_upload_with(size, &TransferTuning::default()) {
         UploadPlan::Multipart { parts, .. } => parts,
-        UploadPlan::Single { .. } => panic!("24MB must plan as multipart"),
+        UploadPlan::Single { .. } => panic!("48MB must plan as multipart"),
     };
-    assert_eq!(parts.len(), 3, "24MB at the 8MB floor is exactly three parts");
+    assert_eq!(
+        parts.len(),
+        3,
+        "48MB at the 16MB floor is exactly three parts"
+    );
 
     let key = "uploads/outoforder.bin";
     let upload_id = provider.multipart_init(&bucket, key).await.expect("init");
@@ -918,7 +914,9 @@ async fn parts_uploaded_out_of_order_still_complete() {
     for number in [3i32, 1, 2] {
         let p = parts[(number - 1) as usize];
         let etag = provider
-            .upload_part_from_file(&bucket, key, &upload_id, p.number, &path, p.offset, p.length)
+            .upload_part_from_file(
+                &bucket, key, &upload_id, p.number, &path, p.offset, p.length,
+            )
             .await
             .unwrap_or_else(|e| panic!("upload_part {} should succeed: {e}", p.number));
         done.push(UploadedPart {
@@ -957,17 +955,17 @@ async fn a_shrinking_file_fails_before_uploading_a_short_part() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("shrinking.bin");
-    let size = 16 * MB; // two 8MB parts.
+    let size = 32 * MB; // two 16MB parts.
     write_pseudo_random_file(&path, size, 0x5EED_0004);
-    let parts = match plan_upload(size) {
+    let parts = match plan_upload_with(size, &TransferTuning::default()) {
         UploadPlan::Multipart { parts, .. } => parts,
-        UploadPlan::Single { .. } => panic!("16MB must plan as multipart"),
+        UploadPlan::Single { .. } => panic!("32MB must plan as multipart"),
     };
 
     let key = "uploads/shrinking.bin";
     let upload_id = provider.multipart_init(&bucket, key).await.expect("init");
 
-    // Truncate AFTER planning: part 1 (offset 0, length 8MB) no longer fits.
+    // Truncate AFTER planning: part 1 (offset 0, length 16MB) no longer fits.
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
@@ -977,7 +975,9 @@ async fn a_shrinking_file_fails_before_uploading_a_short_part() {
 
     let p = parts[0];
     let err = provider
-        .upload_part_from_file(&bucket, key, &upload_id, p.number, &path, p.offset, p.length)
+        .upload_part_from_file(
+            &bucket, key, &upload_id, p.number, &path, p.offset, p.length,
+        )
         .await
         .expect_err("uploading a part that no longer fits the shrunk file must fail");
     assert_eq!(
@@ -1042,16 +1042,18 @@ async fn multipart_list_returns_the_accepted_parts() {
     let key = "mp/list.bin";
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("src.bin");
-    write_pseudo_random_file(&path, 20 * MB, 0x5EED_2001);
+    write_pseudo_random_file(&path, 32 * MB, 0x5EED_2001);
 
     let upload_id = provider.multipart_init(&bucket, key).await.expect("init");
-    let plan = match plan_upload(20 * MB) {
+    let plan = match plan_upload_with(32 * MB, &TransferTuning::default()) {
         UploadPlan::Multipart { parts, .. } => parts,
-        _ => panic!("20MB must be multipart"),
+        _ => panic!("32MB must be multipart"),
     };
     for p in plan.iter().take(2) {
         provider
-            .upload_part_from_file(&bucket, key, &upload_id, p.number, &path, p.offset, p.length)
+            .upload_part_from_file(
+                &bucket, key, &upload_id, p.number, &path, p.offset, p.length,
+            )
             .await
             .expect("upload_part");
     }
@@ -1070,8 +1072,8 @@ async fn multipart_list_returns_the_accepted_parts() {
 }
 
 /// A 0-byte file lands as a real 0-byte object. The single-stream path
-/// (`plan_upload(0) == Single { length: 0 }`) must handle an empty body --
-/// folder-marker-adjacent and easy to get wrong.
+/// (`plan_upload_with(0, ..) == Single { length: 0 }`) must handle an empty
+/// body -- folder-marker-adjacent and easy to get wrong.
 #[tokio::test]
 #[ignore]
 async fn zero_byte_file_round_trips() {
@@ -1080,7 +1082,10 @@ async fn zero_byte_file_round_trips() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("empty.bin");
     std::fs::write(&path, b"").expect("write empty fixture");
-    assert_eq!(plan_upload(0), UploadPlan::Single { length: 0 });
+    assert_eq!(
+        plan_upload_with(0, &TransferTuning::default()),
+        UploadPlan::Single { length: 0 }
+    );
 
     let key = "uploads/empty.bin";
     provider
@@ -1098,19 +1103,20 @@ async fn zero_byte_file_round_trips() {
 }
 
 /// The two files straddling the multipart threshold each round-trip with a
-/// hash check: exactly `MULTIPART_THRESHOLD` (multipart) and
-/// `MULTIPART_THRESHOLD - 1` (single stream). That boundary selects between two
-/// entirely different code paths, so both sides are proven.
+/// hash check: exactly `TransferTuning::default().upload_threshold`
+/// (multipart) and one byte below it (single stream). That boundary selects
+/// between two entirely different code paths, so both sides are proven.
 #[tokio::test]
 #[ignore]
 async fn threshold_boundary_files_each_land() {
     let (provider, client, bucket) = fresh_bucket().await;
     let dir = tempfile::tempdir().expect("tempdir");
+    let threshold = TransferTuning::default().upload_threshold;
 
     let at_path = dir.path().join("at-threshold.bin");
-    write_pseudo_random_file(&at_path, MULTIPART_THRESHOLD, 0x5EED_0801);
+    write_pseudo_random_file(&at_path, threshold, 0x5EED_0801);
     assert!(matches!(
-        plan_upload(MULTIPART_THRESHOLD),
+        plan_upload_with(threshold, &TransferTuning::default()),
         UploadPlan::Multipart { .. }
     ));
     assert_round_trip_hash(
@@ -1119,14 +1125,14 @@ async fn threshold_boundary_files_each_land() {
         &bucket,
         "uploads/at-threshold.bin",
         &at_path,
-        MULTIPART_THRESHOLD,
+        threshold,
     )
     .await;
 
     let below_path = dir.path().join("below-threshold.bin");
-    write_pseudo_random_file(&below_path, MULTIPART_THRESHOLD - 1, 0x5EED_0802);
+    write_pseudo_random_file(&below_path, threshold - 1, 0x5EED_0802);
     assert!(matches!(
-        plan_upload(MULTIPART_THRESHOLD - 1),
+        plan_upload_with(threshold - 1, &TransferTuning::default()),
         UploadPlan::Single { .. }
     ));
     assert_round_trip_hash(
@@ -1135,7 +1141,7 @@ async fn threshold_boundary_files_each_land() {
         &bucket,
         "uploads/below-threshold.bin",
         &below_path,
-        MULTIPART_THRESHOLD - 1,
+        threshold - 1,
     )
     .await;
 
@@ -1335,7 +1341,11 @@ fn build_engine_cp(
     )
 }
 
-fn build_engine(hub: Arc<ProviderHub>, sink: Arc<dyn TransferSink>, max_parts: usize) -> TransferEngine {
+fn build_engine(
+    hub: Arc<ProviderHub>,
+    sink: Arc<dyn TransferSink>,
+    max_parts: usize,
+) -> TransferEngine {
     build_engine_cp(hub, sink, max_parts, None, Arc::new(AtomicBool::new(true)))
 }
 
@@ -1364,7 +1374,12 @@ async fn snapshot_of(engine: &TransferEngine, id: &str) -> Option<TransferTaskDt
 /// Polls until the task reaches `want`, failing fast (with the error code) if
 /// it instead settles into a different terminal state -- a bare timeout costs
 /// the next debugger an hour.
-async fn wait_for_status(engine: &TransferEngine, id: &str, want: TransferStatus, budget: Duration) {
+async fn wait_for_status(
+    engine: &TransferEngine,
+    id: &str,
+    want: TransferStatus,
+    budget: Duration,
+) {
     let deadline = tokio::time::Instant::now() + budget;
     let mut last: Option<TransferStatus> = None;
     while tokio::time::Instant::now() < deadline {
@@ -1412,7 +1427,9 @@ async fn wait_for_mid_flight(engine: &TransferEngine, id: &str, budget: Duration
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    panic!("timed out after {budget:?} waiting for {id} to be Running with progress; last: {last:?}");
+    panic!(
+        "timed out after {budget:?} waiting for {id} to be Running with progress; last: {last:?}"
+    );
 }
 
 /// The full stack: a ~60MB file enqueued into a real engine runs to
@@ -1457,7 +1474,9 @@ async fn engine_uploads_a_large_file_end_to_end() {
         "HeadObject after Completed must show the full object size"
     );
     assert_eq!(
-        hex(&sha256_bytes(&get_object_bytes(&client, &bucket, &key).await)),
+        hex(&sha256_bytes(
+            &get_object_bytes(&client, &bucket, &key).await
+        )),
         hex(&sha256_file(&path)),
         "the object the engine assembled must be byte-identical to the source"
     );
@@ -1530,7 +1549,9 @@ async fn pausing_then_resuming_finishes_the_upload() {
         "after resume completes, the full object must exist"
     );
     assert_eq!(
-        hex(&sha256_bytes(&get_object_bytes(&client, &bucket, &key).await)),
+        hex(&sha256_bytes(
+            &get_object_bytes(&client, &bucket, &key).await
+        )),
         hex(&sha256_file(&path)),
         "a paused-then-resumed upload must be byte-identical to the source"
     );
@@ -1653,7 +1674,9 @@ async fn upload_survives_a_restart_and_resumes_without_reuploading() {
     .await;
 
     assert_eq!(
-        hex(&sha256_bytes(&get_object_bytes(&client, &bucket, &key).await)),
+        hex(&sha256_bytes(
+            &get_object_bytes(&client, &bucket, &key).await
+        )),
         hex(&sha256_file(&path)),
         "the object assembled across the restart must be byte-identical to the source"
     );
@@ -1682,7 +1705,10 @@ async fn engine_downloads_a_large_object_matching_hash() {
     let src_dir = tempfile::tempdir().expect("source tempdir");
     let dl_dir = tempfile::tempdir().expect("download tempdir");
     let path = src_dir.path().join("engine-download.bin");
-    let size = 40 * MB;
+    // Above the download planner's own threshold (64MB, independent of the
+    // upload threshold since the M6 split): this must exercise DownloadRunner's
+    // multi-chunk path, not just its single-stream one.
+    let size = 80 * MB;
     write_pseudo_random_file(&path, size, 0x5EED_0012);
 
     let key = "downloads/engine-download.bin";
@@ -1713,7 +1739,9 @@ async fn engine_downloads_a_large_object_matching_hash() {
     .await;
 
     assert_eq!(
-        std::fs::metadata(&target).expect("downloaded file must exist").len(),
+        std::fs::metadata(&target)
+            .expect("downloaded file must exist")
+            .len(),
         size,
         "the downloaded file must be exactly the object's size"
     );
