@@ -821,6 +821,14 @@ mod tests {
         }
     }
 
+    /// Shorthand for scripting a `BodyProgress::Sent` notch in a
+    /// `put_notches`/`part_notches` literal -- keeps those scripts readable
+    /// now that they can also carry a `Rewound` (see
+    /// `a_rewind_mid_attempt_retracts_the_abandoned_bytes_and_the_true_up_still_lands_on_total`).
+    fn sent(n: u64) -> BodyProgress {
+        BodyProgress::Sent(n)
+    }
+
     #[test]
     fn nothing_done_means_everything_is_pending() {
         let plan = [spec(1), spec(2), spec(3)];
@@ -1006,21 +1014,24 @@ mod tests {
         /// the checkpoint claims part 1 is done -- which is exactly the case
         /// the server-authoritative reconciliation must get right.
         listed: StdMutex<Vec<UploadedPart>>,
-        /// `Sent`-notch sizes `put_object_from_file` emits, in order, before
-        /// it resolves -- simulates the transport pulling the single-stream
-        /// body incrementally. Empty (the default) emits nothing, matching
-        /// every pre-existing single-stream test's expectations.
-        put_notches: Vec<u64>,
+        /// `BodyProgress` notches `put_object_from_file` emits, in order,
+        /// before it resolves -- simulates the transport pulling the
+        /// single-stream body incrementally, `Rewound` included (an
+        /// SDK-internal retry rebuilding the body mid-attempt). Empty (the
+        /// default) emits nothing, matching every pre-existing single-stream
+        /// test's expectations.
+        put_notches: Vec<BodyProgress>,
         /// If set, `put_object_from_file` parks on `put_gate` right after
         /// applying the notch at this index (0-based).
         put_pause_after: Option<usize>,
         put_gate: Arc<Gate>,
-        /// part_number -> queue of `Sent`-notch sequences, one popped per
-        /// call attempt -- so a retried part can script a different sequence
-        /// for its second attempt than its first. A part with no entry (or
-        /// an exhausted queue) gets no notches, matching every pre-existing
-        /// multipart test's expectations.
-        part_notches: StdMutex<HashMap<i32, VecDeque<Vec<u64>>>>,
+        /// part_number -> queue of `BodyProgress`-notch sequences, one
+        /// popped per call attempt -- so a retried part can script a
+        /// different sequence for its second attempt than its first,
+        /// `Rewound` included. A part with no entry (or an exhausted queue)
+        /// gets no notches, matching every pre-existing multipart test's
+        /// expectations.
+        part_notches: StdMutex<HashMap<i32, VecDeque<Vec<BodyProgress>>>>,
         /// If set, the matching call to `upload_part_from_file` parks on
         /// `part_gate` right after applying the triggering notch.
         part_pause: Option<PartPause>,
@@ -1168,8 +1179,8 @@ mod tests {
             if !self.op_delay.is_zero() {
                 tokio::time::sleep(self.op_delay).await;
             }
-            for (i, n) in self.put_notches.iter().enumerate() {
-                progress(BodyProgress::Sent(*n));
+            for (i, event) in self.put_notches.iter().enumerate() {
+                progress(*event);
                 if self.put_pause_after == Some(i) {
                     self.put_gate.pass().await;
                 }
@@ -1220,8 +1231,8 @@ mod tests {
                 .get_mut(&part_number)
                 .and_then(|queue| queue.pop_front())
                 .unwrap_or_default();
-            for (i, n) in notches.into_iter().enumerate() {
-                progress(BodyProgress::Sent(n));
+            for (i, event) in notches.into_iter().enumerate() {
+                progress(event);
                 let pause = self.part_pause;
                 if pause
                     == Some(PartPause {
@@ -2159,7 +2170,7 @@ mod tests {
     // `Ok`. Now the body reports `Sent` notches as the transport pulls it, so
     // the bar can move while a large upload is still in flight -- which
     // means a failed, cancelled or rewound attempt can leave bytes on the
-    // bar that the server never actually kept. These four tests are the
+    // bar that the server never actually kept. These five tests are the
     // conservation invariant from the task brief: `reported - retracted`
     // never overstates what the server holds, and lands exactly on the true
     // length once a part/file lands.
@@ -2173,7 +2184,7 @@ mod tests {
         );
 
         let rig = Arc::new(rig(4, |fake| {
-            fake.put_notches = vec![8 * MB, 8 * MB, 4 * MB];
+            fake.put_notches = vec![sent(8 * MB), sent(8 * MB), sent(4 * MB)];
             fake.put_pause_after = Some(0);
         }));
 
@@ -2203,6 +2214,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_rewind_mid_attempt_retracts_the_abandoned_bytes_and_the_true_up_still_lands_on_total(
+    ) {
+        // `attempt_body_progress`'s `Rewound` branch is the seam between the
+        // counting body (`counting_body_range` in `provider::s3`) and the
+        // runner's accounting: an SDK-internal retry can rebuild the request
+        // body mid-attempt -- distinct from the app-level `with_retry` above
+        // it, which never sees this happen -- so nothing exercises this arm
+        // unless a fake actually scripts a `Rewound` notch. `Sent(3MB)` moves
+        // the bar, `Rewound(3MB)` undoes exactly that (both the live counter
+        // and `attempt_reported`), then `Sent(5MB)` reports the fresh
+        // attempt's progress before the call resolves `Ok`.
+        let total = 8 * MB;
+        assert!(
+            total < threshold(),
+            "this exercises the single-stream path, not multipart"
+        );
+
+        let rig = rig(4, |fake| {
+            fake.put_notches = vec![sent(3 * MB), BodyProgress::Rewound(3 * MB), sent(5 * MB)];
+        });
+
+        let outcome = rig.run(total).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.retracted(),
+            3 * MB,
+            "the rebuilt attempt's abandoned 3MB must come back off the bar via Rewound, \
+             exactly as a failed-and-retried attempt would"
+        );
+        assert_eq!(
+            rig.reported() - rig.retracted(),
+            total,
+            "net reported (gross reported minus what Rewound retracted) must land exactly on \
+             the total once the true-up runs"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_parts_failed_attempt_retracts_exactly_what_it_sent_and_the_retry_true_ups_the_rest()
     {
@@ -2214,7 +2264,7 @@ mod tests {
             fake.part_notches
                 .lock()
                 .unwrap()
-                .insert(1, VecDeque::from(vec![vec![5 * MB]]));
+                .insert(1, VecDeque::from(vec![vec![sent(5 * MB)]]));
         });
 
         let outcome = rig.run(threshold()).await.unwrap();
@@ -2248,7 +2298,7 @@ mod tests {
             fake.part_notches
                 .lock()
                 .unwrap()
-                .insert(2, VecDeque::from(vec![vec![5 * MB]]));
+                .insert(2, VecDeque::from(vec![vec![sent(5 * MB)]]));
             fake.part_pause = Some(PartPause {
                 part: 2,
                 attempt: 1,
@@ -2303,9 +2353,9 @@ mod tests {
         // less -- however the parts interleave under real concurrency.
         let rig = rig(4, |fake| {
             let mut notches = fake.part_notches.lock().unwrap();
-            notches.insert(1, VecDeque::from(vec![vec![3 * MB]]));
-            notches.insert(2, VecDeque::from(vec![vec![7 * MB]]));
-            notches.insert(3, VecDeque::from(vec![vec![MB, 2 * MB]]));
+            notches.insert(1, VecDeque::from(vec![vec![sent(3 * MB)]]));
+            notches.insert(2, VecDeque::from(vec![vec![sent(7 * MB)]]));
+            notches.insert(3, VecDeque::from(vec![vec![sent(MB), sent(2 * MB)]]));
             notches.insert(4, VecDeque::from(vec![vec![]]));
         });
 

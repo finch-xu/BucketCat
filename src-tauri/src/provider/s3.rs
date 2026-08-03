@@ -1253,9 +1253,13 @@ impl HttpBody for CountingFileBody {
         };
 
         if this.remaining == 0 {
-            // EOF: flush whatever's left under the quantum as one final
-            // `Sent`, then signal end of stream. No data frame here -- this
-            // is purely the progress tail, not a read.
+            // EOF, reached either because this body was empty to begin with
+            // (`pending` is 0, so `flush_pending` below is a no-op) or
+            // because a prior call already flushed the tail inline when its
+            // read drove `remaining` to 0 (see the comment on that flush
+            // below). Either way there is nothing left to send -- signal end
+            // of stream. No data frame here -- this is purely a defensive
+            // tail flush, not a read.
             this.flush_pending();
             return Poll::Ready(None);
         }
@@ -1287,8 +1291,15 @@ impl HttpBody for CountingFileBody {
                 this.pending += n as u64;
                 // Quantum crossed: emit now rather than waiting for EOF, so
                 // a large upload reports progress throughout, not only at
-                // the very end.
-                if this.pending >= PROGRESS_QUANTUM {
+                // the very end. Also flush as soon as this read drives
+                // `remaining` to 0: once `is_end_stream()` reports true,
+                // hyper is not guaranteed to poll this body again just to
+                // run the top-of-function tail flush below, so a sub-quantum
+                // remainder has to be flushed on this same frame instead of
+                // waiting for one that may never come. `pending` is always
+                // `> 0` here (this arm only runs after a nonzero read), so
+                // this never emits a spurious `Sent(0)`.
+                if this.pending >= PROGRESS_QUANTUM || this.remaining == 0 {
                     this.flush_pending();
                 }
                 Poll::Ready(Some(Ok(Frame::data(buf.freeze()))))
@@ -1301,6 +1312,11 @@ impl HttpBody for CountingFileBody {
     }
 
     fn size_hint(&self) -> SizeHint {
+        // For a `Failed` state this still reports the planned `length` even
+        // though no data frame will ever arrive; harmless in practice
+        // because the transport aborts the request on the first
+        // `poll_frame` call, which returns that state's error instead of
+        // any bytes.
         SizeHint::with_exact(self.remaining)
     }
 }
