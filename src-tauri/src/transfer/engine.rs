@@ -55,38 +55,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::provider::{Provider, ProviderHub, UploadedPart};
 use crate::transfer::checkpoint::{self, Checkpoint};
+use crate::transfer::limits::SharedLimits;
 use crate::transfer::model::{
     next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto,
 };
-use crate::transfer::part::chunks_for;
+use crate::transfer::part::{chunks_for, TransferTuning};
 use crate::transfer::partfile::bcpart_path;
 use crate::transfer::progress::ProgressMsg;
-
-/// Concurrency limits (design §5). Runtime hot-update belongs to the settings
-/// page (M6); M4a reads these once at construction.
-#[derive(Debug, Clone, Copy)]
-pub struct EngineConfig {
-    /// Tasks allowed to be `Running` at once.
-    pub max_tasks: usize,
-    /// Parts a single task may have in flight.
-    pub max_parts: usize,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            max_tasks: 3,
-            max_parts: 4,
-        }
-    }
-}
 
 /// Why a task was asked to stop. See decision D2 in the plan: pause and
 /// cancel share one [`CancellationToken`] and are told apart by this.
@@ -333,6 +315,11 @@ pub struct TaskContext {
     pub hub: Arc<ProviderHub>,
     pub control: TaskControl,
     pub part_limit: usize,
+    /// The tuning snapshot ([`SharedLimits::tuning`]) read at the moment this
+    /// task was admitted. Captured once here, not read again for the life of
+    /// the task, so a settings change mid-transfer never reshapes a plan a
+    /// runner has already committed to (design §4.4).
+    pub tuning: TransferTuning,
     pub progress: ProgressHandle,
     pub resume: Arc<Mutex<Option<ResumeState>>>,
     /// The checkpoint mirror, or `None` when checkpointing is disabled (no
@@ -506,9 +493,11 @@ struct EngineInner {
     sink: Arc<dyn TransferSink>,
     progress: mpsc::UnboundedSender<ProgressMsg>,
     tasks: Mutex<HashMap<String, TaskRecord>>,
-    task_sem: Arc<Semaphore>,
+    /// The task-admission semaphore, the per-task part limit, and the tuning
+    /// snapshot every newly-admitted task reads -- all hot-adjustable, see
+    /// [`SharedLimits`].
+    limits: Arc<SharedLimits>,
     seq: AtomicU64,
-    config: EngineConfig,
     /// Where per-task checkpoints live, or `None` to disable checkpointing
     /// entirely (the engine's own unit tests pass `None` to keep behaviour
     /// unchanged).
@@ -588,7 +577,7 @@ impl EngineInner {
                 }
                 return;
             }
-            permit = Arc::clone(&self.task_sem).acquire_owned() => match permit {
+            permit = self.limits.acquire() => match permit {
                 Ok(permit) => permit,
                 // The semaphore is only ever closed on shutdown.
                 Err(_) => return,
@@ -624,11 +613,16 @@ impl EngineInner {
             enabled: Arc::clone(&self.resume_enabled),
             last: Arc::new(std::sync::Mutex::new(None)),
         });
+        // Read fresh, right before this task starts: a settings change
+        // (Task 8's command layer, via `SharedLimits::set_max_parts`/
+        // `set_tuning`) must apply to the *next* task admitted, without
+        // touching any task already running (design §4.4).
         let ctx = TaskContext {
             task: dto,
             hub: Arc::clone(&self.hub),
             control: control.clone(),
-            part_limit: self.config.max_parts,
+            part_limit: self.limits.part_limit(),
+            tuning: self.limits.tuning(),
             progress: ProgressHandle {
                 tx: self.progress.clone(),
                 task_id: task_id.clone(),
@@ -855,7 +849,7 @@ impl TransferEngine {
         runner: Arc<dyn TransferRunner>,
         sink: Arc<dyn TransferSink>,
         progress: mpsc::UnboundedSender<ProgressMsg>,
-        config: EngineConfig,
+        limits: Arc<SharedLimits>,
         checkpoint_dir: Option<PathBuf>,
         resume_enabled: Arc<AtomicBool>,
     ) -> Self {
@@ -866,13 +860,20 @@ impl TransferEngine {
                 sink,
                 progress,
                 tasks: Mutex::new(HashMap::new()),
-                task_sem: Arc::new(Semaphore::new(config.max_tasks)),
+                limits,
                 seq: AtomicU64::new(0),
-                config,
                 checkpoint_dir,
                 resume_enabled,
             }),
         }
+    }
+
+    /// The live concurrency + tuning state, shared with every task this
+    /// engine spawns. The command layer (Task 8) adjusts it directly --
+    /// `set_max_tasks`/`set_max_parts`/`set_tuning` apply to the next task
+    /// admitted, with no engine rebuild and no restart.
+    pub fn limits(&self) -> Arc<SharedLimits> {
+        Arc::clone(&self.inner.limits)
     }
 
     /// Registers a task in `Queued` and starts its driver.
@@ -1219,6 +1220,11 @@ mod tests {
         /// has an upload id worth persisting. The write goes through the engine's
         /// real [`CheckpointWriter`], so a test observes genuine file state.
         checkpoint_state: StdMutex<Option<ResumeState>>,
+        /// `ctx.part_limit` as seen by the most recently *started* run --
+        /// proof that hot-adjusting [`SharedLimits`] via
+        /// [`TransferEngine::limits`] is read fresh by the *next* task
+        /// spawned rather than only at engine construction.
+        last_part_limit: AtomicUsize,
     }
 
     impl FakeRunner {
@@ -1233,6 +1239,7 @@ mod tests {
                 report_bytes: AtomicU64::new(0),
                 reported: AtomicUsize::new(0),
                 checkpoint_state: StdMutex::new(None),
+                last_part_limit: AtomicUsize::new(0),
             })
         }
 
@@ -1245,6 +1252,7 @@ mod tests {
     impl TransferRunner for FakeRunner {
         async fn run(&self, ctx: TaskContext) -> AppResult<RunOutcome> {
             self.started.fetch_add(1, Ordering::SeqCst);
+            self.last_part_limit.store(ctx.part_limit, Ordering::SeqCst);
             // Copy the mode out before anything can panic: holding the guard
             // across the `panic!` would poison the mutex for the next run.
             let mode = *self.mode.lock().unwrap();
@@ -1396,10 +1404,7 @@ mod tests {
             runner.clone(),
             sink.clone(),
             progress_tx,
-            EngineConfig {
-                max_tasks,
-                max_parts: 4,
-            },
+            SharedLimits::new(max_tasks, 4, TransferTuning::balanced()),
             checkpoint_dir,
             Arc::new(AtomicBool::new(resume_enabled)),
         );
@@ -1496,6 +1501,48 @@ mod tests {
             "the freed permit admits the other task",
         )
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn changing_max_parts_applies_to_the_next_spawned_task_only() {
+        // Task 5 (spec §4.4): `TransferEngine::limits()` is the command
+        // layer's hot-adjustment handle. A change made through it must reach
+        // the *next* task the engine spawns, without requiring a new engine
+        // (no restart) and without touching a task that is already running.
+        let h = harness(1);
+        let first = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a starts",
+        )
+        .await;
+        assert_eq!(
+            h.runner.last_part_limit.load(Ordering::SeqCst),
+            4,
+            "harness_cfg's engine was built with max_parts = 4"
+        );
+
+        h.engine.limits().set_max_parts(1);
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&first.id).last() == Some(&TransferStatus::Completed),
+            "task a completes",
+        )
+        .await;
+
+        h.runner.finish.store(false, Ordering::SeqCst);
+        h.engine.enqueue(spec("b")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "task b starts",
+        )
+        .await;
+        assert_eq!(
+            h.runner.last_part_limit.load(Ordering::SeqCst),
+            1,
+            "the next spawned task must read the hot-adjusted part_limit, not the value the \
+             engine was constructed with"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

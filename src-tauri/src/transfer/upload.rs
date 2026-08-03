@@ -95,6 +95,11 @@ struct UploadJob {
     key: String,
     path: PathBuf,
     part_limit: usize,
+    /// The tuning snapshot the task was admitted under ([`TaskContext::tuning`],
+    /// Task 5). Read once, at `from_context`, not re-read mid-transfer -- a
+    /// settings change must not reshape a plan this run has already
+    /// committed to.
+    tuning: TransferTuning,
     token: CancellationToken,
     stop: StopFn,
     progress: ProgressFn,
@@ -115,6 +120,7 @@ impl UploadJob {
             key: ctx.task.key.clone(),
             path: PathBuf::from(&ctx.task.local_path),
             part_limit: ctx.part_limit,
+            tuning: ctx.tuning,
             token: ctx.control.token(),
             // `ctx.task` is a snapshot taken before the task went `Running`,
             // so its `status` is stale; the control is the only live source of
@@ -191,7 +197,7 @@ where
         return Ok(RunOutcome::Stopped);
     }
 
-    match plan_upload_with(total, &TransferTuning::default()) {
+    match plan_upload_with(total, &job.tuning) {
         UploadPlan::Single { length } => upload_single(job, provider, length).await,
         UploadPlan::Multipart { parts, part_size } => {
             tracing::info!(
@@ -1090,6 +1096,7 @@ mod tests {
                 // itself -- reading a byte range is the provider's job.
                 path: PathBuf::from("/nonexistent/source.bin"),
                 part_limit: self.part_limit,
+                tuning: TransferTuning::default(),
                 token: self.switch.token.clone(),
                 stop: Arc::new(move || switch.requested()),
                 progress: Arc::new(move |bytes| {

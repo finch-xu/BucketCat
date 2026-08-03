@@ -88,7 +88,7 @@ use bucketcat_lib::provider::{from_connection, Provider, ProviderHub, S3Provider
 use bucketcat_lib::store::{Connection, SecureStore};
 use bucketcat_lib::transfer::{
     checkpoint, plan_upload_with, restore_all, spawn_aggregator, DispatchRunner, DownloadRunner,
-    EngineConfig, EnqueueSpec, ProgressPayload, ProgressSink, ResumeState, TransferEngine,
+    EnqueueSpec, ProgressPayload, ProgressSink, ResumeState, SharedLimits, TransferEngine,
     TransferSink, TransferStatus, TransferTaskDto, TransferTuning, UploadPlan, UploadRunner,
 };
 
@@ -1332,10 +1332,7 @@ fn build_engine_cp(
         }),
         sink,
         progress_tx,
-        EngineConfig {
-            max_tasks: 3,
-            max_parts,
-        },
+        SharedLimits::new(3, max_parts, TransferTuning::default()),
         checkpoint_dir,
         resume_enabled,
     )

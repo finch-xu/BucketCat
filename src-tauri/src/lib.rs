@@ -24,7 +24,7 @@ use commands::{
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 use crate::transfer::{
-    spawn_aggregator, DispatchRunner, DownloadRunner, EngineConfig, ProgressPayload, ProgressSink,
+    spawn_aggregator, DispatchRunner, DownloadRunner, ProgressPayload, ProgressSink, SharedLimits,
     TransferEngine, TransferSink, TransferTaskDto, UploadRunner,
 };
 
@@ -185,12 +185,12 @@ pub fn run() {
                     // clamp, so a hand-edited `settings.json` with
                     // `max_tasks: 0` would otherwise build a zero-permit
                     // semaphore and deadlock every transfer. See
-                    // `Settings::engine_bounds`.
+                    // `Settings::engine_bounds`. `SharedLimits` (Task 5)
+                    // makes both this and `settings.tuning()` hot-adjustable
+                    // afterwards through `TransferEngine::limits()` -- no
+                    // engine rebuild, no restart.
                     let (max_tasks, max_parts) = settings.engine_bounds();
-                    EngineConfig {
-                        max_tasks,
-                        max_parts,
-                    }
+                    SharedLimits::new(max_tasks, max_parts, settings.tuning())
                 },
                 Some(checkpoint_dir.clone()),
                 resume_enabled.clone(),

@@ -83,8 +83,8 @@ use bucketcat_lib::provider::{from_connection, Provider, ProviderHub, S3Provider
 use bucketcat_lib::store::{Connection, SecureStore};
 use bucketcat_lib::transfer::{
     bcpart_path, checkpoint, plan_download, plan_upload_with, restore_all, spawn_aggregator,
-    Direction, DispatchRunner, DownloadRunner, EngineConfig, EnqueueSpec, MultipartState,
-    ProgressPayload, ProgressSink, ResumeState, TransferEngine, TransferSink, TransferStatus,
+    Direction, DispatchRunner, DownloadRunner, EnqueueSpec, MultipartState, ProgressPayload,
+    ProgressSink, ResumeState, SharedLimits, TransferEngine, TransferSink, TransferStatus,
     TransferTaskDto, TransferTuning, UploadPlan, UploadRunner,
 };
 
@@ -1532,10 +1532,7 @@ fn build_engine_cp(
         }),
         sink,
         progress_tx,
-        EngineConfig {
-            max_tasks: 3,
-            max_parts,
-        },
+        SharedLimits::new(3, max_parts, TransferTuning::default()),
         checkpoint_dir,
         resume_enabled,
     )
@@ -1659,7 +1656,7 @@ async fn engine_uploads_a_large_file_end_to_end() {
     let connection_id = "e2e-engine-9";
     let hub = live_hub(connection_id, &hub_dir).await;
     let sink = Arc::new(CollectingSink::default());
-    // The default part concurrency (EngineConfig::default().max_parts == 4).
+    // The default part concurrency.
     let engine = build_engine(Arc::clone(&hub), sink.clone(), 4);
 
     let key = "uploads/engine-large.bin".to_string();

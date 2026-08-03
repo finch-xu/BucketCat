@@ -82,6 +82,11 @@ struct DownloadJob {
     /// it into place on finish.
     target: PathBuf,
     part_limit: usize,
+    /// The tuning snapshot the task was admitted under ([`TaskContext::tuning`],
+    /// Task 5). Read once, at `from_context`, not re-read mid-transfer -- a
+    /// settings change must not reshape a plan this run has already
+    /// committed to.
+    tuning: TransferTuning,
     token: CancellationToken,
     stop: StopFn,
     progress: ProgressFn,
@@ -108,6 +113,7 @@ impl DownloadJob {
             key: ctx.task.key.clone(),
             target: PathBuf::from(&ctx.task.local_path),
             part_limit: ctx.part_limit,
+            tuning: ctx.tuning,
             token: ctx.control.token(),
             // `ctx.task` is a snapshot taken before the task went `Running`, so
             // its `status` is stale; the control is the only live source of
@@ -161,7 +167,7 @@ where
         _ => None,
     };
 
-    let plan = plan_download(total, &TransferTuning::default());
+    let plan = plan_download(total, &job.tuning);
     let part_size = plan.chunk_size;
     let chunks = plan.chunks;
 
@@ -1070,6 +1076,7 @@ mod tests {
                 key: "k".to_string(),
                 target: self.target.clone(),
                 part_limit: self.part_limit,
+                tuning: TransferTuning::default(),
                 token: self.switch.token.clone(),
                 stop: Arc::new(move || switch.requested()),
                 progress: Arc::new(move |bytes| {

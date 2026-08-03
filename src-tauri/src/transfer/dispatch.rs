@@ -31,9 +31,10 @@ mod tests {
     use super::*;
     use crate::provider::ProviderHub;
     use crate::store::{Connection, SecureStore};
-    use crate::transfer::engine::{EngineConfig, EnqueueSpec, TransferEngine, TransferSink};
+    use crate::transfer::engine::{EnqueueSpec, TransferEngine, TransferSink};
     use crate::transfer::model::TransferTaskDto;
-    use crate::transfer::{bcpart_path, spawn_aggregator, ProgressSink};
+    use crate::transfer::part::TransferTuning;
+    use crate::transfer::{bcpart_path, spawn_aggregator, ProgressSink, SharedLimits};
     use std::time::Duration;
 
     // `TaskContext` cannot be built from this module: `TaskControl::new` is
@@ -115,7 +116,7 @@ mod tests {
             }),
             Arc::new(NoopSink),
             progress_tx,
-            EngineConfig::default(),
+            SharedLimits::new(3, 4, TransferTuning::balanced()),
             // This test exercises direction routing, not checkpointing.
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
