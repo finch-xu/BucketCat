@@ -39,7 +39,7 @@ use crate::transfer::engine::{
     TransferRunner,
 };
 use crate::transfer::part::{plan_upload_with, PartSpec, TransferTuning, UploadPlan};
-use crate::transfer::retry::{backoff_delay, is_retryable, MAX_RETRIES};
+use crate::transfer::retry::{backoff_delay_for, is_retryable, MAX_RETRIES};
 
 /// Reports transferred bytes.
 ///
@@ -594,7 +594,7 @@ where
                 if !is_retryable(&err) || retries > MAX_RETRIES {
                     return Err(err);
                 }
-                let delay = backoff_delay(retries);
+                let delay = backoff_delay_for(&err, retries);
                 tracing::warn!(retry = retries, ?delay, "retrying transfer step: {err}");
                 tokio::select! {
                     _ = token.cancelled() => return Ok(None),

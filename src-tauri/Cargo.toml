@@ -42,6 +42,15 @@ tokio-util = { version = "0.7.18", features = ["rt"] }
 # lock entries (hyper 0.14, h2 0.3, rustls 0.21, rustls-webpki 0.101, tokio-rustls
 # 0.24, hyper-rustls 0.24, sct, httpdate, socket2 0.5) and adds none.
 aws-sdk-s3 = { version = "1.137.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+# `provider::s3::normalize_s3_error`'s HTTP-status throttle fallback (a bare
+# 429/503 from a non-AWS gateway with no S3 error body, e.g. Rainyun) needs
+# to read the raw response's status off `SdkError<E, R>`'s `R`, which
+# `aws-sdk-s3` never re-exports at its own crate root. Already resolved at
+# 1.13.0 in Cargo.lock as a transitive dependency of `aws-sdk-s3` itself, so
+# promoting it to a direct, default-features (`http` module only, no
+# `client`/`http-auth`/...) dependency adds zero new lock entries -- same
+# test as the `rustls`/`hyper-rustls`/`http`/`base64` block above.
+aws-smithy-runtime-api = "1.13.0"
 aes-gcm = "0.11.0"
 hkdf = "0.13.0"
 sha2 = "0.11.0"

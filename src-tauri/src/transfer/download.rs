@@ -46,7 +46,7 @@ use crate::transfer::engine::{
 };
 use crate::transfer::part::{plan_download, PartSpec, TransferTuning};
 use crate::transfer::partfile::PartFile;
-use crate::transfer::retry::{backoff_delay, is_retryable, MAX_RETRIES};
+use crate::transfer::retry::{backoff_delay_for, is_retryable, MAX_RETRIES};
 
 /// Reports transferred bytes.
 ///
@@ -549,12 +549,25 @@ where
         // Conservation before the retry/fail decision: whatever this attempt
         // reported must come back off the bar first, whether the attempt is
         // about to be retried or is about to fail the whole task.
+        //
+        // Invariant this loop must keep (carried from Task 4's review):
+        // `ProgressHandle::retract` (which `regress` calls into) does not
+        // emit a compensating message to the progress aggregator. That's
+        // only safe today because a retried attempt's error is always
+        // request-time (`open_range`'s own error, normalized -- and now
+        // possibly `Throttled` -- by the provider) and never a mid-stream
+        // `tokio::io` read failure: `stream_chunk_once` hand-builds
+        // `AppError::Internal` for those (see its `read` call above), which
+        // `is_retryable` always rejects, so the task fails outright and
+        // `ProgressMsg::Forget` cleans up the aggregator's entry for it. If
+        // a future change ever makes an in-stream read error retryable,
+        // this retract-without-compensation gap stops being self-healing.
         regress(reported);
         retries += 1;
         if !is_retryable(&err) || retries > MAX_RETRIES {
             return Err(err);
         }
-        let delay = backoff_delay(retries);
+        let delay = backoff_delay_for(&err, retries);
         tracing::warn!(retry = retries, ?delay, "retrying download chunk: {err}");
         tokio::select! {
             _ = token.cancelled() => return Ok(None),

@@ -23,6 +23,8 @@ pub enum AppError {
     Timeout,
     #[error("endpoint unreachable")]
     Unreachable,
+    #[error("throttled by server")]
+    Throttled,
 
     #[error("bucket not found: {bucket}")]
     BucketNotFound { bucket: String },
@@ -72,6 +74,7 @@ impl AppError {
             AppError::AccessDenied => "auth/access-denied",
             AppError::Timeout => "network/timeout",
             AppError::Unreachable => "network/unreachable",
+            AppError::Throttled => "network/throttled",
             AppError::BucketNotFound { .. } => "storage/bucket-not-found",
             AppError::BucketExists { .. } => "storage/bucket-exists",
             AppError::WrongRegion { .. } => "storage/wrong-region",
@@ -242,6 +245,15 @@ mod tests {
         let e = AppError::KeyDerivationFailed;
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["code"], "local/key-derivation-failed");
+        assert!(v["params"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn throttled_maps_code_and_serializes_with_empty_params() {
+        let e = AppError::Throttled;
+        assert_eq!(e.code(), "network/throttled");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "network/throttled");
         assert!(v["params"].as_object().unwrap().is_empty());
     }
 

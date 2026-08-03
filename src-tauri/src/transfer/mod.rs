@@ -33,5 +33,5 @@ pub use partfile::{bcpart_path, PartFile};
 pub use progress::{
     eta_secs, spawn_aggregator, ProgressMsg, ProgressPayload, ProgressSink, PROGRESS_INTERVAL,
 };
-pub use retry::{backoff_delay, is_retryable, MAX_RETRIES};
+pub use retry::{backoff_delay_for, is_retryable, MAX_RETRIES};
 pub use upload::UploadRunner;

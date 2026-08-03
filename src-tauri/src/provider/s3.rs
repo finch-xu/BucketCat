@@ -687,6 +687,41 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
     })
 }
 
+/// A raw SDK response's HTTP status code, when the generic raw-response
+/// type parameter `R` on `SdkError<E, R>` actually carries one to read.
+///
+/// Every real request this crate makes resolves `R` to
+/// `aws_smithy_runtime_api::client::orchestrator::HttpResponse` (a type
+/// alias for `aws_smithy_runtime_api::http::Response<SdkBody>`) via type
+/// inference at the call site, so the blanket impl below over any body type
+/// `B` covers all of them without this module needing to name `SdkBody`
+/// itself. This module's own `SdkError` unit tests instead build values
+/// with `R = ()` -- a placeholder raw response for tests that don't care
+/// about the HTTP status -- so `()` gets a no-op impl returning `None`,
+/// keeping those tests compiling unchanged.
+///
+/// Exists because a caller behind a non-AWS gateway can throttle with a
+/// bare `429`/`503` and no S3 error body at all (confirmed live against
+/// Rainyun): the response then either fails XML parsing
+/// (`SdkError::ResponseError`) or parses into an error with no recognizable
+/// `code` (`SdkError::ServiceError`) -- either way, the raw HTTP status is
+/// the only throttle signal left.
+trait RawStatus {
+    fn status_code(&self) -> Option<u16>;
+}
+
+impl RawStatus for () {
+    fn status_code(&self) -> Option<u16> {
+        None
+    }
+}
+
+impl<B> RawStatus for aws_smithy_runtime_api::http::Response<B> {
+    fn status_code(&self) -> Option<u16> {
+        Some(self.status().into())
+    }
+}
+
 /// Classifies an [`SdkError`] into an [`AppError`] *before* it collapses
 /// into `aws_sdk_s3::Error`, recovering the network-cause fidelity that
 /// conversion throws away (see the doc comment on
@@ -700,7 +735,10 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
 /// network-free: every branch is exercised in `tests` below by
 /// constructing `SdkError` values directly via its public constructors,
 /// with no real request involved.
-fn classify_sdk_error<E, R>(err: &SdkError<E, R>) -> Option<AppError> {
+fn classify_sdk_error<E, R>(err: &SdkError<E, R>) -> Option<AppError>
+where
+    R: RawStatus,
+{
     match err {
         SdkError::TimeoutError(_) => Some(AppError::Timeout),
         // `DispatchFailure` wraps a `ConnectorError`; only its `is_timeout`
@@ -718,9 +756,15 @@ fn classify_sdk_error<E, R>(err: &SdkError<E, R>) -> Option<AppError> {
         SdkError::ConstructionFailure(_) => Some(AppError::Unreachable),
         // A response came back but couldn't be parsed as this protocol --
         // typically because the endpoint isn't actually an S3-compatible
-        // server. Also a connectivity/target problem, not a modeled S3
-        // error.
-        SdkError::ResponseError(_) => Some(AppError::Unreachable),
+        // server. Usually a connectivity/target problem, not a modeled S3
+        // error -- *unless* the raw HTTP status is 429/503, in which case a
+        // bare-status throttle response with no (or non-XML) body just
+        // happens to also fail parsing here, and that's a throttle signal,
+        // not a broken endpoint.
+        SdkError::ResponseError(ctx) => Some(match ctx.raw().status_code() {
+            Some(429) | Some(503) => AppError::Throttled,
+            _ => AppError::Unreachable,
+        }),
         SdkError::ServiceError(_) => None,
         _ => None,
     }
@@ -790,6 +834,23 @@ pub(crate) fn classify_error_code(code: &str, message: Option<&str>) -> Option<A
         "PermanentRedirect" | "IncorrectRegion" => Some(AppError::WrongRegion {
             bucket: message.unwrap_or("unknown").to_string(),
         }),
+        // Every S3-compatible backend's own spelling of "you're sending too
+        // fast, back off": AWS S3 itself uses `SlowDown` (and, on some
+        // operations, `Throttling`/`ThrottlingException` like other AWS
+        // services); `TooManyRequests` and `RequestLimitExceeded` show up on
+        // API-Gateway-fronted and DynamoDB-backed S3-compatible services
+        // respectively; `ServiceUnavailable` is the generic "we're
+        // overloaded, retry later" a server sends instead of a dedicated
+        // throttle code. All six get the same, much slower backoff
+        // (`retry::backoff_delay_for`) instead of the plain network
+        // schedule -- retrying at 1s/2s/4s against a server that just said
+        // "slow down" only makes the throttling worse.
+        "SlowDown"
+        | "TooManyRequests"
+        | "RequestLimitExceeded"
+        | "Throttling"
+        | "ThrottlingException"
+        | "ServiceUnavailable" => Some(AppError::Throttled),
         _ => None,
     }
 }
@@ -1037,9 +1098,15 @@ fn fold_single_delete_outcomes(results: Vec<(String, Result<(), AppError>)>) -> 
 ///    `SignatureDoesNotMatch` on `ListBuckets`/`DeleteBucket`, whose
 ///    generated error enums don't model anything but `Unhandled` and so
 ///    never reach tier 2's modeled-variant arms.
+/// 4. If tier 3 still found no code to map (no code at all, or one this
+///    crate doesn't recognize), one last fallback: the raw response's HTTP
+///    status. A `429`/`503` with no usable S3 error code -- as seen live
+///    from Rainyun's gateway -- still means "throttled", it just can't say
+///    so via the usual error-code channel.
 fn normalize_s3_error<E, R>(err: SdkError<E, R>) -> AppError
 where
     E: ProvideErrorMetadata,
+    R: RawStatus,
     aws_sdk_s3::Error: From<SdkError<E, R>>,
 {
     if let Some(app_err) = classify_sdk_error(&err) {
@@ -1049,13 +1116,15 @@ where
     // At this point `err` is `SdkError::ServiceError` (the only case
     // `classify_sdk_error` returns `None` for, aside from a hypothetical
     // future `#[non_exhaustive]` variant it also can't classify -- for
-    // which `code`/`message` below are simply `None`, a no-op for tier 3).
-    let (code, message) = match &err {
+    // which `code`/`message`/`status` below are simply `None`, a no-op for
+    // tiers 3 and 4).
+    let (code, message, status) = match &err {
         SdkError::ServiceError(ctx) => (
             ctx.err().code().map(str::to_string),
             ctx.err().message().map(str::to_string),
+            ctx.raw().status_code(),
         ),
-        _ => (None, None),
+        _ => (None, None, None),
     };
 
     let mapped = AppError::from(aws_sdk_s3::Error::from(err));
@@ -1065,6 +1134,9 @@ where
             .and_then(|c| classify_error_code(c, message.as_deref()))
         {
             return app_err;
+        }
+        if matches!(status, Some(429) | Some(503)) {
+            return AppError::Throttled;
         }
     }
     mapped
@@ -3570,6 +3642,61 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn classify_error_code_maps_throttle_codes_to_throttled() {
+        for code in [
+            "SlowDown",
+            "TooManyRequests",
+            "RequestLimitExceeded",
+            "Throttling",
+            "ThrottlingException",
+            "ServiceUnavailable",
+        ] {
+            assert!(
+                matches!(classify_error_code(code, None), Some(AppError::Throttled)),
+                "{code}"
+            );
+        }
+    }
+
+    // --- classify_sdk_error raw-status fallback (pure, no network) ----------
+
+    #[test]
+    fn classify_response_error_with_throttle_status_maps_to_throttled() {
+        // A non-AWS gateway can throttle with a bare 429/503 and no S3 XML
+        // error body at all (confirmed live against Rainyun): the response
+        // then fails to parse as this protocol, surfacing as
+        // `SdkError::ResponseError` -- which, absent a status check, would
+        // otherwise be misclassified as `Unreachable`.
+        for status in [429u16, 503u16] {
+            let raw = aws_smithy_runtime_api::http::Response::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status).unwrap(),
+                (),
+            );
+            let err: SdkError<(), _> = SdkError::response_error("boom", raw);
+            assert!(
+                matches!(classify_sdk_error(&err), Some(AppError::Throttled)),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_response_error_with_other_status_stays_unreachable() {
+        // The raw-status fallback must not swallow every parse failure --
+        // only 429/503 mean "throttled"; anything else keeps today's
+        // behavior.
+        let raw = aws_smithy_runtime_api::http::Response::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(500u16).unwrap(),
+            (),
+        );
+        let err: SdkError<(), _> = SdkError::response_error("boom", raw);
+        assert!(matches!(
+            classify_sdk_error(&err),
+            Some(AppError::Unreachable)
+        ));
+    }
+
     // --- normalize_s3_error metadata-code fallback (pure, no network) -------
 
     #[test]
@@ -3630,6 +3757,48 @@ mod tests {
         let app_err = normalize_s3_error(sdk_err);
 
         assert_eq!(app_err.code(), "internal");
+    }
+
+    #[test]
+    fn normalize_recovers_throttled_from_bare_status_with_no_error_code() {
+        // Some non-AWS gateways (Rainyun, confirmed live) throttle with a
+        // bare 429/503 and no S3 error body at all: no `<Code>` for
+        // `classify_error_code` to map, so the raw HTTP status is the only
+        // signal left that this was a throttle, not an unknown failure.
+        for status in [429u16, 503u16] {
+            let meta = ErrorMetadata::builder().build();
+            let unhandled = aws_sdk_s3::operation::list_buckets::ListBucketsError::generic(meta);
+            let raw = aws_smithy_runtime_api::http::Response::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status).unwrap(),
+                (),
+            );
+            let sdk_err: SdkError<_, _> = SdkError::service_error(unhandled, raw);
+
+            let app_err = normalize_s3_error(sdk_err);
+
+            assert_eq!(app_err.code(), "network/throttled", "{status}");
+        }
+    }
+
+    #[test]
+    fn normalize_status_fallback_never_overrides_a_recognized_code() {
+        // Tier 3 (the error code) must win outright over tier 4 (the raw
+        // status) when both are present -- a modeled/known code is always
+        // more precise than a bare status guess.
+        let meta = ErrorMetadata::builder()
+            .code("NoSuchBucket")
+            .message("gone")
+            .build();
+        let unhandled = aws_sdk_s3::operation::delete_bucket::DeleteBucketError::generic(meta);
+        let raw = aws_smithy_runtime_api::http::Response::new(
+            aws_smithy_runtime_api::http::StatusCode::try_from(503u16).unwrap(),
+            (),
+        );
+        let sdk_err: SdkError<_, _> = SdkError::service_error(unhandled, raw);
+
+        let app_err = normalize_s3_error(sdk_err);
+
+        assert_eq!(app_err.code(), "storage/bucket-not-found");
     }
 
     // --- display_name (pure) ------------------------------------------------
