@@ -128,6 +128,17 @@ pub enum ProgressMsg {
     /// The one case that must *not* send it is `Paused`: keeping the entry is
     /// what lets the panel go on showing the progress the pause froze.
     Forget { task_id: String },
+    /// Undo `bytes` of a task's `transferred` -- the aggregator-side half of
+    /// [`crate::transfer::ProgressHandle::retract`]'s atomic rollback, so a
+    /// task that keeps running after a retract (a retried chunk, Task 3's
+    /// upload case) does not leave the IPC payload permanently over-counted.
+    ///
+    /// Deliberately *not* a throughput sample: a retract does not touch the
+    /// entry's `SpeedWindow`, so the reported speed can briefly overshoot
+    /// during a retry burst rather than dip -- accepted per the design brief.
+    /// An unknown `task_id` is silently ignored (no entry is created for it),
+    /// the same as any message racing a `Forget`.
+    Retract { task_id: String, bytes: u64 },
 }
 
 /// Where flushed batches go. The Tauri implementation lives in `engine.rs`;
@@ -178,6 +189,16 @@ pub fn spawn_aggregator(sink: Arc<dyn ProgressSink>) -> mpsc::UnboundedSender<Pr
                         None => break,
                         Some(ProgressMsg::Forget { task_id }) => {
                             tasks.remove(&task_id);
+                        }
+                        Some(ProgressMsg::Retract { task_id, bytes }) => {
+                            // `get_mut` rather than `entry(..).or_insert`: an
+                            // unknown task_id must be a silent no-op, not
+                            // spawn a zeroed entry that then reports garbage
+                            // on the next tick.
+                            if let Some(entry) = tasks.get_mut(&task_id) {
+                                entry.transferred = entry.transferred.saturating_sub(bytes);
+                                entry.dirty = true;
+                            }
                         }
                         Some(ProgressMsg::Delta { task_id, bytes, total }) => {
                             let entry = tasks.entry(task_id).or_insert_with(|| TaskProgress {
@@ -436,6 +457,68 @@ mod tests {
             batches[1][0].transferred, 5,
             "Forget must have removed the entry so the post-Forget delta \
              starts a fresh TaskProgress, not resume the old total"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retract_reduces_transferred_without_touching_speed() {
+        let sink = Arc::new(RecordingSink::default());
+        let tx = spawn_aggregator(sink.clone());
+
+        tx.send(ProgressMsg::Delta {
+            task_id: "t1".to_string(),
+            bytes: 8_000_000,
+            total: 10_000_000,
+        })
+        .unwrap();
+        tx.send(ProgressMsg::Retract {
+            task_id: "t1".to_string(),
+            bytes: 3_000_000,
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(PROGRESS_INTERVAL * 2).await;
+        tokio::task::yield_now().await;
+
+        let batches = sink.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1, "expected exactly one flush");
+        let payload = &batches[0][0];
+        assert_eq!(payload.task_id, "t1");
+        assert_eq!(
+            payload.transferred, 5_000_000,
+            "retract must reduce transferred: 8MB delta minus a 3MB retract"
+        );
+        // The window only records Delta bytes, so the speed a retract-adjusted
+        // entry reports must be identical to what the 8MB Delta alone would
+        // have produced -- a retract is not a throughput sample and must not
+        // shrink or otherwise perturb the window (brief retry-period
+        // overshoot is accepted).
+        let expected_speed = 8_000_000.0 / (PROGRESS_INTERVAL * 2).as_secs_f64();
+        assert!(
+            (payload.speed - expected_speed).abs() < 1.0,
+            "speed {} strayed from the Delta-only expectation {expected_speed}",
+            payload.speed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retract_for_an_unknown_task_is_ignored() {
+        let sink = Arc::new(RecordingSink::default());
+        let tx = spawn_aggregator(sink.clone());
+
+        tx.send(ProgressMsg::Retract {
+            task_id: "ghost".to_string(),
+            bytes: 100,
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(PROGRESS_INTERVAL * 2).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            sink.batches.lock().unwrap().is_empty(),
+            "a Retract for a task nobody Delta'd yet must not create an entry, let alone flush \
+             one"
         );
     }
 

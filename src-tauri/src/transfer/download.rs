@@ -574,18 +574,18 @@ where
         // reported must come back off the bar first, whether the attempt is
         // about to be retried or is about to fail the whole task.
         //
-        // Invariant this loop must keep (carried from Task 4's review):
-        // `ProgressHandle::retract` (which `regress` calls into) does not
-        // emit a compensating message to the progress aggregator. That's
-        // only safe today because a retried attempt's error is always
-        // request-time (`open_range`'s own error, normalized -- and now
-        // possibly `Throttled` -- by the provider) and never a mid-stream
-        // `tokio::io` read failure: `stream_chunk_once` hand-builds
-        // `AppError::Internal` for those (see its `read` call above), which
-        // `is_retryable` always rejects, so the task fails outright and
-        // `ProgressMsg::Forget` cleans up the aggregator's entry for it. If
-        // a future change ever makes an in-stream read error retryable,
-        // this retract-without-compensation gap stops being self-healing.
+        // `ProgressHandle::retract` (which `regress` calls into) now sends
+        // `ProgressMsg::Retract`, so the aggregator's own `transferred`
+        // figure is compensated directly and no longer depends on the task
+        // failing outright and `ProgressMsg::Forget` wiping its entry. That
+        // means this accounting stays correct even on the path a retried
+        // attempt's error is always request-time today (`open_range`'s own
+        // error, normalized -- and possibly `Throttled` -- by the provider):
+        // a mid-stream `tokio::io` read failure still hand-builds
+        // `AppError::Internal` (see `stream_chunk_once`'s `read` call above),
+        // which `is_retryable` always rejects, so that case still fails the
+        // task outright -- it just no longer needs to, for the accounting to
+        // stay sound.
         regress(reported);
         retries += 1;
         if !is_retryable(&err) || retries > MAX_RETRIES {

@@ -216,12 +216,25 @@ impl ProgressHandle {
     /// Saturating at 0 makes that impossible -- the DTO-side `transferred`
     /// this counter backs (see `EngineInner::apply`/`TransferEngine::snapshot`)
     /// can never go negative anyway.
+    ///
+    /// Also sends [`ProgressMsg::Retract`] so the aggregator's own copy of
+    /// `transferred` (the one batched over IPC) stays in sync with this
+    /// atomic -- without it, a task that keeps running after a retract (Task
+    /// 3's upload-retry case) would over-report on the wire forever, since
+    /// nothing would ever bring the aggregator's figure back down.
     pub fn retract(&self, bytes: u64) {
         let _ = self
             .transferred
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(bytes))
             });
+        // Same "closed channel is fine" stance as `add`: a gone aggregator
+        // means the engine is shutting down, and there is nobody left to
+        // compensate for.
+        let _ = self.tx.send(ProgressMsg::Retract {
+            task_id: self.task_id.clone(),
+            bytes,
+        });
     }
 }
 
@@ -2161,6 +2174,38 @@ mod tests {
             1,
             "restart must Forget, or the aggregator adds the replayed bytes to the old total"
         );
+    }
+
+    #[tokio::test]
+    async fn retract_sends_a_compensating_message_to_the_aggregator() {
+        // Direct construction rather than the full Harness: this is a
+        // narrow contract on ProgressHandle itself -- retract must both
+        // roll back its own atomic (already covered by the doc comment's
+        // fetch_update) and tell the aggregator, so a task that keeps
+        // running after a retract does not permanently over-report over
+        // IPC (Task 3's retry-while-running case).
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = ProgressHandle {
+            tx,
+            task_id: "t1".to_string(),
+            total: 100,
+            transferred: Arc::new(AtomicU64::new(20)),
+        };
+
+        handle.retract(7);
+
+        assert_eq!(
+            handle.transferred.load(Ordering::Relaxed),
+            13,
+            "the atomic must still roll back exactly as before"
+        );
+        match rx.try_recv().expect("retract must send a message") {
+            ProgressMsg::Retract { task_id, bytes } => {
+                assert_eq!(task_id, "t1");
+                assert_eq!(bytes, 7);
+            }
+            other => panic!("expected ProgressMsg::Retract, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
