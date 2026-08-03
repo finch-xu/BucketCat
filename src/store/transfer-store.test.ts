@@ -16,6 +16,8 @@ function task(over: Partial<TransferTask> = {}): TransferTask {
     transferred: 0,
     status: "queued",
     error_code: null,
+    error_params: null,
+    notice: null,
     ...over,
   };
 }

@@ -450,6 +450,17 @@ export interface TransferTask {
    * `errors.` namespace itself, so sending it pre-prefixed would double up
    * and never match a dictionary entry. */
   error_code: string | null;
+  /** Interpolation params for `error_code`'s i18n message (e.g. `{ bucket:
+   * "photos" }`), mirroring the backend's `AppError::params()`. `null`
+   * unless `error_code` is set. */
+  error_params: Record<string, string> | null;
+  /** A transient "this step is being retried" notice a runner emits while
+   * `status === "running"`, distinct from `error_code`: it only ever shows up
+   * mid-transfer and is cleared the moment the task leaves `running`, so it
+   * never lingers on a finished, paused, failed or canceled row. `code` is an
+   * `errors.*` key exactly like `error_code`; `attempt`/`max` let the panel
+   * render e.g. "retrying (2/3)". */
+  notice: { code: string; attempt: number; max: number } | null;
 }
 
 /** One task's throttled progress. Mirrors `ProgressPayload`. `speed` is bytes

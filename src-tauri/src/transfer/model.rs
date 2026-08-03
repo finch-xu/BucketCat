@@ -1,5 +1,7 @@
 //! Transfer task model and its state machine (design §5).
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Which way the bytes flow. `Download` exists in the model from day one --
@@ -99,6 +101,24 @@ pub fn next_status(current: TransferStatus, cmd: TransferCommand) -> Option<Tran
     }
 }
 
+/// A transient "this part/chunk is being retried" notice a runner emits while
+/// a task is `Running` (Task 7, design §7.4). Distinct from
+/// [`TransferTaskDto::error_code`]: a notice is informational and only ever
+/// present mid-transfer, whereas `error_code` only appears once the task has
+/// actually reached `Failed`. The engine clears it on every state transition
+/// (see `EngineInner::apply`), so it can never survive into a `Paused`,
+/// `Failed`, `Completed` or `Canceled` DTO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskNotice {
+    /// An `AppError::code()`-style i18n key, e.g. `"network/throttled"`.
+    pub code: String,
+    /// 1-based retry attempt this notice describes.
+    pub attempt: u32,
+    /// The retry budget (`transfer::retry::MAX_RETRIES`), so the frontend can
+    /// render "attempt 2/3" without importing the constant itself.
+    pub max: u32,
+}
+
 /// One transfer task, as the frontend sees it.
 ///
 /// `seq` is a monotonically increasing creation counter rather than a
@@ -126,6 +146,14 @@ pub struct TransferTaskDto {
     /// The frontend renders it through the same `errors.*` dictionary as
     /// top-level errors.
     pub error_code: Option<String>,
+    /// Interpolation params for `error_code`'s i18n message, mirroring
+    /// `AppError::params()` field-for-field. `Some` exactly when `error_code`
+    /// is `Some` (i.e. `status == Failed`), `None` otherwise.
+    pub error_params: Option<HashMap<String, String>>,
+    /// A transient in-flight retry notice (Task 7). `None` unless a runner is
+    /// actively retrying a step of a `Running` task; cleared by the engine on
+    /// every state transition, so it never lingers into a non-`Running` DTO.
+    pub notice: Option<TaskNotice>,
 }
 
 #[cfg(test)]
@@ -199,6 +227,8 @@ mod tests {
             transferred: 512,
             status: TransferStatus::Running,
             error_code: None,
+            error_params: None,
+            notice: None,
         };
         let v = serde_json::to_value(&task).unwrap();
         assert_eq!(v["id"], "t-1");
@@ -213,6 +243,8 @@ mod tests {
         assert_eq!(v["transferred"], 512);
         assert_eq!(v["status"], "running");
         assert!(v["error_code"].is_null());
+        assert!(v["error_params"].is_null());
+        assert!(v["notice"].is_null());
     }
 
     #[test]

@@ -64,7 +64,7 @@ use crate::provider::{Provider, ProviderHub, UploadedPart};
 use crate::transfer::checkpoint::{self, Checkpoint};
 use crate::transfer::limits::SharedLimits;
 use crate::transfer::model::{
-    next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto,
+    next_status, Direction, TaskNotice, TransferCommand, TransferStatus, TransferTaskDto,
 };
 use crate::transfer::part::{chunks_for, TransferTuning};
 use crate::transfer::partfile::bcpart_path;
@@ -326,6 +326,13 @@ pub struct TaskContext {
     /// checkpoint dir configured). Cloned into the runner's job so the resume
     /// call sites can persist without reaching back into the engine.
     pub checkpoint: Option<CheckpointWriter>,
+    /// Reports a transient in-flight retry notice (Task 7, design §7.4).
+    /// `Some(notice)` on a retryable failure the runner is about to retry,
+    /// `None` to clear a previously-emitted one once the step succeeds.
+    /// Wired to [`EngineInner::set_notice`]; the closure spawns its own task
+    /// (see [`EngineInner::drive`]) so a runner never awaits the task-table
+    /// lock just to surface a notice.
+    pub notice: Arc<dyn Fn(Option<TaskNotice>) + Send + Sync>,
 }
 
 impl TaskContext {
@@ -512,11 +519,19 @@ impl EngineInner {
     /// Applies a state-machine command and, if it was legal, emits the new
     /// state. The emit happens **after** the lock is released so a slow sink
     /// can never stall the task table.
+    ///
+    /// `error` is `Some((code, params))` only for a `Fail` transition; any
+    /// other transition (including a second `Fail` call that turns out
+    /// illegal) leaves both `error_code` and `error_params` cleared. Every
+    /// legal transition also clears `notice` -- a retry notice is only
+    /// meaningful while the task is actively `Running`, and once the driver
+    /// moves it anywhere else (`Paused`, `Failed`, `Completed`, `Canceled`,
+    /// even back to `Running` via `Start`) a stale one would be misleading.
     async fn apply(
         self: &Arc<Self>,
         task_id: &str,
         cmd: TransferCommand,
-        error_code: Option<String>,
+        error: Option<(String, HashMap<String, String>)>,
     ) -> bool {
         let updated = {
             let mut tasks = self.tasks.lock().await;
@@ -527,17 +542,43 @@ impl EngineInner {
                 return false;
             };
             record.dto.status = next;
-            record.dto.error_code = if next == TransferStatus::Failed {
-                error_code
-            } else {
-                None
-            };
+            match (next, error) {
+                (TransferStatus::Failed, Some((code, params))) => {
+                    record.dto.error_code = Some(code);
+                    record.dto.error_params = Some(params);
+                }
+                _ => {
+                    record.dto.error_code = None;
+                    record.dto.error_params = None;
+                }
+            }
+            record.dto.notice = None;
             record.dto.transferred = record.transferred.load(Ordering::Relaxed);
             record.dto.clone()
         };
         tracing::debug!(task = %updated.id, status = ?updated.status, "transfer state");
         self.sink.state_changed(&updated);
         true
+    }
+
+    /// Updates a task's transient retry notice and broadcasts the new DTO.
+    /// Unlike [`EngineInner::apply`] this never touches `status` -- a runner
+    /// can emit and clear a notice many times while a task stays `Running`.
+    /// A missing task is a benign no-op: the task may have finished (and been
+    /// cleared or gone terminal) between the runner deciding to retry and this
+    /// call actually running (it is dispatched via `tokio::spawn`, so it can
+    /// land after the driver already moved on).
+    async fn set_notice(self: &Arc<Self>, task_id: &str, notice: Option<TaskNotice>) {
+        let updated = {
+            let mut tasks = self.tasks.lock().await;
+            let Some(record) = tasks.get_mut(task_id) else {
+                return;
+            };
+            record.dto.notice = notice;
+            record.dto.transferred = record.transferred.load(Ordering::Relaxed);
+            record.dto.clone()
+        };
+        self.sink.state_changed(&updated);
     }
 
     fn spawn_driver(self: &Arc<Self>, task_id: String) {
@@ -613,6 +654,21 @@ impl EngineInner {
             enabled: Arc::clone(&self.resume_enabled),
             last: Arc::new(std::sync::Mutex::new(None)),
         });
+        // The notice closure cannot call `set_notice` directly: `set_notice`
+        // is async (it takes the tasks `Mutex`), and a runner must never be
+        // made to await the task table just to surface a retry notice. So it
+        // clones the pieces it needs and spawns its own short-lived task --
+        // exactly the "fire and forget" shape `ProgressHandle::add` uses for
+        // progress, just via `tokio::spawn` instead of an mpsc send since
+        // `set_notice` mutates the same table `apply` does.
+        let notice_inner = Arc::clone(&self);
+        let notice_task_id = task_id.clone();
+        let notice: Arc<dyn Fn(Option<TaskNotice>) + Send + Sync> = Arc::new(move |n| {
+            let inner = Arc::clone(&notice_inner);
+            let task_id = notice_task_id.clone();
+            tokio::spawn(async move { inner.set_notice(&task_id, n).await });
+        });
+
         // Read fresh, right before this task starts: a settings change
         // (Task 8's command layer, via `SharedLimits::set_max_parts`/
         // `set_tuning`) must apply to the *next* task admitted, without
@@ -631,6 +687,7 @@ impl EngineInner {
             },
             resume,
             checkpoint,
+            notice,
         };
 
         // The runner gets its own task so that a panic inside it cannot take
@@ -661,7 +718,7 @@ impl EngineInner {
                 self.apply(
                     &task_id,
                     TransferCommand::Fail,
-                    Some(err.code().to_string()),
+                    Some((err.code().to_string(), err.params())),
                 )
                 .await;
                 return;
@@ -703,7 +760,7 @@ impl EngineInner {
                     self.apply(
                         &task_id,
                         TransferCommand::Fail,
-                        Some(err.code().to_string()),
+                        Some((err.code().to_string(), err.params())),
                     )
                     .await;
                 }
@@ -718,7 +775,7 @@ impl EngineInner {
                 self.apply(
                     &task_id,
                     TransferCommand::Fail,
-                    Some(err.code().to_string()),
+                    Some((err.code().to_string(), err.params())),
                 )
                 .await;
             }
@@ -892,6 +949,8 @@ impl TransferEngine {
             transferred: 0,
             status: TransferStatus::Queued,
             error_code: None,
+            error_params: None,
+            notice: None,
         };
 
         {
@@ -948,6 +1007,8 @@ impl TransferEngine {
             transferred: preset,
             status: TransferStatus::Paused,
             error_code: None,
+            error_params: None,
+            notice: None,
         };
 
         {
@@ -1225,6 +1286,10 @@ mod tests {
         /// [`TransferEngine::limits`] is read fresh by the *next* task
         /// spawned rather than only at engine construction.
         last_part_limit: AtomicUsize,
+        /// If set, each run calls `(ctx.notice)(Some(..))` with this notice
+        /// right after starting -- standing in for a retry site (Task 7)
+        /// deciding a step is worth surfacing.
+        emit_notice: StdMutex<Option<TaskNotice>>,
     }
 
     impl FakeRunner {
@@ -1240,11 +1305,16 @@ mod tests {
                 reported: AtomicUsize::new(0),
                 checkpoint_state: StdMutex::new(None),
                 last_part_limit: AtomicUsize::new(0),
+                emit_notice: StdMutex::new(None),
             })
         }
 
         fn set_mode(&self, mode: FakeMode) {
             *self.mode.lock().unwrap() = mode;
+        }
+
+        fn set_emit_notice(&self, notice: TaskNotice) {
+            *self.emit_notice.lock().unwrap() = Some(notice);
         }
     }
 
@@ -1266,6 +1336,9 @@ mod tests {
             let bytes = self.report_bytes.load(Ordering::SeqCst);
             if bytes > 0 {
                 ctx.progress.add(bytes);
+            }
+            if let Some(notice) = self.emit_notice.lock().unwrap().clone() {
+                (ctx.notice)(Some(notice));
             }
             // Mirror the checkpoint *before* bumping `reported`, so a test that
             // waits on `reported == 1` is guaranteed the file is already on disk.
@@ -1309,7 +1382,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSink {
-        seen: StdMutex<Vec<(String, TransferStatus)>>,
+        seen: StdMutex<Vec<(String, TransferStatus, Option<TaskNotice>)>>,
     }
 
     impl RecordingSink {
@@ -1318,8 +1391,21 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(task, _)| task == id)
-                .map(|(_, status)| *status)
+                .filter(|(task, _, _)| task == id)
+                .map(|(_, status, _)| *status)
+                .collect()
+        }
+
+        /// Every `notice` a `state_changed` broadcast carried for `id`, in
+        /// arrival order -- including `None`s, so a test can assert both that
+        /// a notice arrived and that a later broadcast cleared it again.
+        fn notices_of(&self, id: &str) -> Vec<Option<TaskNotice>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(task, _, _)| task == id)
+                .map(|(_, _, notice)| notice.clone())
                 .collect()
         }
     }
@@ -1329,7 +1415,7 @@ mod tests {
             self.seen
                 .lock()
                 .unwrap()
-                .push((task.id.clone(), task.status));
+                .push((task.id.clone(), task.status, task.notice.clone()));
         }
     }
 
@@ -1721,6 +1807,75 @@ mod tests {
             h.task(&task.id).await.error_code,
             None,
             "a retried task must not keep showing the previous failure"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_task_carries_error_params() {
+        // Task 7 (spec §7.4): `error_params` mirrors `AppError::params()`
+        // alongside `error_code`, so the frontend's i18n dictionary can
+        // interpolate `{bucket}` and friends without a second round trip.
+        let h = harness(1);
+        *h.runner.fail_with.lock().unwrap() = Some(AppError::BucketNotFound {
+            bucket: "b1".to_string(),
+        });
+        let task = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Failed),
+            "the task reaches Failed",
+        )
+        .await;
+
+        let dto = h.task(&task.id).await;
+        assert_eq!(dto.error_code.as_deref(), Some("storage/bucket-not-found"));
+        assert_eq!(
+            dto.error_params
+                .as_ref()
+                .and_then(|p| p.get("bucket"))
+                .map(String::as_str),
+            Some("b1")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notice_reaches_the_dto_and_clears_on_completion() {
+        // Task 7 (spec §7.4): a runner surfaces an in-flight retry through
+        // `ctx.notice`, which must reach a `state_changed` broadcast without
+        // the runner blocking on the task table, and must not survive the
+        // task reaching a terminal state.
+        let h = harness(1);
+        let notice = TaskNotice {
+            code: "network/throttled".to_string(),
+            attempt: 1,
+            max: 3,
+        };
+        h.runner.set_emit_notice(notice.clone());
+        let task = h.engine.enqueue(spec("a")).await.unwrap();
+
+        eventually(
+            || h.sink.notices_of(&task.id).contains(&Some(notice.clone())),
+            "the notice reaches a state_changed broadcast",
+        )
+        .await;
+
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Completed),
+            "the task completes",
+        )
+        .await;
+
+        assert_eq!(
+            h.task(&task.id).await.notice,
+            None,
+            "a finished task must not keep showing a stale retry notice"
         );
     }
 

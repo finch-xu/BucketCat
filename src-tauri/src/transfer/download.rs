@@ -44,6 +44,7 @@ use crate::provider::Provider;
 use crate::transfer::engine::{
     CheckpointWriter, DownloadState, ResumeState, RunOutcome, StopKind, TaskContext, TransferRunner,
 };
+use crate::transfer::model::TaskNotice;
 use crate::transfer::part::{plan_download, PartSpec, TransferTuning};
 use crate::transfer::partfile::PartFile;
 use crate::transfer::retry::{backoff_delay_for, is_retryable, MAX_RETRIES};
@@ -59,6 +60,10 @@ type ProgressFn = Arc<dyn Fn(u64) + Send + Sync>;
 /// Reads the task's stop intent. A closure for the same reason as
 /// [`ProgressFn`]: [`crate::transfer::TaskControl`] has no public constructor.
 type StopFn = Arc<dyn Fn() -> Option<StopKind> + Send + Sync>;
+
+/// Surfaces a transient in-flight retry notice (Task 7). Same rationale as
+/// [`ProgressFn`]: [`TaskContext::notice`] is the only constructor.
+type NoticeFn = Arc<dyn Fn(Option<TaskNotice>) + Send + Sync>;
 
 /// Chunks of `plan` not yet written to the `.bcpart`. Pure so resume
 /// arithmetic is testable without a network. `plan` comes from
@@ -95,6 +100,10 @@ struct DownloadJob {
     /// [`crate::transfer::ProgressHandle::retract`] exactly as `progress` is
     /// wired to `add`.
     regress: ProgressFn,
+    /// Reports a transient in-flight retry notice (Task 7). Cloned straight
+    /// from [`TaskContext::notice`] and further cloned into each spawned
+    /// chunk task.
+    notice: NoticeFn,
     resume: Arc<Mutex<Option<ResumeState>>>,
     /// Mirrors the in-memory resume slot to a checkpoint file (M4c). `None`
     /// when checkpointing is disabled, in which case `persist_checkpoint` is a
@@ -121,6 +130,7 @@ impl DownloadJob {
             stop: Arc::new(move || control.requested()),
             progress: Arc::new(move |bytes| progress.add(bytes)),
             regress: Arc::new(move |bytes| regress_handle.retract(bytes)),
+            notice: Arc::clone(&ctx.notice),
             resume: Arc::clone(&ctx.resume),
             checkpoint: ctx.checkpoint.clone(),
         }
@@ -350,11 +360,12 @@ where
         let token = chunk_token.clone();
         let progress = Arc::clone(&job.progress);
         let regress = Arc::clone(&job.regress);
+        let notice = Arc::clone(&job.notice);
 
         set.spawn(async move {
             let _permit = permit;
             download_one_chunk(
-                provider, &bucket, &key, chunk, &partfile, &token, progress, regress,
+                provider, &bucket, &key, chunk, &partfile, &token, progress, regress, notice,
             )
             .await
         });
@@ -502,6 +513,11 @@ const STREAM_BUF: usize = 8 * 1024 * 1024;
 /// loop decides whether to retry or give up, or a retried chunk would
 /// permanently over-report and the bar would never reach 100% even once every
 /// chunk truly lands.
+///
+/// `notice` mirrors `upload.rs`'s `with_retry` (Task 7, design §7.4): a
+/// retryable failure emits `Some(TaskNotice { .. })` before the backoff
+/// sleep, and an eventual success only emits `None` if a notice was actually
+/// emitted earlier for this chunk (the `notified` guard).
 #[allow(clippy::too_many_arguments)]
 async fn download_one_chunk<P>(
     provider: Arc<P>,
@@ -512,40 +528,48 @@ async fn download_one_chunk<P>(
     token: &CancellationToken,
     progress: ProgressFn,
     regress: ProgressFn,
+    notice: NoticeFn,
 ) -> AppResult<Option<i32>>
 where
     P: Provider + Send + Sync + 'static,
 {
     let mut retries = 0u32;
+    let mut notified = false;
     loop {
         if token.is_cancelled() {
             return Ok(None);
         }
-        let (err, reported) =
-            match stream_chunk_once(&provider, bucket, key, chunk, partfile, token, &progress)
-                .await
-            {
-                Ok(Some(written)) if written == chunk.length => return Ok(Some(chunk.number)),
-                // The token fired mid-read; the reported bytes stay reported
-                // (pause semantics: the resume path re-reports finished
-                // chunks only, so nothing here needs undoing) and nothing
-                // more may be written.
-                Ok(None) => return Ok(None),
-                // A short stream (the object shrank between head and get, or
-                // a non-conformant gateway EOF'd early): same failure shape as
-                // the old whole-chunk length check, just discovered
-                // incrementally instead of in one length comparison.
-                Ok(Some(short)) => (
-                    AppError::Internal {
-                        message: format!(
-                            "range read for {key} chunk {} returned {short} bytes, expected {}",
-                            chunk.number, chunk.length
-                        ),
-                    },
-                    short,
-                ),
-                Err((err, reported)) => (err, reported),
-            };
+        let (err, reported) = match stream_chunk_once(
+            &provider, bucket, key, chunk, partfile, token, &progress,
+        )
+        .await
+        {
+            Ok(Some(written)) if written == chunk.length => {
+                if notified {
+                    (*notice)(None);
+                }
+                return Ok(Some(chunk.number));
+            }
+            // The token fired mid-read; the reported bytes stay reported
+            // (pause semantics: the resume path re-reports finished
+            // chunks only, so nothing here needs undoing) and nothing
+            // more may be written.
+            Ok(None) => return Ok(None),
+            // A short stream (the object shrank between head and get, or
+            // a non-conformant gateway EOF'd early): same failure shape as
+            // the old whole-chunk length check, just discovered
+            // incrementally instead of in one length comparison.
+            Ok(Some(short)) => (
+                AppError::Internal {
+                    message: format!(
+                        "range read for {key} chunk {} returned {short} bytes, expected {}",
+                        chunk.number, chunk.length
+                    ),
+                },
+                short,
+            ),
+            Err((err, reported)) => (err, reported),
+        };
         // Conservation before the retry/fail decision: whatever this attempt
         // reported must come back off the bar first, whether the attempt is
         // about to be retried or is about to fail the whole task.
@@ -567,6 +591,12 @@ where
         if !is_retryable(&err) || retries > MAX_RETRIES {
             return Err(err);
         }
+        (*notice)(Some(TaskNotice {
+            code: err.code().to_string(),
+            attempt: retries,
+            max: MAX_RETRIES,
+        }));
+        notified = true;
         let delay = backoff_delay_for(&err, retries);
         tracing::warn!(retry = retries, ?delay, "retrying download chunk: {err}");
         tokio::select! {
@@ -1054,6 +1084,10 @@ mod tests {
         /// bar would show (Task 4).
         regressed: Arc<AtomicU64>,
         part_limit: usize,
+        /// Every notice `download_one_chunk` emitted, in arrival order --
+        /// `Some` for a retryable failure, `None` for the clear that follows
+        /// an eventual success (Task 7).
+        notices: Arc<StdMutex<Vec<Option<TaskNotice>>>>,
         // Kept for its RAII lifetime: the target lives under this tempdir, so
         // dropping it early would delete the file mid-test.
         _dir: tempfile::TempDir,
@@ -1073,6 +1107,7 @@ mod tests {
             reported: Arc::new(AtomicU64::new(0)),
             regressed: Arc::new(AtomicU64::new(0)),
             part_limit,
+            notices: Arc::new(StdMutex::new(Vec::new())),
             _dir: dir,
             target,
         }
@@ -1083,6 +1118,7 @@ mod tests {
             let switch = Arc::clone(&self.switch);
             let reported = Arc::clone(&self.reported);
             let regressed = Arc::clone(&self.regressed);
+            let notices = Arc::clone(&self.notices);
             DownloadJob {
                 task_id: "task-1".to_string(),
                 bucket: "b".to_string(),
@@ -1098,12 +1134,18 @@ mod tests {
                 regress: Arc::new(move |bytes| {
                     regressed.fetch_add(bytes, Ordering::SeqCst);
                 }),
+                notice: Arc::new(move |n| notices.lock().unwrap().push(n)),
                 resume: Arc::clone(&self.resume),
                 // The runner's decision logic is under test here, not the
                 // checkpoint mirror; disabling it keeps these tests filesystem-
                 // free (the engine tests cover the writer end).
                 checkpoint: None,
             }
+        }
+
+        /// Every notice recorded so far, in arrival order.
+        fn notices(&self) -> Vec<Option<TaskNotice>> {
+            self.notices.lock().unwrap().clone()
         }
 
         async fn run(&self, total: u64) -> AppResult<RunOutcome> {
@@ -1454,6 +1496,40 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_chunk_failure_emits_a_retry_notice_and_clears_it_on_success() {
+        // Task 7 (spec §7.4): mirrors upload.rs's equivalent test -- each
+        // retryable failure surfaces a `TaskNotice` before the backoff sleep,
+        // and the eventual success clears it exactly once.
+        let object = make_object((16 * MB) as usize);
+        let rig = rig(4, object.clone(), |fake| {
+            fake.failures
+                .lock()
+                .unwrap()
+                .insert(1, (2, Fail::Transient));
+        });
+
+        let outcome = rig.run(object.len() as u64).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.notices(),
+            vec![
+                Some(TaskNotice {
+                    code: "network/timeout".to_string(),
+                    attempt: 1,
+                    max: MAX_RETRIES,
+                }),
+                Some(TaskNotice {
+                    code: "network/timeout".to_string(),
+                    attempt: 2,
+                    max: MAX_RETRIES,
+                }),
+                None,
+            ]
+        );
+    }
+
     // Test 7 (retry budget exhausted): a chunk that fails four times fails the
     // task -- MAX_RETRIES retries after the first attempt.
     #[tokio::test(start_paused = true)]
@@ -1713,6 +1789,13 @@ mod tests {
         (progress, reported, regress, regressed)
     }
 
+    /// A `notice` that discards everything -- for the `download_one_chunk`
+    /// tests below that exercise the read loop itself and have nothing to say
+    /// about retries.
+    fn no_notice() -> NoticeFn {
+        Arc::new(|_| {})
+    }
+
     // Task 4 Step 1, test 1: a chunk streamed in several pieces (each smaller
     // than the fixed read buffer) lands byte-for-byte in the `.bcpart`, and
     // progress is reported once per piece rather than once for the whole
@@ -1737,9 +1820,19 @@ mod tests {
         let token = CancellationToken::new();
         let (progress, reported, regress, regressed) = tracking_fns();
 
-        let result = download_one_chunk(provider, "b", "k", chunk, &pf, &token, progress, regress)
-            .await
-            .unwrap();
+        let result = download_one_chunk(
+            provider,
+            "b",
+            "k",
+            chunk,
+            &pf,
+            &token,
+            progress,
+            regress,
+            no_notice(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result, Some(1));
         pf.finish().unwrap();
@@ -1788,9 +1881,19 @@ mod tests {
         let token = CancellationToken::new();
         let (progress, reported, regress, regressed) = tracking_fns();
 
-        let err = download_one_chunk(Arc::clone(&provider), "b", "k", chunk, &pf, &token, progress, regress)
-            .await
-            .unwrap_err();
+        let err = download_one_chunk(
+            Arc::clone(&provider),
+            "b",
+            "k",
+            chunk,
+            &pf,
+            &token,
+            progress,
+            regress,
+            no_notice(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(
             err.code(),
@@ -1850,6 +1953,7 @@ mod tests {
             &token,
             progress,
             regress,
+            no_notice(),
         )
         .await
         .unwrap();
@@ -1898,9 +2002,19 @@ mod tests {
         let pf = PartFile::create(&target, chunk.length).unwrap();
         let (progress, reported, regress, regressed) = tracking_fns();
 
-        let result = download_one_chunk(provider, "b", "k", chunk, &pf, &token, progress, regress)
-            .await
-            .unwrap();
+        let result = download_one_chunk(
+            provider,
+            "b",
+            "k",
+            chunk,
+            &pf,
+            &token,
+            progress,
+            regress,
+            no_notice(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             result.is_none(),

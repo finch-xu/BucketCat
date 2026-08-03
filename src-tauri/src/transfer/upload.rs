@@ -38,6 +38,7 @@ use crate::transfer::engine::{
     CheckpointWriter, MultipartState, ResumeState, RunOutcome, StopKind, TaskContext,
     TransferRunner,
 };
+use crate::transfer::model::TaskNotice;
 use crate::transfer::part::{plan_upload_with, PartSpec, TransferTuning, UploadPlan};
 use crate::transfer::retry::{backoff_delay_for, is_retryable, MAX_RETRIES};
 
@@ -52,6 +53,10 @@ type ProgressFn = Arc<dyn Fn(u64) + Send + Sync>;
 /// Reads the task's stop intent. A closure for the same reason as
 /// [`ProgressFn`]: [`crate::transfer::TaskControl`] has no public constructor.
 type StopFn = Arc<dyn Fn() -> Option<StopKind> + Send + Sync>;
+
+/// Surfaces a transient in-flight retry notice (Task 7). Same rationale as
+/// [`ProgressFn`]: [`TaskContext::notice`] is the only constructor.
+type NoticeFn = Arc<dyn Fn(Option<TaskNotice>) + Send + Sync>;
 
 /// Parts of `plan` the server has not accepted yet.
 ///
@@ -103,6 +108,10 @@ struct UploadJob {
     token: CancellationToken,
     stop: StopFn,
     progress: ProgressFn,
+    /// Reports a transient in-flight retry notice (Task 7). Cloned straight
+    /// from [`TaskContext::notice`]; every `with_retry` call site gets its own
+    /// clone (or a further clone into a spawned part task).
+    notice: NoticeFn,
     resume: Arc<Mutex<Option<ResumeState>>>,
     /// Mirrors the in-memory resume slot to a checkpoint file (M4c). `None`
     /// when checkpointing is disabled, in which case `persist_checkpoint` is a
@@ -127,6 +136,7 @@ impl UploadJob {
             // stop intent.
             stop: Arc::new(move || control.requested()),
             progress: Arc::new(move |bytes| progress.add(bytes)),
+            notice: Arc::clone(&ctx.notice),
             resume: Arc::clone(&ctx.resume),
             checkpoint: ctx.checkpoint.clone(),
         }
@@ -217,7 +227,7 @@ where
 {
     tracing::info!(task = %job.task_id, bytes = length, "uploading as a single stream");
 
-    let put = with_retry(&job.token, || {
+    let put = with_retry(&job.token, &job.notice, || {
         let provider = Arc::clone(&provider);
         let bucket = job.bucket.clone();
         let key = job.key.clone();
@@ -407,10 +417,11 @@ where
         let target = Arc::clone(&target);
         let token = part_token.clone();
         let progress = Arc::clone(&job.progress);
+        let notice = Arc::clone(&job.notice);
 
         set.spawn(async move {
             let _permit = permit;
-            upload_one_part(provider, target, spec, token, progress).await
+            upload_one_part(provider, target, spec, token, progress, notice).await
         });
     }
 
@@ -533,11 +544,12 @@ async fn upload_one_part<P>(
     spec: PartSpec,
     token: CancellationToken,
     progress: ProgressFn,
+    notice: NoticeFn,
 ) -> AppResult<Option<UploadedPart>>
 where
     P: Provider + Send + Sync + 'static,
 {
-    let etag = with_retry(&token, || {
+    let etag = with_retry(&token, &notice, || {
         let provider = Arc::clone(&provider);
         let target = Arc::clone(&target);
         async move {
@@ -570,12 +582,24 @@ where
 /// Runs `op` with the retry policy from `transfer::retry`, giving up early if
 /// `token` fires. `Ok(None)` means "stopped, not failed" -- the caller must
 /// not treat it as success *or* as an error.
-async fn with_retry<T, F, Fut>(token: &CancellationToken, mut op: F) -> AppResult<Option<T>>
+///
+/// `notice` surfaces each retry (Task 7, design §7.4): a retryable failure
+/// emits `Some(TaskNotice { .. })` before the backoff sleep, and -- only if a
+/// notice was actually emitted earlier in this call -- a subsequent success
+/// emits `None` to clear it. The `notified` guard keeps a step that never
+/// failed from ever touching `set_notice`, which would otherwise fire on
+/// every single successful part/put with nothing to say.
+async fn with_retry<T, F, Fut>(
+    token: &CancellationToken,
+    notice: &NoticeFn,
+    mut op: F,
+) -> AppResult<Option<T>>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = AppResult<T>>,
 {
     let mut retries = 0u32;
+    let mut notified = false;
     loop {
         if token.is_cancelled() {
             return Ok(None);
@@ -588,12 +612,23 @@ where
         };
 
         match outcome {
-            Ok(value) => return Ok(Some(value)),
+            Ok(value) => {
+                if notified {
+                    (*notice)(None);
+                }
+                return Ok(Some(value));
+            }
             Err(err) => {
                 retries += 1;
                 if !is_retryable(&err) || retries > MAX_RETRIES {
                     return Err(err);
                 }
+                (*notice)(Some(TaskNotice {
+                    code: err.code().to_string(),
+                    attempt: retries,
+                    max: MAX_RETRIES,
+                }));
+                notified = true;
                 let delay = backoff_delay_for(&err, retries);
                 tracing::warn!(retry = retries, ?delay, "retrying transfer step: {err}");
                 tokio::select! {
@@ -1069,6 +1104,10 @@ mod tests {
         resume: Arc<Mutex<Option<ResumeState>>>,
         reported: Arc<AtomicU64>,
         part_limit: usize,
+        /// Every notice `with_retry` emitted, in arrival order -- `Some` for a
+        /// retryable failure, `None` for the clear that follows an eventual
+        /// success (Task 7).
+        notices: Arc<StdMutex<Vec<Option<TaskNotice>>>>,
     }
 
     fn rig(part_limit: usize, configure: impl FnOnce(&mut FakeProvider)) -> Rig {
@@ -1081,6 +1120,7 @@ mod tests {
             resume: Arc::new(Mutex::new(None)),
             reported: Arc::new(AtomicU64::new(0)),
             part_limit,
+            notices: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -1088,6 +1128,7 @@ mod tests {
         fn job(&self) -> UploadJob {
             let switch = Arc::clone(&self.switch);
             let reported = Arc::clone(&self.reported);
+            let notices = Arc::clone(&self.notices);
             UploadJob {
                 task_id: "task-1".to_string(),
                 bucket: "b".to_string(),
@@ -1102,12 +1143,18 @@ mod tests {
                 progress: Arc::new(move |bytes| {
                     reported.fetch_add(bytes, Ordering::SeqCst);
                 }),
+                notice: Arc::new(move |n| notices.lock().unwrap().push(n)),
                 resume: Arc::clone(&self.resume),
                 // The runner's decision logic is under test here, not the
                 // checkpoint mirror; disabling it keeps these tests filesystem-
                 // free (the engine tests cover the writer end).
                 checkpoint: None,
             }
+        }
+
+        /// Every notice recorded so far, in arrival order.
+        fn notices(&self) -> Vec<Option<TaskNotice>> {
+            self.notices.lock().unwrap().clone()
         }
 
         async fn run(&self, total: u64) -> AppResult<RunOutcome> {
@@ -1461,6 +1508,40 @@ mod tests {
             "two timeouts must cost two retries, not the task"
         );
         assert_eq!(rig.provider.assembled_numbers(), vec![1, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_part_failure_emits_a_retry_notice_and_clears_it_on_success() {
+        // Task 7 (spec §7.4): each retryable failure surfaces a `TaskNotice`
+        // before the backoff sleep, and the eventual success clears it --
+        // exactly once, since a step that never failed must never touch
+        // `notice` at all (see the other multipart tests' silence on this).
+        let rig = rig(4, |fake| {
+            fake.failures
+                .lock()
+                .unwrap()
+                .insert(1, (2, Fail::Transient));
+        });
+
+        let outcome = rig.run(threshold()).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.notices(),
+            vec![
+                Some(TaskNotice {
+                    code: "network/timeout".to_string(),
+                    attempt: 1,
+                    max: MAX_RETRIES,
+                }),
+                Some(TaskNotice {
+                    code: "network/timeout".to_string(),
+                    attempt: 2,
+                    max: MAX_RETRIES,
+                }),
+                None,
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
