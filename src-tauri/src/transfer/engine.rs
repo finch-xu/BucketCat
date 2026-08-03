@@ -1308,6 +1308,10 @@ mod tests {
         /// [`TransferEngine::limits`] is read fresh by the *next* task
         /// spawned rather than only at engine construction.
         last_part_limit: AtomicUsize,
+        /// `ctx.tuning` as seen by the most recently *started* run -- the
+        /// same proof as `last_part_limit`, but for the tuning snapshot
+        /// [`SharedLimits::set_tuning`] hot-adjusts.
+        last_tuning: StdMutex<Option<TransferTuning>>,
         /// If set, each run calls `(ctx.notice)(Some(..))` with this notice
         /// right after starting -- standing in for a retry site (Task 7)
         /// deciding a step is worth surfacing.
@@ -1327,6 +1331,7 @@ mod tests {
                 reported: AtomicUsize::new(0),
                 checkpoint_state: StdMutex::new(None),
                 last_part_limit: AtomicUsize::new(0),
+                last_tuning: StdMutex::new(None),
                 emit_notice: StdMutex::new(None),
             })
         }
@@ -1345,6 +1350,7 @@ mod tests {
         async fn run(&self, ctx: TaskContext) -> AppResult<RunOutcome> {
             self.started.fetch_add(1, Ordering::SeqCst);
             self.last_part_limit.store(ctx.part_limit, Ordering::SeqCst);
+            *self.last_tuning.lock().unwrap() = Some(ctx.tuning);
             // Copy the mode out before anything can panic: holding the guard
             // across the `panic!` would poison the mutex for the next run.
             let mode = *self.mode.lock().unwrap();
@@ -1617,6 +1623,9 @@ mod tests {
         // layer's hot-adjustment handle. A change made through it must reach
         // the *next* task the engine spawns, without requiring a new engine
         // (no restart) and without touching a task that is already running.
+        // Also covers `ctx.tuning` (Finding 3 of the whole-branch review):
+        // a hot-changed `TransferTuning` must thread into the next spawned
+        // task the same way `part_limit` does, not just at construction.
         let h = harness(1);
         let first = h.engine.enqueue(spec("a")).await.unwrap();
         eventually(
@@ -1629,8 +1638,14 @@ mod tests {
             4,
             "harness_cfg's engine was built with max_parts = 4"
         );
+        assert_eq!(
+            *h.runner.last_tuning.lock().unwrap(),
+            Some(TransferTuning::balanced()),
+            "harness_cfg's engine was built with TransferTuning::balanced()"
+        );
 
         h.engine.limits().set_max_parts(1);
+        h.engine.limits().set_tuning(TransferTuning::aggressive());
         h.runner.finish.store(true, Ordering::SeqCst);
         eventually(
             || h.sink.statuses_of(&first.id).last() == Some(&TransferStatus::Completed),
@@ -1650,6 +1665,12 @@ mod tests {
             1,
             "the next spawned task must read the hot-adjusted part_limit, not the value the \
              engine was constructed with"
+        );
+        assert_eq!(
+            *h.runner.last_tuning.lock().unwrap(),
+            Some(TransferTuning::aggressive()),
+            "the next spawned task must read the hot-adjusted tuning, not the value the engine \
+             was constructed with"
         );
     }
 
