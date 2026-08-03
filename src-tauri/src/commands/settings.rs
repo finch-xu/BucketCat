@@ -18,19 +18,21 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::commands::AppState;
 use crate::error::{AppError, AppResult};
 use crate::provider::clamp_expiry;
-use crate::store::settings::{self, clamp_parts, clamp_tasks, Settings};
-use crate::updater_source;
+use crate::store::settings::{
+    self, clamp_part_floor, clamp_parts, clamp_target_parts, clamp_tasks, clamp_threshold, Settings,
+};
 use crate::transfer::{
     bcpart_path, checkpoint, checkpoint_dir, plan_restore, Checkpoint, Direction, RestoreAction,
-    TransferEngine,
+    TransferEngine, TransferTuning,
 };
+use crate::updater_source;
 
 /// Tauri-managed handle to the runtime resume flag. Wraps the *same*
 /// `Arc<AtomicBool>` the transfer engine was constructed with in `lib.rs`'s
@@ -117,6 +119,112 @@ pub fn apply_settings_patch(path: &Path, f: impl FnOnce(&mut Settings)) -> AppRe
     settings::save(path, &s)
 }
 
+/// Partial update to the six [`TransferTuning`] fields (spec §4.7's advanced
+/// section): every field optional so the frontend only ever sends the one
+/// `<select>` the user just changed. Field names are snake_case on the wire,
+/// the same convention `ConnectionInput` uses (see `src/lib/api.ts`'s module
+/// doc) -- Tauri only camelCases *argument* names (`patch`), not the fields
+/// of a struct argument.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TransferTuningPatch {
+    pub upload_threshold: Option<u64>,
+    pub upload_part_floor: Option<u64>,
+    pub upload_target_parts: Option<u64>,
+    pub download_threshold: Option<u64>,
+    pub download_chunk_floor: Option<u64>,
+    pub download_target_parts: Option<u64>,
+}
+
+/// The [`TransferTuning`] + linked `(max_tasks, max_parts)` a built-in preset
+/// writes as one atomic group (spec §4.2's table). `None` for any name this
+/// build does not recognize, so the caller can turn that into
+/// `AppError::Internal` rather than silently falling back to a default --
+/// an unknown name reaching here is either a stale/typo'd frontend build or a
+/// hand-built invoke call, and both deserve a loud rejection over a silently
+/// wrong write.
+fn preset_group(name: &str) -> Option<(TransferTuning, usize, usize)> {
+    match name {
+        "conservative" => Some((TransferTuning::conservative(), 2, 2)),
+        "balanced" => Some((TransferTuning::balanced(), 3, 4)),
+        "aggressive" => Some((TransferTuning::aggressive(), 5, 8)),
+        _ => None,
+    }
+}
+
+/// Writes a whole preset group to disk: the six `TransferTuning` fields, the
+/// concurrency pair [`preset_group`] pairs with it, and `transfer_preset =
+/// name` recording the choice -- all through [`apply_settings_patch`], so
+/// unrelated fields already on disk (e.g. `share_expiry_secs`) survive
+/// untouched, the same regression [`apply_resume_setting`]'s tests guard
+/// against.
+///
+/// Returns the group that was written (rather than making the caller re-read
+/// the file) so the command shell can hot-apply it to the running engine's
+/// `SharedLimits` in one round trip. Rejects an unrecognized `name` with
+/// `AppError::Internal` *before* touching the file -- an unknown preset must
+/// never partially write.
+pub fn apply_transfer_preset(path: &Path, name: &str) -> AppResult<(TransferTuning, usize, usize)> {
+    let (tuning, max_tasks, max_parts) = preset_group(name).ok_or_else(|| AppError::Internal {
+        message: format!("unknown transfer preset: {name}"),
+    })?;
+    apply_settings_patch(path, |s| {
+        s.transfer_preset = name.to_string();
+        s.max_tasks = max_tasks;
+        s.max_parts = max_parts;
+        s.upload_threshold = tuning.upload_threshold;
+        s.upload_part_floor = tuning.upload_part_floor;
+        s.upload_target_parts = tuning.upload_target_parts;
+        s.download_threshold = tuning.download_threshold;
+        s.download_chunk_floor = tuning.download_chunk_floor;
+        s.download_target_parts = tuning.download_target_parts;
+    })?;
+    Ok((tuning, max_tasks, max_parts))
+}
+
+/// Applies a partial tuning change (any subset of the six fields), clamping
+/// each provided value the same way the write path already bounds a hand-
+/// edited file ([`clamp_threshold`]/[`clamp_part_floor`]/[`clamp_target_parts`],
+/// mirrored by [`Settings::tuning`]), and marks the preset `"custom"`: a
+/// manual tuning edit no longer matches any built-in preset.
+///
+/// Deliberately does **not** touch `max_tasks`/`max_parts` -- those are only
+/// a preset's linked concurrency starting point (spec §4.2's table), while a
+/// preset's actual semantics live in these six tuning fields. Symmetrically,
+/// [`set_max_tasks`]/[`set_max_parts`] touch concurrency alone and never flip
+/// `transfer_preset` to `"custom"`.
+///
+/// Returns the resulting [`TransferTuning`], re-derived via
+/// [`Settings::tuning`] so it reflects both the just-applied patch and
+/// whatever unrelated tuning fields were already on disk, for the caller to
+/// hot-apply.
+pub fn apply_transfer_tuning_patch(
+    path: &Path,
+    patch: &TransferTuningPatch,
+) -> AppResult<TransferTuning> {
+    apply_settings_patch(path, |s| {
+        if let Some(v) = patch.upload_threshold {
+            s.upload_threshold = clamp_threshold(v);
+        }
+        if let Some(v) = patch.upload_part_floor {
+            s.upload_part_floor = clamp_part_floor(v);
+        }
+        if let Some(v) = patch.upload_target_parts {
+            s.upload_target_parts = clamp_target_parts(v);
+        }
+        if let Some(v) = patch.download_threshold {
+            s.download_threshold = clamp_threshold(v);
+        }
+        if let Some(v) = patch.download_chunk_floor {
+            s.download_chunk_floor = clamp_part_floor(v);
+        }
+        if let Some(v) = patch.download_target_parts {
+            s.download_target_parts = clamp_target_parts(v);
+        }
+        s.transfer_preset = "custom".to_string();
+    })?;
+    Ok(settings::load(path).tuning())
+}
+
 /// Returns the whole persisted `Settings`, so the Settings modal (Task 3) can
 /// initialize every field from one round trip.
 #[tauri::command]
@@ -124,20 +232,65 @@ pub fn get_settings(app: AppHandle) -> AppResult<Settings> {
     Ok(settings::load(&settings_path(&app)?))
 }
 
-/// Persists a new max-concurrent-tasks limit, clamped to `[1, 5]`. Takes
-/// effect on the next engine construction (app restart) -- M6c reads
-/// concurrency from settings only at `TransferEngine::new` time, there is no
-/// runtime hot-update.
+/// Persists a new max-concurrent-tasks limit, clamped to `[1, 5]`, and
+/// hot-applies it to the running engine's `SharedLimits` (Task 5) -- no
+/// restart required. Closes the M6c-era gap where this command only wrote
+/// the file and the new value took effect on the next launch.
+///
+/// Does not touch `transfer_preset`: `max_tasks`/`max_parts` are only a
+/// preset's linked concurrency starting point, not part of what defines the
+/// preset (see [`apply_transfer_tuning_patch`]'s doc comment).
 #[tauri::command]
-pub fn set_max_tasks(app: AppHandle, n: usize) -> AppResult<()> {
-    apply_settings_patch(&settings_path(&app)?, |s| s.max_tasks = clamp_tasks(n))
+pub fn set_max_tasks(app: AppHandle, engine: State<'_, TransferEngine>, n: usize) -> AppResult<()> {
+    let clamped = clamp_tasks(n);
+    apply_settings_patch(&settings_path(&app)?, |s| s.max_tasks = clamped)?;
+    engine.limits().set_max_tasks(clamped);
+    Ok(())
 }
 
-/// Persists a new max-parts-per-task limit, clamped to `[1, 8]`. Same
-/// next-restart caveat as [`set_max_tasks`].
+/// Persists a new max-parts-per-task limit, clamped to `[1, 8]`, and
+/// hot-applies it the same way [`set_max_tasks`] does -- see its doc comment
+/// for both the restart-gap fix and the `transfer_preset` non-interaction.
 #[tauri::command]
-pub fn set_max_parts(app: AppHandle, n: usize) -> AppResult<()> {
-    apply_settings_patch(&settings_path(&app)?, |s| s.max_parts = clamp_parts(n))
+pub fn set_max_parts(app: AppHandle, engine: State<'_, TransferEngine>, n: usize) -> AppResult<()> {
+    let clamped = clamp_parts(n);
+    apply_settings_patch(&settings_path(&app)?, |s| s.max_parts = clamped)?;
+    engine.limits().set_max_parts(clamped);
+    Ok(())
+}
+
+/// Applies a built-in transfer tuning preset (spec §4.2): writes the six
+/// tuning fields, the linked `max_tasks`/`max_parts`, and `transfer_preset =
+/// name` as one atomic group ([`apply_transfer_preset`]), then hot-applies
+/// all three to the running engine's `SharedLimits` -- no restart. Rejects an
+/// unrecognized `name` with `AppError::Internal`.
+#[tauri::command]
+pub fn set_transfer_preset(
+    app: AppHandle,
+    engine: State<'_, TransferEngine>,
+    name: String,
+) -> AppResult<()> {
+    let (tuning, max_tasks, max_parts) = apply_transfer_preset(&settings_path(&app)?, &name)?;
+    let limits = engine.limits();
+    limits.set_tuning(tuning);
+    limits.set_max_tasks(max_tasks);
+    limits.set_max_parts(max_parts);
+    Ok(())
+}
+
+/// Applies a manual tuning change (any subset of the six fields), persists it
+/// with `transfer_preset` flipped to `"custom"`
+/// ([`apply_transfer_tuning_patch`]), and hot-applies the result to the
+/// running engine.
+#[tauri::command]
+pub fn set_transfer_tuning(
+    app: AppHandle,
+    engine: State<'_, TransferEngine>,
+    patch: TransferTuningPatch,
+) -> AppResult<()> {
+    let tuning = apply_transfer_tuning_patch(&settings_path(&app)?, &patch)?;
+    engine.limits().set_tuning(tuning);
+    Ok(())
 }
 
 /// Persists a new default Share-link expiry, clamped the same way
@@ -558,6 +711,150 @@ mod tests {
         assert_eq!(loaded.max_parts, 6);
         assert_eq!(loaded.share_expiry_secs, 120);
         assert!(loaded.resume_enabled, "untouched field keeps its default");
+    }
+
+    // --- set_transfer_preset / set_transfer_tuning: apply_transfer_preset +
+    // apply_transfer_tuning_patch -------------------------------------------
+
+    #[test]
+    fn preset_writes_the_whole_group_and_records_the_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Pre-seed an unrelated field so a regression to a full-file
+        // overwrite (the M6c bug `apply_resume_setting`'s tests already
+        // guard against) would be caught here too.
+        settings::save(
+            &path,
+            &Settings {
+                share_expiry_secs: 999,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+
+        let (tuning, max_tasks, max_parts) = apply_transfer_preset(&path, "conservative").unwrap();
+
+        assert_eq!(tuning, TransferTuning::conservative());
+        assert_eq!(max_tasks, 2);
+        assert_eq!(max_parts, 2);
+
+        let loaded = settings::load(&path);
+        assert_eq!(loaded.transfer_preset, "conservative");
+        assert_eq!(loaded.max_tasks, 2);
+        assert_eq!(loaded.max_parts, 2);
+        assert_eq!(loaded.upload_threshold, tuning.upload_threshold);
+        assert_eq!(loaded.upload_part_floor, tuning.upload_part_floor);
+        assert_eq!(loaded.upload_target_parts, tuning.upload_target_parts);
+        assert_eq!(loaded.download_threshold, tuning.download_threshold);
+        assert_eq!(loaded.download_chunk_floor, tuning.download_chunk_floor);
+        assert_eq!(loaded.download_target_parts, tuning.download_target_parts);
+        assert_eq!(
+            loaded.share_expiry_secs, 999,
+            "unrelated fields must survive a preset write"
+        );
+    }
+
+    #[test]
+    fn manual_tuning_flips_preset_to_custom_and_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        settings::save(
+            &path,
+            &Settings {
+                transfer_preset: "balanced".to_string(),
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        let balanced = TransferTuning::balanced();
+
+        let patch = TransferTuningPatch {
+            upload_threshold: Some(1),
+            ..Default::default()
+        };
+        let tuning = apply_transfer_tuning_patch(&path, &patch).unwrap();
+
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(
+            tuning.upload_threshold,
+            16 * MB,
+            "clamped up to the [16MB, 1GB] floor"
+        );
+        assert_eq!(
+            tuning.upload_part_floor, balanced.upload_part_floor,
+            "untouched field keeps its prior value"
+        );
+        assert_eq!(tuning.upload_target_parts, balanced.upload_target_parts);
+        assert_eq!(tuning.download_threshold, balanced.download_threshold);
+        assert_eq!(tuning.download_chunk_floor, balanced.download_chunk_floor);
+        assert_eq!(tuning.download_target_parts, balanced.download_target_parts);
+
+        let loaded = settings::load(&path);
+        assert_eq!(loaded.transfer_preset, "custom");
+        assert_eq!(loaded.upload_threshold, 16 * MB);
+    }
+
+    #[test]
+    fn unknown_preset_name_is_rejected_before_touching_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let err = apply_transfer_preset(&path, "turbo").unwrap_err();
+
+        assert!(matches!(err, AppError::Internal { .. }));
+        assert!(!path.exists(), "an unknown preset must not write anything");
+    }
+
+    #[test]
+    fn manual_tuning_patch_leaves_max_tasks_and_max_parts_untouched() {
+        // Ruling: max_tasks/max_parts are only a preset's linked concurrency
+        // starting point, not part of what a preset means -- an advanced
+        // tuning edit must not disturb them.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        settings::save(
+            &path,
+            &Settings {
+                max_tasks: 5,
+                max_parts: 8,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+
+        apply_transfer_tuning_patch(
+            &path,
+            &TransferTuningPatch {
+                download_target_parts: Some(50),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let loaded = settings::load(&path);
+        assert_eq!(loaded.max_tasks, 5, "must not reset max_tasks");
+        assert_eq!(loaded.max_parts, 8, "must not reset max_parts");
+    }
+
+    #[test]
+    fn a_plain_max_tasks_patch_does_not_flip_the_preset_to_custom() {
+        // Symmetric ruling: set_max_tasks/set_max_parts's persistence
+        // (apply_settings_patch mutating only max_tasks/max_parts) must not
+        // touch transfer_preset -- only a tuning-field change does that.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        settings::save(
+            &path,
+            &Settings {
+                transfer_preset: "aggressive".to_string(),
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+
+        apply_settings_patch(&path, |s| s.max_tasks = clamp_tasks(2)).unwrap();
+
+        assert_eq!(settings::load(&path).transfer_preset, "aggressive");
     }
 
     #[test]

@@ -18,8 +18,9 @@ use commands::{
     list_connections, list_objects, list_transfers, list_update_sources, pause_transfer,
     presign_get, r2_bucket_info, r2_probe_token, rename_object, restart_app, resume_transfer,
     retry_transfer, set_auto_check_update, set_autostart, set_close_to_tray, set_max_parts,
-    set_max_tasks, set_resume_enabled, set_share_expiry, set_tray_labels, set_update_source,
-    test_connection, update_connection, AppState, CloseToTrayFlag, ResumeFlag,
+    set_max_tasks, set_resume_enabled, set_share_expiry, set_transfer_preset, set_transfer_tuning,
+    set_tray_labels, set_update_source, test_connection, update_connection, AppState,
+    CloseToTrayFlag, ResumeFlag,
 };
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
@@ -264,6 +265,8 @@ pub fn run() {
             get_settings,
             set_max_tasks,
             set_max_parts,
+            set_transfer_preset,
+            set_transfer_tuning,
             set_share_expiry,
             get_close_to_tray,
             set_close_to_tray,

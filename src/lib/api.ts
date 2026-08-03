@@ -575,11 +575,12 @@ export function setResumeEnabled(enabled: boolean): Promise<void> {
   return invokeCommand<void>("set_resume_enabled", { enabled });
 }
 
-/** The full persisted app settings (M6c). Mirrors `Settings` in
+/** The full persisted app settings (M6c/M6d). Mirrors `Settings` in
  * `src-tauri/src/store/settings.rs` field-for-field. `max_tasks`/`max_parts`
- * are read by the transfer engine only at construction (app restart) --
- * there is no runtime hot-update. `share_expiry_secs` is frontend-consumed,
- * used to prefill the Share dialog's expiry field. */
+ * and the six `transfer_preset`-linked tuning fields below all hot-apply to
+ * the running transfer engine via `SharedLimits` -- no restart required.
+ * `share_expiry_secs` is frontend-consumed, used to prefill the Share
+ * dialog's expiry field. */
 export interface Settings {
   resume_enabled: boolean;
   max_tasks: number;
@@ -588,6 +589,23 @@ export interface Settings {
   close_to_tray: boolean;
   update_source: string;
   auto_check_update: boolean;
+  /** Which transfer tuning preset is active: `"conservative"`, `"balanced"`,
+   * `"aggressive"`, or `"custom"` once any of the six fields below has been
+   * hand-edited (never written by a `max_tasks`/`max_parts`-only change --
+   * see `setMaxTasks`/`setMaxParts`). */
+  transfer_preset: string;
+  /** Files smaller than this upload as a single `PutObject`, in bytes. */
+  upload_threshold: number;
+  /** Lower bound on a computed upload part size, in bytes. */
+  upload_part_floor: number;
+  /** Target upload part count planning aims for. */
+  upload_target_parts: number;
+  /** Objects smaller than this download as a single Range GET, in bytes. */
+  download_threshold: number;
+  /** Lower bound on a computed download chunk size, in bytes. */
+  download_chunk_floor: number;
+  /** Target download chunk count planning aims for. */
+  download_target_parts: number;
 }
 
 /** Reads the whole persisted `Settings`, e.g. to initialize the Settings
@@ -597,16 +615,46 @@ export function getSettings(): Promise<Settings> {
 }
 
 /** Persists a new max-concurrent-tasks limit. Backend clamps to `[1, 5]`
- * (`clamp_tasks` in `src-tauri/src/store/settings.rs`); takes effect on the
- * next app restart. */
+ * (`clamp_tasks` in `src-tauri/src/store/settings.rs`) and hot-applies it to
+ * the running transfer engine -- no restart needed. Does not change
+ * `transfer_preset`. */
 export function setMaxTasks(n: number): Promise<void> {
   return invokeCommand<void>("set_max_tasks", { n });
 }
 
 /** Persists a new max-parts-per-task limit. Backend clamps to `[1, 8]`
- * (`clamp_parts`); takes effect on the next app restart. */
+ * (`clamp_parts`) and hot-applies it the same way `setMaxTasks` does. Does
+ * not change `transfer_preset`. */
 export function setMaxParts(n: number): Promise<void> {
   return invokeCommand<void>("set_max_parts", { n });
+}
+
+/** Applies a built-in transfer tuning preset (spec §4.2): `"conservative"`,
+ * `"balanced"`, or `"aggressive"`. The backend writes all six tuning fields
+ * plus the preset's linked `max_tasks`/`max_parts` as one atomic group,
+ * records the choice as `transfer_preset`, and hot-applies everything to the
+ * running engine -- no restart. Rejects any other `name`. */
+export function setTransferPreset(name: string): Promise<void> {
+  return invokeCommand<void>("set_transfer_preset", { name });
+}
+
+/** Partial update to the six transfer tuning fields (spec §4.7's advanced
+ * section) -- send only the one field the user just changed. Backend clamps
+ * each provided value, flips `transfer_preset` to `"custom"`, and hot-applies
+ * the result to the running engine. Mirrors `TransferTuningPatch` in
+ * `src-tauri/src/commands/settings.rs` field-for-field (snake_case, like
+ * `ConnectionInput`). */
+export interface TransferTuningPatch {
+  upload_threshold?: number;
+  upload_part_floor?: number;
+  upload_target_parts?: number;
+  download_threshold?: number;
+  download_chunk_floor?: number;
+  download_target_parts?: number;
+}
+
+export function setTransferTuning(patch: TransferTuningPatch): Promise<void> {
+  return invokeCommand<void>("set_transfer_tuning", { patch });
 }
 
 /** Persists a new default Share-link expiry, in seconds. Backend clamps to

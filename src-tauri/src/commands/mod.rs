@@ -27,8 +27,9 @@ pub use r2::{r2_bucket_info, r2_probe_token, R2BucketInfo};
 pub use settings::{
     clean_checkpoint_residue, get_autostart, get_close_to_tray, get_resume_enabled, get_settings,
     set_auto_check_update, set_autostart, set_close_to_tray, set_max_parts, set_max_tasks,
-    set_resume_enabled, set_share_expiry, set_tray_labels, set_update_source, CleanResult,
-    CloseToTrayFlag, ResumeFlag,
+    set_resume_enabled, set_share_expiry, set_transfer_preset, set_transfer_tuning,
+    set_tray_labels, set_update_source, CleanResult, CloseToTrayFlag, ResumeFlag,
+    TransferTuningPatch,
 };
 pub use transfer::{
     cancel_transfer, clear_finished_transfers, enqueue_download, enqueue_folder_download,
