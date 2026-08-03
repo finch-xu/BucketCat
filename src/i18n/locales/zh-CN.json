@@ -131,7 +131,10 @@
     "retry": "重试",
     "clearFinished": "清除已完成",
     "remaining": "剩余 {{eta}}",
-    "dismiss": "移除此记录"
+    "dismiss": "移除此记录",
+    "throttledPaused": "已被服务商限流，任务已暂停；进度已保留，稍后点击重试继续",
+    "retrying": "第 {{attempt}}/{{max}} 次重试中",
+    "deletedConnection": "连接已删除"
   },
   "addConn": {
     "title": "添加连接",
@@ -321,6 +324,7 @@
     "auth/access-denied": "访问被拒绝，请检查该账号的权限",
     "network/timeout": "连接超时，请检查网络后重试",
     "network/unreachable": "无法连接到该 Endpoint",
+    "network/throttled": "请求已被服务商限流",
     "storage/bucket-not-found": "存储桶不存在",
     "storage/bucket-exists": "存储桶名称已被占用",
     "storage/wrong-region": "该存储桶不在当前连接配置的区域，请检查连接的区域设置",

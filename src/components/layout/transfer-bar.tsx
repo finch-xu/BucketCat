@@ -3,7 +3,11 @@ import { memo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { useErrorText } from "@/hooks/use-error-text";
+import { useConnections } from "@/hooks/use-connections";
 import { formatEta, formatSize, formatSpeed } from "@/lib/format";
+import { providerMeta } from "@/lib/providers";
+import { colorFor, hasRetryNotice, isThrottled, provenanceTitle, subtitleTone } from "@/lib/transfer-row";
+import { ProviderGlyph } from "@/components/icons/provider-chip";
 import {
   cancelTransfer,
   clearFinishedTransfers,
@@ -18,15 +22,7 @@ import {
   useTransferStore,
   useTransferSummary,
   useTransferTask,
-  type LiveTransfer,
 } from "@/store/transfer-store";
-
-function colorFor(status: LiveTransfer["status"]): string {
-  if (status === "completed") return "var(--success)";
-  if (status === "failed") return "var(--destructive)";
-  if (status === "canceled") return "var(--muted2)";
-  return "var(--primary)";
-}
 
 /** Small icon-only action button shared by every row's button cluster. */
 function RowButton({
@@ -71,11 +67,19 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
   const { t } = useTranslation();
   const errorText = useErrorText();
   const task = useTransferTask(taskId);
+  // React-query cache, shared with the sidebar. Connection add/delete are rare
+  // enough that this re-rendering every row in the panel is fine -- not worth
+  // the extra machinery to scope it down (see task brief).
+  const connections = useConnections();
   const [actionError, setActionError] = useState<AppError | null>(null);
   if (!task) return null;
 
+  const conn = connections.data?.find((c) => c.id === task.connection_id);
+  const meta = providerMeta(conn?.provider ?? "generic");
+
   const DirIcon = task.direction === "upload" ? Upload : Download;
-  const color = colorFor(task.status);
+  const color = colorFor(task);
+  const tone = subtitleTone(task);
   // In-flight rows get the accent surface; terminal ones (done, failed,
   // canceled) fall back to neutral so the panel reads as "these are still
   // moving" at a glance.
@@ -100,13 +104,20 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
       subtitle = t("transfer.paused");
       break;
     case "failed":
-      subtitle = errorText({ code: task.error_code ?? "internal", params: {} });
+      subtitle = isThrottled(task)
+        ? t("transfer.throttledPaused")
+        : errorText({ code: task.error_code ?? "internal", params: task.error_params ?? {} });
       break;
     case "canceled":
       subtitle = t("transfer.canceled");
       break;
     default:
       subtitle = `${t("transfer.done")} · ${formatSize(task.total)}`;
+  }
+  // Notice only ever shows up while `status === "running"` (see
+  // `TransferTask.notice`), so this can never clobber the branches above.
+  if (hasRetryNotice(task) && task.notice) {
+    subtitle = `${t("transfer.retrying", { attempt: task.notice.attempt, max: task.notice.max })} · ${subtitle}`;
   }
 
   // Imperative IPC calls. A successful call's status change comes back
@@ -143,6 +154,15 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
             {formatSize(task.total)}
           </span>
         </div>
+        <div
+          className="mt-0.5 flex min-w-0 items-center gap-1 text-[10.5px] text-muted2"
+          title={provenanceTitle(conn?.name, task.connection_id, task.bucket)}
+        >
+          <ProviderGlyph meta={meta} className="size-3 shrink-0" />
+          <span className="truncate">
+            {conn?.name ?? t("transfer.deletedConnection")} · {task.bucket}
+          </span>
+        </div>
         <div className="mt-1.5 flex items-center gap-2">
           <div className="h-[5px] flex-1 overflow-hidden rounded-[3px] bg-border2">
             <div
@@ -157,7 +177,9 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
         <div
           className={cn(
             "mt-1 truncate text-[10.5px]",
-            task.status === "failed" ? "text-destructive" : "text-muted2",
+            tone === "warning" && "text-warning",
+            tone === "destructive" && "text-destructive",
+            tone === "muted" && "text-muted2",
           )}
         >
           {subtitle}

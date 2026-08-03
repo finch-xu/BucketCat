@@ -131,7 +131,10 @@
     "retry": "Retry",
     "clearFinished": "Clear finished",
     "remaining": "{{eta}} left",
-    "dismiss": "Remove this entry"
+    "dismiss": "Remove this entry",
+    "throttledPaused": "Paused by provider rate limiting -- progress is kept, click retry to continue",
+    "retrying": "Retrying ({{attempt}}/{{max}})",
+    "deletedConnection": "Connection deleted"
   },
   "addConn": {
     "title": "Add Connection",
@@ -321,6 +324,7 @@
     "auth/access-denied": "Access denied -- check this account's permissions",
     "network/timeout": "Connection timed out -- check your network and try again",
     "network/unreachable": "Could not reach that endpoint",
+    "network/throttled": "Request was rate-limited by the provider",
     "storage/bucket-not-found": "Bucket not found",
     "storage/bucket-exists": "Bucket name already taken",
     "storage/wrong-region": "This bucket is not in this connection's configured region -- check the connection's region setting",

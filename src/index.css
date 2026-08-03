@@ -33,6 +33,7 @@
     --color-secondary: var(--secondary);
     --color-secondary-foreground: var(--secondary-foreground);
     --color-destructive: var(--destructive);
+    --color-warning: var(--warning);
     --radius-sm: calc(var(--radius) * 0.6);
     --radius-md: calc(var(--radius) * 0.8);
     --radius-lg: var(--radius);
@@ -67,6 +68,7 @@
     --secondary-foreground: #1c2329;
     --destructive: #c8503f;
     --success: #4bb39a;
+    --warning: #9c671c;
     --accent-tint: #eef6fc;
     --accent-border: #d5e3ee;
     --accent-surface: #f6fafd;
@@ -100,6 +102,7 @@
     --secondary-foreground: #eef1f4;
     --destructive: #d76a5a;
     --success: #4bb39a;
+    --warning: #d7a042;
     --accent-tint: #1e2429;
     --accent-border: #33414c;
     --accent-surface: #1a2026;
