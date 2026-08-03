@@ -687,18 +687,20 @@ pub fn from_connection(conn: &Connection) -> AppResult<S3Provider> {
     })
 }
 
-/// A raw SDK response's HTTP status code, when the generic raw-response
-/// type parameter `R` on `SdkError<E, R>` actually carries one to read.
+/// A raw SDK response's HTTP status code, when the raw-response type
+/// parameter `R` on `SdkError<E, R>` actually carries one to read.
 ///
 /// Every real request this crate makes resolves `R` to
-/// `aws_smithy_runtime_api::client::orchestrator::HttpResponse` (a type
-/// alias for `aws_smithy_runtime_api::http::Response<SdkBody>`) via type
-/// inference at the call site, so the blanket impl below over any body type
-/// `B` covers all of them without this module needing to name `SdkBody`
-/// itself. This module's own `SdkError` unit tests instead build values
-/// with `R = ()` -- a placeholder raw response for tests that don't care
-/// about the HTTP status -- so `()` gets a no-op impl returning `None`,
-/// keeping those tests compiling unchanged.
+/// `aws_sdk_s3::config::http::HttpResponse` -- `aws-sdk-s3` (built here with
+/// its `http-1x` feature on) re-exports this unconditionally at
+/// `config::http::HttpResponse` as `pub use
+/// ::aws_smithy_runtime_api::client::orchestrator::HttpResponse;`, so this
+/// crate can name the concrete type without taking a direct dependency on
+/// `aws-smithy-runtime-api` just to read one status code off it. This
+/// module's own `SdkError` unit tests instead build values with `R = ()` --
+/// a placeholder raw response for tests that don't care about the HTTP
+/// status -- so `()` gets a no-op impl returning `None`, keeping those
+/// tests compiling unchanged.
 ///
 /// Exists because a caller behind a non-AWS gateway can throttle with a
 /// bare `429`/`503` and no S3 error body at all (confirmed live against
@@ -716,7 +718,7 @@ impl RawStatus for () {
     }
 }
 
-impl<B> RawStatus for aws_smithy_runtime_api::http::Response<B> {
+impl RawStatus for aws_sdk_s3::config::http::HttpResponse {
     fn status_code(&self) -> Option<u16> {
         Some(self.status().into())
     }
@@ -3661,6 +3663,24 @@ mod tests {
 
     // --- classify_sdk_error raw-status fallback (pure, no network) ----------
 
+    /// Builds a real `aws_sdk_s3::config::http::HttpResponse` carrying only a
+    /// status code -- the same concrete type every live `SdkError`'s `raw()`
+    /// returns -- so [`RawStatus`] tests exercise the real type rather than a
+    /// stand-in. Round-trips through the plain `http` crate (already a
+    /// direct dependency of this crate) and `TryFrom<http::Response<B>> for
+    /// aws_smithy_runtime_api::http::Response<B>` (available because
+    /// `aws-sdk-s3`'s `http-1x` feature, already on, turns on
+    /// `aws-smithy-runtime-api/http-1x`) instead of depending on
+    /// `aws-smithy-runtime-api` directly just to construct one.
+    fn http_response_with_status(status: u16) -> aws_sdk_s3::config::http::HttpResponse {
+        http::Response::builder()
+            .status(status)
+            .body(aws_sdk_s3::primitives::SdkBody::empty())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
     #[test]
     fn classify_response_error_with_throttle_status_maps_to_throttled() {
         // A non-AWS gateway can throttle with a bare 429/503 and no S3 XML
@@ -3669,10 +3689,7 @@ mod tests {
         // `SdkError::ResponseError` -- which, absent a status check, would
         // otherwise be misclassified as `Unreachable`.
         for status in [429u16, 503u16] {
-            let raw = aws_smithy_runtime_api::http::Response::new(
-                aws_smithy_runtime_api::http::StatusCode::try_from(status).unwrap(),
-                (),
-            );
+            let raw = http_response_with_status(status);
             let err: SdkError<(), _> = SdkError::response_error("boom", raw);
             assert!(
                 matches!(classify_sdk_error(&err), Some(AppError::Throttled)),
@@ -3686,10 +3703,7 @@ mod tests {
         // The raw-status fallback must not swallow every parse failure --
         // only 429/503 mean "throttled"; anything else keeps today's
         // behavior.
-        let raw = aws_smithy_runtime_api::http::Response::new(
-            aws_smithy_runtime_api::http::StatusCode::try_from(500u16).unwrap(),
-            (),
-        );
+        let raw = http_response_with_status(500);
         let err: SdkError<(), _> = SdkError::response_error("boom", raw);
         assert!(matches!(
             classify_sdk_error(&err),
@@ -3768,10 +3782,7 @@ mod tests {
         for status in [429u16, 503u16] {
             let meta = ErrorMetadata::builder().build();
             let unhandled = aws_sdk_s3::operation::list_buckets::ListBucketsError::generic(meta);
-            let raw = aws_smithy_runtime_api::http::Response::new(
-                aws_smithy_runtime_api::http::StatusCode::try_from(status).unwrap(),
-                (),
-            );
+            let raw = http_response_with_status(status);
             let sdk_err: SdkError<_, _> = SdkError::service_error(unhandled, raw);
 
             let app_err = normalize_s3_error(sdk_err);
@@ -3790,10 +3801,7 @@ mod tests {
             .message("gone")
             .build();
         let unhandled = aws_sdk_s3::operation::delete_bucket::DeleteBucketError::generic(meta);
-        let raw = aws_smithy_runtime_api::http::Response::new(
-            aws_smithy_runtime_api::http::StatusCode::try_from(503u16).unwrap(),
-            (),
-        );
+        let raw = http_response_with_status(503);
         let sdk_err: SdkError<_, _> = SdkError::service_error(unhandled, raw);
 
         let app_err = normalize_s3_error(sdk_err);
