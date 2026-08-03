@@ -458,6 +458,13 @@ mod tests {
                 // without normalizing away a value some other version wrote.
                 update_source: "some-future-mirror".to_string(),
                 auto_check_update: false,
+                transfer_preset: "balanced".to_string(),
+                upload_threshold: 32 * 1024 * 1024,
+                upload_part_floor: 16 * 1024 * 1024,
+                upload_target_parts: 32,
+                download_threshold: 64 * 1024 * 1024,
+                download_chunk_floor: 32 * 1024 * 1024,
+                download_target_parts: 16,
             },
         )
         .unwrap();
@@ -516,6 +523,13 @@ mod tests {
                 close_to_tray: true,
                 update_source: "some-future-mirror".to_string(),
                 auto_check_update: false,
+                transfer_preset: "balanced".to_string(),
+                upload_threshold: 32 * 1024 * 1024,
+                upload_part_floor: 16 * 1024 * 1024,
+                upload_target_parts: 32,
+                download_threshold: 64 * 1024 * 1024,
+                download_chunk_floor: 32 * 1024 * 1024,
+                download_target_parts: 16,
             },
         )
         .unwrap();
