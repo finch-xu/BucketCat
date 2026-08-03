@@ -85,6 +85,11 @@ struct DownloadJob {
     token: CancellationToken,
     stop: StopFn,
     progress: ProgressFn,
+    /// Rolls back bytes a failed streaming attempt already reported, before
+    /// the retry loop decides to retry or fail (Task 4). Wired to
+    /// [`crate::transfer::ProgressHandle::retract`] exactly as `progress` is
+    /// wired to `add`.
+    regress: ProgressFn,
     resume: Arc<Mutex<Option<ResumeState>>>,
     /// Mirrors the in-memory resume slot to a checkpoint file (M4c). `None`
     /// when checkpointing is disabled, in which case `persist_checkpoint` is a
@@ -96,6 +101,7 @@ impl DownloadJob {
     fn from_context(ctx: &TaskContext) -> Self {
         let control = ctx.control.clone();
         let progress = ctx.progress.clone();
+        let regress_handle = ctx.progress.clone();
         Self {
             task_id: ctx.task.id.clone(),
             bucket: ctx.task.bucket.clone(),
@@ -108,6 +114,7 @@ impl DownloadJob {
             // stop intent.
             stop: Arc::new(move || control.requested()),
             progress: Arc::new(move |bytes| progress.add(bytes)),
+            regress: Arc::new(move |bytes| regress_handle.retract(bytes)),
             resume: Arc::clone(&ctx.resume),
             checkpoint: ctx.checkpoint.clone(),
         }
@@ -336,10 +343,14 @@ where
         let key = job.key.clone();
         let token = chunk_token.clone();
         let progress = Arc::clone(&job.progress);
+        let regress = Arc::clone(&job.regress);
 
         set.spawn(async move {
             let _permit = permit;
-            download_one_chunk(provider, &bucket, &key, chunk, &partfile, &token, progress).await
+            download_one_chunk(
+                provider, &bucket, &key, chunk, &partfile, &token, progress, regress,
+            )
+            .await
         });
     }
 
@@ -468,6 +479,24 @@ fn discard_stale_bcpart(task_id: &str, bcpart: &std::path::Path) {
     }
 }
 
+/// How much of a chunk is read into memory at once. Chunk sizes run
+/// 32-256MB (Tasks 1-3); buffering a whole chunk in RAM the way the old
+/// `get_range`-based runner did would mean multi-hundred-MB spikes with
+/// several chunks in flight (`part_limit` concurrent chunks). 8MB bounds the
+/// memory a single chunk's read loop ever holds, independent of chunk size.
+const STREAM_BUF: usize = 8 * 1024 * 1024;
+
+/// Downloads one chunk with manual retry, replacing the old single-shot
+/// `get_range` + `with_retry` pair (see `upload.rs`'s `with_retry`, whose doc
+/// comment explains why the two runners keep separate copies of the retry
+/// loop). This one cannot reuse that generic helper: [`stream_chunk_once`]
+/// reports bytes to the progress bar incrementally as they land, so a failed
+/// attempt -- one that already streamed and reported part of the chunk before
+/// erroring -- must roll that partial report back with `regress` *before* the
+/// loop decides whether to retry or give up, or a retried chunk would
+/// permanently over-report and the bar would never reach 100% even once every
+/// chunk truly lands.
+#[allow(clippy::too_many_arguments)]
 async fn download_one_chunk<P>(
     provider: Arc<P>,
     bucket: &str,
@@ -476,89 +505,118 @@ async fn download_one_chunk<P>(
     partfile: &PartFile,
     token: &CancellationToken,
     progress: ProgressFn,
+    regress: ProgressFn,
 ) -> AppResult<Option<i32>>
 where
     P: Provider + Send + Sync + 'static,
-{
-    let bytes = with_retry(token, || {
-        let provider = Arc::clone(&provider);
-        let bucket = bucket.to_string();
-        let key = key.to_string();
-        async move {
-            provider
-                .get_range(&bucket, &key, chunk.offset, chunk.length)
-                .await
-        }
-    })
-    .await?;
-
-    // `None` = the token fired mid-request; the bytes were never observed, so
-    // nothing may be written or reported.
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
-    // The `.bcpart` is zero-filled by `set_len`, so a short range response (the
-    // object shrank between head and get, or a non-conformant gateway) would
-    // leave a zero gap yet still mark the chunk complete -- `finish()` would
-    // then rename a corrupt file into place and report it `Completed`, the one
-    // hole in "Completed = bytes landed" (the M3 guard counts chunks, not
-    // bytes). Refuse to write anything but the exact requested byte count. A
-    // 0-byte object's single length-0 chunk yields an empty Vec and satisfies
-    // `0 == 0`, so it needs no special case.
-    if bytes.len() as u64 != chunk.length {
-        return Err(AppError::Internal {
-            message: format!(
-                "range read for {key} chunk {} returned {} bytes, expected {}",
-                chunk.number,
-                bytes.len(),
-                chunk.length
-            ),
-        });
-    }
-    partfile.write_at(chunk.offset, &bytes)?;
-    progress(chunk.length);
-    Ok(Some(chunk.number))
-}
-
-/// Runs `op` with the retry policy from `transfer::retry`, giving up early if
-/// `token` fires. `Ok(None)` means "stopped, not failed" -- the caller must
-/// not treat it as success *or* as an error.
-///
-/// Deliberately duplicated from `upload.rs` rather than shared: this task's
-/// scope is limited to `download.rs`, and extracting a `pub(crate)` helper
-/// would have to edit `retry.rs` and `upload.rs`'s call site too. The policy is
-/// network-only, 1s/2s/4s.
-async fn with_retry<T, F, Fut>(token: &CancellationToken, mut op: F) -> AppResult<Option<T>>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = AppResult<T>>,
 {
     let mut retries = 0u32;
     loop {
         if token.is_cancelled() {
             return Ok(None);
         }
-        let outcome = tokio::select! {
-            biased;
+        let (err, reported) =
+            match stream_chunk_once(&provider, bucket, key, chunk, partfile, token, &progress)
+                .await
+            {
+                Ok(Some(written)) if written == chunk.length => return Ok(Some(chunk.number)),
+                // The token fired mid-read; the reported bytes stay reported
+                // (pause semantics: the resume path re-reports finished
+                // chunks only, so nothing here needs undoing) and nothing
+                // more may be written.
+                Ok(None) => return Ok(None),
+                // A short stream (the object shrank between head and get, or
+                // a non-conformant gateway EOF'd early): same failure shape as
+                // the old whole-chunk length check, just discovered
+                // incrementally instead of in one length comparison.
+                Ok(Some(short)) => (
+                    AppError::Internal {
+                        message: format!(
+                            "range read for {key} chunk {} returned {short} bytes, expected {}",
+                            chunk.number, chunk.length
+                        ),
+                    },
+                    short,
+                ),
+                Err((err, reported)) => (err, reported),
+            };
+        // Conservation before the retry/fail decision: whatever this attempt
+        // reported must come back off the bar first, whether the attempt is
+        // about to be retried or is about to fail the whole task.
+        regress(reported);
+        retries += 1;
+        if !is_retryable(&err) || retries > MAX_RETRIES {
+            return Err(err);
+        }
+        let delay = backoff_delay(retries);
+        tracing::warn!(retry = retries, ?delay, "retrying download chunk: {err}");
+        tokio::select! {
             _ = token.cancelled() => return Ok(None),
-            result = op() => result,
-        };
-        match outcome {
-            Ok(value) => return Ok(Some(value)),
-            Err(err) => {
-                retries += 1;
-                if !is_retryable(&err) || retries > MAX_RETRIES {
-                    return Err(err);
-                }
-                let delay = backoff_delay(retries);
-                tracing::warn!(retry = retries, ?delay, "retrying download step: {err}");
-                tokio::select! {
-                    _ = token.cancelled() => return Ok(None),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-            }
+            _ = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+/// One streaming attempt at `chunk`: opens the range, reads it through a
+/// bounded buffer, writes each piece to `partfile` and reports it as it
+/// lands. `Ok(Some(n))` with `n < chunk.length` is a short stream (the
+/// caller turns it into the same-shaped error the old length check produced);
+/// `Ok(Some(chunk.length))` is a complete chunk; `Ok(None)` is a clean
+/// cancellation. `Err` carries the bytes *this attempt* already reported, so
+/// the caller can retract exactly that before deciding whether to retry.
+async fn stream_chunk_once<P>(
+    provider: &Arc<P>,
+    bucket: &str,
+    key: &str,
+    chunk: PartSpec,
+    partfile: &PartFile,
+    token: &CancellationToken,
+    progress: &ProgressFn,
+) -> Result<Option<u64>, (AppError, u64)>
+where
+    P: Provider + Send + Sync + 'static,
+{
+    let mut reader = provider
+        .open_range(bucket, key, chunk.offset, chunk.length)
+        .await
+        .map_err(|err| (err, 0))?;
+    let mut written = 0u64;
+    // `chunk.length.max(1)` so a 0-byte chunk (the 0-byte-object case) still
+    // allocates a non-empty buffer; the read loop below never runs for it
+    // anyway since `written < chunk.length` is immediately false.
+    let mut buf = vec![0u8; STREAM_BUF.min(chunk.length.max(1) as usize)];
+    while written < chunk.length {
+        // Cap the slice to what's left of the chunk: a non-conformant gateway
+        // that hands back more than it was asked for must not be allowed to
+        // write past `chunk.length` into the next chunk's bytes.
+        let remaining = (chunk.length - written) as usize;
+        let cap = buf.len().min(remaining);
+        let n = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(None),
+            r = tokio::io::AsyncReadExt::read(&mut reader, &mut buf[..cap]) => r,
+        }
+        .map_err(|err| {
+            (
+                AppError::Internal {
+                    message: format!("range stream read for {key} chunk {}: {err}", chunk.number),
+                },
+                written,
+            )
+        })?;
+        if n == 0 {
+            // EOF before the chunk was fully read -- a short stream. The
+            // caller builds the error; this attempt's already-reported bytes
+            // are `written`.
+            return Ok(Some(written));
+        }
+        partfile
+            .write_at(chunk.offset + written, &buf[..n])
+            .map_err(|err| (err, written))?;
+        written += n as u64;
+        progress(n as u64);
+    }
+    Ok(Some(written))
 }
 
 #[cfg(test)]
@@ -704,8 +762,8 @@ mod tests {
         /// runner uses, so failures and call counts can be addressed by chunk.
         offset_to_number: HashMap<u64, i32>,
         heads: AtomicUsize,
-        /// Chunk number -> `get_range` calls, retries included -- which is what
-        /// makes the retry budget and resume-skips observable.
+        /// Chunk number -> `open_range` calls, retries included -- which is
+        /// what makes the retry budget and resume-skips observable.
         calls: StdMutex<HashMap<i32, usize>>,
         live: AtomicUsize,
         peak: AtomicUsize,
@@ -754,7 +812,7 @@ mod tests {
             }
         }
 
-        /// How many `get_range` calls (retries included) targeted `chunk`.
+        /// How many `open_range` calls (retries included) targeted `chunk`.
         fn calls_of(&self, chunk: i32) -> usize {
             self.calls.lock().unwrap().get(&chunk).copied().unwrap_or(0)
         }
@@ -773,17 +831,17 @@ mod tests {
 
     #[async_trait]
     impl Provider for FakeProvider {
-        async fn get_range(
+        async fn open_range(
             &self,
             _bucket: &str,
             _key: &str,
             offset: u64,
             length: u64,
-        ) -> AppResult<Vec<u8>> {
+        ) -> AppResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
             let number = *self
                 .offset_to_number
                 .get(&offset)
-                .expect("get_range must target a planned chunk offset");
+                .expect("open_range must target a planned chunk offset");
             *self.calls.lock().unwrap().entry(number).or_insert(0) += 1;
 
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
@@ -817,13 +875,17 @@ mod tests {
             let start = offset as usize;
             let end = start + length as usize;
             let mut bytes = self.object[start..end].to_vec();
-            // Simulate a short/partial range response for the named chunk.
+            // Simulate a short/partial range response for the named chunk: the
+            // returned stream EOFs after `keep` bytes instead of the full
+            // `length` -- `std::io::Cursor` naturally reads Ok(0) once its
+            // backing `Vec` is exhausted, so truncating it here is enough to
+            // make `stream_chunk_once`'s read loop observe a short stream.
             if let Some((n, keep)) = *self.short_chunk.lock().unwrap() {
                 if n == number {
                     bytes.truncate(keep as usize);
                 }
             }
-            Ok(bytes)
+            Ok(Box::new(std::io::Cursor::new(bytes)))
         }
 
         async fn head_object(&self, _bucket: &str, _key: &str) -> AppResult<ObjectHead> {
@@ -968,6 +1030,10 @@ mod tests {
         provider: Arc<FakeProvider>,
         resume: Arc<Mutex<Option<ResumeState>>>,
         reported: Arc<AtomicU64>,
+        /// Cumulative bytes `regress` has retracted -- gross, like `reported`,
+        /// so `reported() - regressed()` is the net figure the real progress
+        /// bar would show (Task 4).
+        regressed: Arc<AtomicU64>,
         part_limit: usize,
         // Kept for its RAII lifetime: the target lives under this tempdir, so
         // dropping it early would delete the file mid-test.
@@ -986,6 +1052,7 @@ mod tests {
             provider: Arc::new(provider),
             resume: Arc::new(Mutex::new(None)),
             reported: Arc::new(AtomicU64::new(0)),
+            regressed: Arc::new(AtomicU64::new(0)),
             part_limit,
             _dir: dir,
             target,
@@ -996,6 +1063,7 @@ mod tests {
         fn job(&self) -> DownloadJob {
             let switch = Arc::clone(&self.switch);
             let reported = Arc::clone(&self.reported);
+            let regressed = Arc::clone(&self.regressed);
             DownloadJob {
                 task_id: "task-1".to_string(),
                 bucket: "b".to_string(),
@@ -1006,6 +1074,9 @@ mod tests {
                 stop: Arc::new(move || switch.requested()),
                 progress: Arc::new(move |bytes| {
                     reported.fetch_add(bytes, Ordering::SeqCst);
+                }),
+                regress: Arc::new(move |bytes| {
+                    regressed.fetch_add(bytes, Ordering::SeqCst);
                 }),
                 resume: Arc::clone(&self.resume),
                 // The runner's decision logic is under test here, not the
@@ -1032,6 +1103,10 @@ mod tests {
 
         fn reported(&self) -> u64 {
             self.reported.load(Ordering::SeqCst)
+        }
+
+        fn regressed(&self) -> u64 {
+            self.regressed.load(Ordering::SeqCst)
         }
 
         fn bcpart(&self) -> PathBuf {
@@ -1194,11 +1269,22 @@ mod tests {
 
     // Test 4: pausing mid-run keeps the `.bcpart` and records the finished
     // chunk numbers so the resume reopens the same staging file.
+    //
+    // Two chunks (not one), and the pause fires on the *second*: Task 4's
+    // streaming `open_range` observes the token before it starts reading a
+    // chunk's own bytes (`stream_chunk_once`'s read loop checks
+    // `token.cancelled()` ahead of every read), so a chunk whose fetch never
+    // got past `open_range` before the pause landed must NOT count as done --
+    // unlike the old single-shot `get_range`, where the whole chunk resolved
+    // atomically in one call and a pause requested mid-call could not stop it
+    // from finishing. Chunk 1, fetched to completion before chunk 2 is even
+    // attempted (part_limit 1 makes this sequential), is the one that must
+    // survive into the resume state.
     #[tokio::test]
     async fn pausing_a_download_keeps_the_bcpart_and_the_finished_chunk_numbers() {
-        let object = make_object((16 * MB) as usize);
+        let object = make_object(download_threshold() as usize);
         let rig = rig(1, object.clone(), |fake| {
-            *fake.stop_at_chunk.lock().unwrap() = Some((1, StopKind::Pause));
+            *fake.stop_at_chunk.lock().unwrap() = Some((2, StopKind::Pause));
         });
 
         let outcome = rig.run(object.len() as u64).await.unwrap();
@@ -1212,6 +1298,12 @@ mod tests {
             !rig.target.exists(),
             "a pause has not finished the download"
         );
+        assert_eq!(
+            rig.provider.calls_of(2),
+            1,
+            "the pause landed while chunk 2's open_range call fired it -- the read loop must never \
+             have reached a read"
+        );
         let state = rig
             .resume_state()
             .await
@@ -1219,7 +1311,9 @@ mod tests {
         assert_eq!(
             state.completed_parts,
             vec![1],
-            "the chunk that landed before the pause is recorded for the resume"
+            "chunk 1 finished before chunk 2 was even attempted, so only it is recorded for the \
+             resume -- chunk 2's own fetch was interrupted by the pause before any of its bytes \
+             streamed"
         );
         assert_eq!(state.bcpart, rig.bcpart());
     }
@@ -1326,6 +1420,18 @@ mod tests {
             "two timeouts must cost two retries, not the task"
         );
         assert_eq!(rig.read_target(), object);
+        assert_eq!(
+            rig.reported(),
+            object.len() as u64,
+            "the final total must equal the object size exactly once, not double-counted across \
+             the two retries"
+        );
+        assert_eq!(
+            rig.regressed(),
+            0,
+            "these failures happen in open_range, before any byte of the retried chunk is \
+             streamed, so there is nothing yet to retract"
+        );
     }
 
     // Test 7 (retry budget exhausted): a chunk that fails four times fails the
@@ -1349,6 +1455,448 @@ mod tests {
             "MAX_RETRIES is retries *after* the first attempt"
         );
         assert!(!rig.target.exists(), "an exhausted retry must not finish");
+    }
+
+    // ---- Task 4: streaming chunk download ----------------------------------
+    //
+    // These exercise `download_one_chunk`/`stream_chunk_once` directly rather
+    // than through `Rig`/`run_download`: the property under test is the read
+    // loop's own behavior (incremental progress, short-stream detection, and
+    // the retry loop's regress-before-retry bookkeeping), not the
+    // whole-download state machine the tests above already cover.
+
+    /// An `AsyncRead` that hands out one `segments` entry per `poll_read`
+    /// call, never merging several queued segments into a single read the
+    /// way `std::io::Cursor` would. That is what lets a test control -- and
+    /// observe -- exactly how many times the read loop iterates for one
+    /// chunk, which is what proves progress is reported incrementally rather
+    /// than once for the whole chunk. Once the queue is empty, further reads
+    /// report EOF (`Ok(0)`), so a `segments` total shorter than the chunk
+    /// length naturally simulates a short/partial stream -- no separate
+    /// "fail" mode is needed for that case.
+    struct SegmentedReader {
+        segments: std::collections::VecDeque<Vec<u8>>,
+        /// Fires this token right after the first segment is handed out, so a
+        /// test can land a cancellation deterministically between two read
+        /// loop iterations without any real concurrency.
+        cancel_after_first: Option<CancellationToken>,
+    }
+
+    impl SegmentedReader {
+        fn new(segments: Vec<Vec<u8>>) -> Self {
+            Self {
+                segments: segments.into(),
+                cancel_after_first: None,
+            }
+        }
+
+        fn cancelling_after_first(segments: Vec<Vec<u8>>, token: CancellationToken) -> Self {
+            Self {
+                segments: segments.into(),
+                cancel_after_first: Some(token),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for SegmentedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(seg) = self.segments.pop_front() {
+                buf.put_slice(&seg);
+                if let Some(token) = self.cancel_after_first.take() {
+                    token.cancel();
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// What a single `open_range` call should do -- built from the same
+    /// [`Fail`] enum the whole-download `FakeProvider` above uses, so a
+    /// scripted failure carries the same retryable-vs-not meaning the other
+    /// tests in this file rely on.
+    enum Attempt {
+        Fail(Fail),
+        Stream(SegmentedReader),
+    }
+
+    /// A minimal [`Provider`] whose `open_range` plays back a fixed script of
+    /// [`Attempt`]s, one per call, and panics on every other method -- these
+    /// tests call `download_one_chunk`/`stream_chunk_once` directly, so
+    /// nothing else is ever reached.
+    struct ScriptedProvider {
+        calls: AtomicUsize,
+        attempts: StdMutex<std::collections::VecDeque<Attempt>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(attempts: Vec<Attempt>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                attempts: StdMutex::new(attempts.into()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn open_range(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _offset: u64,
+            _length: u64,
+        ) -> AppResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self
+                .attempts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("ScriptedProvider ran out of scripted open_range attempts")
+            {
+                Attempt::Fail(how) => Err(how.error()),
+                Attempt::Stream(reader) => Ok(Box::new(reader)),
+            }
+        }
+
+        async fn test_connection(&self) -> AppResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn list_buckets(&self) -> AppResult<Vec<Bucket>> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn create_bucket(&self, _name: &str) -> AppResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn delete_bucket(&self, _name: &str) -> AppResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn list_objects(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _token: Option<&str>,
+            _max_keys: i32,
+        ) -> AppResult<ListPage> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn delete_objects(&self, _bucket: &str, _keys: &[String]) -> AppResult<BatchResult> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn delete_prefix(&self, _bucket: &str, _prefix: &str) -> AppResult<BatchResult> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn rename_object(
+            &self,
+            _bucket: &str,
+            _from_key: &str,
+            _to_key: &str,
+        ) -> AppResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn create_folder(&self, _bucket: &str, _prefix: &str) -> AppResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn put_object_from_file(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _path: &Path,
+            _length: u64,
+        ) -> AppResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn multipart_init(&self, _bucket: &str, _key: &str) -> AppResult<String> {
+            unimplemented!("not exercised by these tests")
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn upload_part_from_file(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+            _part_number: i32,
+            _path: &Path,
+            _offset: u64,
+            _length: u64,
+        ) -> AppResult<String> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn multipart_complete(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+            _parts: &[UploadedPart],
+        ) -> AppResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn multipart_abort(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> AppResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn multipart_list(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _upload_id: &str,
+        ) -> AppResult<Vec<UploadedPart>> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn head_object(&self, _bucket: &str, _key: &str) -> AppResult<ObjectHead> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn list_objects_flat(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _token: Option<&str>,
+            _max_keys: i32,
+        ) -> AppResult<ListPage> {
+            unimplemented!("not exercised by these tests")
+        }
+        async fn presign_get(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _expires_secs: u64,
+        ) -> AppResult<String> {
+            unimplemented!("not exercised by these tests")
+        }
+    }
+
+    /// A tracking `progress`/`regress` pair: every call appends the byte
+    /// count to a shared log rather than just summing it, so a test can
+    /// assert the *shape* of the calls (how many, in what order) and not just
+    /// the total -- a bare running sum would hide a single big report where
+    /// several incremental ones were expected.
+    #[allow(clippy::type_complexity)]
+    fn tracking_fns() -> (ProgressFn, Arc<StdMutex<Vec<u64>>>, ProgressFn, Arc<StdMutex<Vec<u64>>>) {
+        let reported = Arc::new(StdMutex::new(Vec::<u64>::new()));
+        let regressed = Arc::new(StdMutex::new(Vec::<u64>::new()));
+        let reported_for_closure = Arc::clone(&reported);
+        let progress: ProgressFn = Arc::new(move |bytes| reported_for_closure.lock().unwrap().push(bytes));
+        let regressed_for_closure = Arc::clone(&regressed);
+        let regress: ProgressFn = Arc::new(move |bytes| regressed_for_closure.lock().unwrap().push(bytes));
+        (progress, reported, regress, regressed)
+    }
+
+    // Task 4 Step 1, test 1: a chunk streamed in several pieces (each smaller
+    // than the fixed read buffer) lands byte-for-byte in the `.bcpart`, and
+    // progress is reported once per piece rather than once for the whole
+    // chunk.
+    #[tokio::test]
+    async fn streamed_chunk_lands_bytes_and_reports_incremental_progress() {
+        let segments = vec![b"abc".to_vec(), b"defgh".to_vec(), b"ij".to_vec()];
+        let expected: Vec<u8> = segments.iter().flatten().copied().collect();
+        let total = expected.len() as u64;
+        let chunk = PartSpec {
+            number: 1,
+            offset: 0,
+            length: total,
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![Attempt::Stream(SegmentedReader::new(
+            segments,
+        ))]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.bin");
+        let pf = PartFile::create(&target, total).unwrap();
+        let token = CancellationToken::new();
+        let (progress, reported, regress, regressed) = tracking_fns();
+
+        let result = download_one_chunk(provider, "b", "k", chunk, &pf, &token, progress, regress)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(1));
+        pf.finish().unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            expected,
+            "the assembled file must be byte-for-byte the streamed source"
+        );
+        let calls = reported.lock().unwrap().clone();
+        assert!(
+            calls.len() > 1,
+            "progress must be reported once per read, not once for the whole chunk: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().sum::<u64>(),
+            total,
+            "the sum of every incremental report must equal the chunk length"
+        );
+        assert!(
+            regressed.lock().unwrap().is_empty(),
+            "a chunk that never failed must never regress"
+        );
+    }
+
+    // Task 4 Step 1, test 2: a stream that EOFs before the chunk's full
+    // length must fail (the same failure shape as the old whole-chunk length
+    // check), and every byte it reported on the way there must come back off
+    // the bar -- progress conservation, no ghost bytes left behind.
+    #[tokio::test]
+    async fn short_stream_errors_and_retracts_reported_bytes() {
+        let seg_a = vec![1u8; 100];
+        let seg_b = vec![2u8; 50];
+        let streamed = (seg_a.len() + seg_b.len()) as u64; // 150
+        let chunk = PartSpec {
+            number: 1,
+            offset: 0,
+            length: 200, // more than the stream actually provides
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![Attempt::Stream(SegmentedReader::new(
+            vec![seg_a, seg_b],
+        ))]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.bin");
+        let pf = PartFile::create(&target, chunk.length).unwrap();
+        let token = CancellationToken::new();
+        let (progress, reported, regress, regressed) = tracking_fns();
+
+        let err = download_one_chunk(Arc::clone(&provider), "b", "k", chunk, &pf, &token, progress, regress)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.code(),
+            "internal",
+            "a short stream is a broken-invariant failure, not a storage error"
+        );
+        assert_eq!(
+            provider.calls(),
+            1,
+            "a short stream is an Internal error, which is never retried"
+        );
+        pf.abort();
+
+        let reported_total: u64 = reported.lock().unwrap().iter().sum();
+        let regressed_total: u64 = regressed.lock().unwrap().iter().sum();
+        assert_eq!(
+            reported_total, streamed,
+            "the bytes actually streamed before EOF must still have been reported incrementally"
+        );
+        assert_eq!(
+            regressed_total, reported_total,
+            "every byte this attempt reported must be retracted -- progress conservation"
+        );
+    }
+
+    // Task 4 Step 1, test 3: `open_range` itself failing (a connection never
+    // established, before any bytes flow) is retried under the same
+    // network-only policy `transfer::retry` already governs -- and the
+    // manual retry loop's regress call runs on that path too, even though
+    // there is nothing to undo yet (no reader was ever obtained).
+    #[tokio::test(start_paused = true)]
+    async fn throttled_open_range_retries_then_succeeds() {
+        let object = b"hello world, this is one full chunk of bytes".to_vec();
+        let length = object.len() as u64;
+        let chunk = PartSpec {
+            number: 1,
+            offset: 0,
+            length,
+        };
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            Attempt::Fail(Fail::Transient),
+            Attempt::Stream(SegmentedReader::new(vec![object.clone()])),
+        ]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.bin");
+        let pf = PartFile::create(&target, length).unwrap();
+        let token = CancellationToken::new();
+        let (progress, reported, regress, regressed) = tracking_fns();
+
+        let result = download_one_chunk(
+            Arc::clone(&provider),
+            "b",
+            "k",
+            chunk,
+            &pf,
+            &token,
+            progress,
+            regress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, Some(1));
+        pf.finish().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), object);
+        assert_eq!(
+            provider.calls(),
+            2,
+            "one failed open_range plus one that succeeded"
+        );
+        let reported_total: u64 = reported.lock().unwrap().iter().sum();
+        let regressed_total: u64 = regressed.lock().unwrap().iter().sum();
+        assert_eq!(
+            reported_total, length,
+            "the successful retry must report exactly the chunk's bytes once, not double-counted \
+             from the failed first attempt"
+        );
+        assert_eq!(
+            regressed_total, 0,
+            "the first attempt failed before any bytes were read, so the regress/retry mechanism \
+             ran with nothing to undo"
+        );
+    }
+
+    // Task 4: a cancellation observed mid-read must return `Ok(None)` and
+    // leave whatever was already reported in place -- pause semantics, not a
+    // failure to roll back. The resume path re-reports finished *chunks*
+    // only, so a regressed partial chunk here would just vanish from the bar.
+    #[tokio::test]
+    async fn cancelling_mid_stream_leaves_already_reported_bytes_in_place() {
+        let seg_a = vec![9u8; 100];
+        let seg_b = vec![8u8; 100];
+        let chunk = PartSpec {
+            number: 1,
+            offset: 0,
+            length: (seg_a.len() + seg_b.len()) as u64,
+        };
+        let token = CancellationToken::new();
+        let reader = SegmentedReader::cancelling_after_first(vec![seg_a.clone(), seg_b], token.clone());
+        let provider = Arc::new(ScriptedProvider::new(vec![Attempt::Stream(reader)]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.bin");
+        let pf = PartFile::create(&target, chunk.length).unwrap();
+        let (progress, reported, regress, regressed) = tracking_fns();
+
+        let result = download_one_chunk(provider, "b", "k", chunk, &pf, &token, progress, regress)
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "a cancellation observed mid-read must return Ok(None), not an error or a false success"
+        );
+        let reported_total: u64 = reported.lock().unwrap().iter().sum();
+        assert_eq!(
+            reported_total,
+            seg_a.len() as u64,
+            "the first segment's bytes were reported before the cancel landed"
+        );
+        assert!(
+            regressed.lock().unwrap().is_empty(),
+            "pause semantics: a cancellation must NOT retract bytes already reported"
+        );
+        pf.abort();
     }
 
     // Test 8: in-flight range reads never exceed the configured part_limit.

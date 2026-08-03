@@ -1992,19 +1992,19 @@ impl Provider for S3Provider {
         })
     }
 
-    async fn get_range(
+    async fn open_range(
         &self,
         bucket: &str,
         key: &str,
         offset: u64,
         length: u64,
-    ) -> AppResult<Vec<u8>> {
+    ) -> AppResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
         // A zero-length range is malformed HTTP (and `range_header` would
         // have to guard against underflowing `offset + length - 1`); a
         // 0-byte object is a real case (a single zero-length chunk from
         // `plan_download(0, ..)`), so answer it here without a request.
         if length == 0 {
-            return Ok(Vec::new());
+            return Ok(Box::new(tokio::io::empty()));
         }
         let client = self.client_for(bucket).await;
         let out = client
@@ -2015,10 +2015,11 @@ impl Provider for S3Provider {
             .send()
             .await
             .map_err(normalize_s3_error)?;
-        let data = out.body.collect().await.map_err(|err| AppError::Internal {
-            message: format!("failed to read object body: {err}"),
-        })?;
-        Ok(data.into_bytes().to_vec())
+        // `ByteStream::into_async_read` (feature `rt-tokio`, already enabled
+        // on the `aws-sdk-s3` dependency) adapts the SDK's response body into
+        // a `tokio::io::AsyncBufRead`, which is also an `AsyncRead` -- no new
+        // dependency, and no `aws_smithy_types` type escapes this function.
+        Ok(Box::new(out.body.into_async_read()))
     }
 
     async fn list_objects_flat(
@@ -4117,7 +4118,7 @@ mod tests {
         // `length == 0` used to compute `offset + length - 1`, underflowing
         // `u64` at offset 0. The saturating form must not panic, and
         // degenerates to the single start byte (this value is never
-        // actually sent: `get_range` short-circuits length 0 before this
+        // actually sent: `open_range` short-circuits length 0 before this
         // is ever called).
         assert_eq!(range_header(0, 0), "bytes=0-0");
         assert_eq!(range_header(5, 0), "bytes=5-5");

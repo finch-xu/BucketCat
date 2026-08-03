@@ -141,6 +141,7 @@ use hyper_util::rt::TokioExecutor;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+use bucketcat_lib::error::{AppError, AppResult};
 use bucketcat_lib::provider::s3::{
     qiniu_endpoint_for_region, supports_batch_delete, uses_path_style,
 };
@@ -149,6 +150,27 @@ use bucketcat_lib::store::Connection;
 
 /// 1 MiB, the unit the multipart fixture is sized in.
 const MB: u64 = 1024 * 1024;
+
+/// Reads `[offset, offset+length)` of `key` into a `Vec`, standing in for the
+/// whole-buffer `Provider::get_range` these tests were originally written
+/// against -- Task 4 replaced it with the streaming `Provider::open_range`,
+/// so this suite drains the returned reader itself.
+async fn get_range_bytes(
+    provider: &S3Provider,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: u64,
+) -> AppResult<Vec<u8>> {
+    let mut reader = provider.open_range(bucket, key, offset, length).await?;
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+        .await
+        .map_err(|e| AppError::Internal {
+            message: format!("reading range stream: {e}"),
+        })?;
+    Ok(buf)
+}
 
 // --- env / connection helpers ------------------------------------------------
 
@@ -471,8 +493,7 @@ async fn small_object_round_trip() {
         .expect("head_object should succeed right after put_object_from_file");
     assert_eq!(head.size, size, "head_object reported the wrong size");
 
-    let downloaded = provider
-        .get_range(&bucket, &key, 0, size)
+    let downloaded = get_range_bytes(&provider, &bucket, &key, 0, size)
         .await
         .expect("get_range over the whole object should succeed");
     assert_eq!(
@@ -593,13 +614,11 @@ async fn multipart_upload_round_trip() {
         // Read it back in two ranges rather than one, so a per-part offset
         // mix-up (which a whole-object read could mask if the halves happened
         // to be swapped consistently) shows up as a hash mismatch.
-        let mut got = provider
-            .get_range(&bucket, &key, 0, first)
+        let mut got = get_range_bytes(&provider, &bucket, &key, 0, first)
             .await
             .map_err(|e| format!("get_range over the first part: {e}"))?;
         got.extend(
-            provider
-                .get_range(&bucket, &key, first, last)
+            get_range_bytes(&provider, &bucket, &key, first, last)
                 .await
                 .map_err(|e| format!("get_range over the last part: {e}"))?,
         );
@@ -797,8 +816,7 @@ async fn cross_region_bucket_is_routed_automatically() {
         .put_object_from_file(&bucket, &key, &path, size)
         .await
         .expect("put_object_from_file must succeed through the routed client");
-    let downloaded = provider
-        .get_range(&bucket, &key, 0, size)
+    let downloaded = get_range_bytes(&provider, &bucket, &key, 0, size)
         .await
         .expect("get_range must succeed through the routed client");
     assert_eq!(hex(&sha256_bytes(&downloaded)), source_hash);

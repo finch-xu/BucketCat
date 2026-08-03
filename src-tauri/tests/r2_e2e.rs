@@ -40,6 +40,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use sha2::{Digest, Sha256};
 
+use bucketcat_lib::error::{AppError, AppResult};
 use bucketcat_lib::provider::r2::{r2_endpoint as build_r2_endpoint, r2_secret_from_token};
 use bucketcat_lib::provider::r2_admin;
 use bucketcat_lib::provider::s3::{supports_batch_delete, uses_path_style};
@@ -48,6 +49,27 @@ use bucketcat_lib::store::Connection;
 
 /// 1 MiB, the unit the multipart fixture is sized in.
 const MB: u64 = 1024 * 1024;
+
+/// Reads `[offset, offset+length)` of `key` into a `Vec`, standing in for the
+/// whole-buffer `Provider::get_range` these tests were originally written
+/// against -- Task 4 replaced it with the streaming `Provider::open_range`,
+/// so this suite drains the returned reader itself.
+async fn get_range_bytes(
+    provider: &S3Provider,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: u64,
+) -> AppResult<Vec<u8>> {
+    let mut reader = provider.open_range(bucket, key, offset, length).await?;
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+        .await
+        .map_err(|e| AppError::Internal {
+            message: format!("reading range stream: {e}"),
+        })?;
+    Ok(buf)
+}
 
 // --- env / connection helpers ------------------------------------------------
 
@@ -379,8 +401,7 @@ async fn multipart_upload_round_trip() {
         "the assembled object should be {size} bytes"
     );
 
-    let downloaded = provider
-        .get_range(&bucket, &key, 0, size)
+    let downloaded = get_range_bytes(&provider, &bucket, &key, 0, size)
         .await
         .expect("reading the whole assembled object back should succeed");
     assert_eq!(
@@ -421,8 +442,7 @@ async fn range_get_reads_exact_slices() {
 
     let offset = 12_345u64;
     let length = 4_096u64;
-    let slice = provider
-        .get_range(&bucket, &key, offset, length)
+    let slice = get_range_bytes(&provider, &bucket, &key, offset, length)
         .await
         .expect("a ranged GET against R2 should succeed");
 
@@ -473,8 +493,7 @@ async fn rename_object_copies_then_deletes() {
         .await
         .expect("rename_object (CopyObject + DeleteObject) against R2 should succeed");
 
-    let moved = provider
-        .get_range(&bucket, &to_key, 0, size)
+    let moved = get_range_bytes(&provider, &bucket, &to_key, 0, size)
         .await
         .expect("the renamed object should be readable at its new key");
     assert_eq!(

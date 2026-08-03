@@ -27,7 +27,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 # `default-features = false` + the four features below == the upstream `default`
 # set MINUS `rustls`. That one name is misleading: it does NOT select the TLS

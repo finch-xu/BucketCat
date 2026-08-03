@@ -275,16 +275,21 @@ pub trait Provider {
     /// download) plus ETag/content-type. `storage/key-not-found` if absent.
     async fn head_object(&self, bucket: &str, key: &str) -> AppResult<ObjectHead>;
 
-    /// Reads exactly `[offset, offset+length)` of `key`. Returns the bytes
-    /// (bounded by the caller's chunk size — never the whole object at once),
-    /// so no `aws_sdk_s3` stream type crosses this boundary (design §3).
-    async fn get_range(
+    /// Opens `[offset, offset+length)` of `key` as a stream rather than
+    /// buffering it in RAM -- chunk sizes run 32-256MB (Task 1-3), so a
+    /// caller reads it incrementally through an 8MB buffer instead of holding
+    /// the whole chunk at once. The return type is `std`/`tokio`'s own
+    /// `AsyncRead` trait object, not an `aws_sdk_s3` / `aws_smithy_types`
+    /// stream type, so design §3 principle 3 ("no `aws_sdk_s3` type crosses
+    /// this boundary") still holds -- a trait object over a standard-library
+    /// trait is not an SDK type.
+    async fn open_range(
         &self,
         bucket: &str,
         key: &str,
         offset: u64,
         length: u64,
-    ) -> AppResult<Vec<u8>>;
+    ) -> AppResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>>;
 
     /// Like `list_objects` but with NO delimiter, so it returns every object
     /// under `prefix` recursively (each row `is_prefix == false`, including

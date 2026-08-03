@@ -172,12 +172,34 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use sha2::{Digest, Sha256};
 
+use bucketcat_lib::error::{AppError, AppResult};
 use bucketcat_lib::provider::s3::{supports_batch_delete, uses_path_style};
 use bucketcat_lib::provider::{from_connection, Provider, S3Provider, UploadedPart};
 use bucketcat_lib::store::Connection;
 
 /// 1 MiB, the unit the multipart fixture is sized in.
 const MB: u64 = 1024 * 1024;
+
+/// Reads `[offset, offset+length)` of `key` into a `Vec`, standing in for the
+/// whole-buffer `Provider::get_range` these tests were originally written
+/// against -- Task 4 replaced it with the streaming `Provider::open_range`,
+/// so this suite drains the returned reader itself.
+async fn get_range_bytes(
+    provider: &S3Provider,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: u64,
+) -> AppResult<Vec<u8>> {
+    let mut reader = provider.open_range(bucket, key, offset, length).await?;
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+        .await
+        .map_err(|e| AppError::Internal {
+            message: format!("reading range stream: {e}"),
+        })?;
+    Ok(buf)
+}
 
 // --- env / connection helpers ------------------------------------------------
 
@@ -569,8 +591,7 @@ async fn small_object_round_trip() {
         .expect("head_object should succeed right after put_object_from_file");
     assert_eq!(head.size, size, "head_object reported the wrong size");
 
-    let downloaded = provider
-        .get_range(&bucket, &key, 0, size)
+    let downloaded = get_range_bytes(&provider, &bucket, &key, 0, size)
         .await
         .expect("get_range over the whole object should succeed");
     assert_eq!(
@@ -680,8 +701,7 @@ async fn multipart_upload_round_trip() {
         "the assembled object's size does not match the source"
     );
 
-    let downloaded = provider
-        .get_range(&bucket, &key, 0, total)
+    let downloaded = get_range_bytes(&provider, &bucket, &key, 0, total)
         .await
         .expect("get_range over the whole assembled object should succeed");
     assert_eq!(
@@ -1022,11 +1042,14 @@ async fn apk_download_is_forbidden_on_the_default_domain() {
         .await
         .expect("head_object on an .apk should succeed; only the object read is forbidden");
 
-    let err = provider.get_range(&bucket, &key, 0, size).await.expect_err(
-        "COS must refuse to serve an .apk from the default bucket domain. If this now succeeds, \
-         Tencent lifted the restriction (or the sandbox bucket predates 2024-01-01) and this \
-         file's module doc comment plus the user-facing docs should drop the limitation",
-    );
+    let err = get_range_bytes(&provider, &bucket, &key, 0, size)
+        .await
+        .expect_err(
+            "COS must refuse to serve an .apk from the default bucket domain. If this now \
+             succeeds, Tencent lifted the restriction (or the sandbox bucket predates \
+             2024-01-01) and this file's module doc comment plus the user-facing docs should \
+             drop the limitation",
+        );
     let rendered = format!("{err:?}");
     assert!(
         rendered.contains("DownloadForbidden") || rendered.contains("access-denied"),

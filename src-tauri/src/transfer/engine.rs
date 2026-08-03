@@ -221,6 +221,26 @@ impl ProgressHandle {
             total: self.total,
         });
     }
+
+    /// Undoes bytes an earlier `add` reported for a download attempt that then
+    /// failed mid-stream (Task 4): a retryable chunk read must not leave the
+    /// bytes it already streamed permanently counted, or a task that retries
+    /// several times over-reports and the bar never reaches 100% even once
+    /// every chunk truly lands.
+    ///
+    /// `fetch_update` rather than a plain `fetch_sub`: the runner reports and
+    /// retracts from concurrent chunk tasks, and a straight subtract could
+    /// underflow the `u64` if two retractions raced past a small counter.
+    /// Saturating at 0 makes that impossible -- the DTO-side `transferred`
+    /// this counter backs (see `EngineInner::apply`/`TransferEngine::snapshot`)
+    /// can never go negative anyway.
+    pub fn retract(&self, bytes: u64) {
+        let _ = self
+            .transferred
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes))
+            });
+    }
 }
 
 /// The static half of a [`Checkpoint`] -- everything about a task that never

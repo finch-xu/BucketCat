@@ -161,12 +161,34 @@ use hyper_util::rt::TokioExecutor;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+use bucketcat_lib::error::{AppError, AppResult};
 use bucketcat_lib::provider::s3::uses_path_style;
 use bucketcat_lib::provider::{from_connection, Provider, S3Provider, UploadedPart};
 use bucketcat_lib::store::Connection;
 
 /// 1 MiB, the unit the multipart fixture is sized in.
 const MB: u64 = 1024 * 1024;
+
+/// Reads `[offset, offset+length)` of `key` into a `Vec`, standing in for the
+/// whole-buffer `Provider::get_range` these tests were originally written
+/// against -- Task 4 replaced it with the streaming `Provider::open_range`,
+/// so this suite drains the returned reader itself.
+async fn get_range_bytes(
+    provider: &S3Provider,
+    bucket: &str,
+    key: &str,
+    offset: u64,
+    length: u64,
+) -> AppResult<Vec<u8>> {
+    let mut reader = provider.open_range(bucket, key, offset, length).await?;
+    let mut buf = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+        .await
+        .map_err(|e| AppError::Internal {
+            message: format!("reading range stream: {e}"),
+        })?;
+    Ok(buf)
+}
 
 // --- env / connection helpers ------------------------------------------------
 
@@ -472,8 +494,7 @@ async fn small_object_round_trip() {
         "head_object's reported size must match the uploaded file's size"
     );
 
-    let downloaded = provider
-        .get_range(&bucket, &key, 0, size)
+    let downloaded = get_range_bytes(&provider, &bucket, &key, 0, size)
         .await
         .expect("get_range should succeed reading the whole object back");
     assert_eq!(
@@ -644,8 +665,7 @@ async fn multipart_upload_round_trip() {
         // single-stream one doesn't.
         let mut reassembled: Vec<u8> = Vec::with_capacity(total as usize);
         for (number, offset, length) in [(1i32, 0u64, first), (2i32, first, last)] {
-            let segment = provider
-                .get_range(&bucket, &key, offset, length)
+            let segment = get_range_bytes(&provider, &bucket, &key, offset, length)
                 .await
                 .map_err(|e| {
                     format!("get_range for part {number}'s byte range should succeed: {e}")

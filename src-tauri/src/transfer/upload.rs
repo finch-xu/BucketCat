@@ -1027,13 +1027,13 @@ mod tests {
             unimplemented!("an upload never heads objects")
         }
 
-        async fn get_range(
+        async fn open_range(
             &self,
             _bucket: &str,
             _key: &str,
             _offset: u64,
             _length: u64,
-        ) -> AppResult<Vec<u8>> {
+        ) -> AppResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
             unimplemented!("an upload never reads object ranges")
         }
 
