@@ -155,7 +155,32 @@ where
     };
 
     let plan = plan_download(total, &TransferTuning::default());
+    let part_size = plan.chunk_size;
     let chunks = plan.chunks;
+
+    // Chunking is user-configurable (M6+), so a checkpoint recorded under one
+    // tuning cannot be trusted under another: its `completed_parts` chunk
+    // numbers would silently map to different byte ranges under *this* plan
+    // and corrupt the file. `part_size == 0` (a pre-M6 checkpoint, or one
+    // this same check already invalidated) is unconditionally a mismatch.
+    // Discard the stale `.bcpart` and fall through to a fresh download rather
+    // than trust a resume whose byte ranges no longer line up.
+    let existing = existing.and_then(|ds| {
+        if ds.part_size != part_size {
+            tracing::info!(
+                task = %job.task_id,
+                key = %job.key,
+                recorded_part_size = ds.part_size,
+                current_part_size = part_size,
+                "recorded part size does not match the current plan; discarding the checkpoint and \
+                 restarting the download"
+            );
+            discard_stale_bcpart(&job.task_id, &ds.bcpart);
+            None
+        } else {
+            Some(ds)
+        }
+    });
 
     if chunks.len() == 1 {
         tracing::info!(task = %job.task_id, key = %job.key, "downloading as a single stream");
@@ -277,6 +302,7 @@ where
         etag: etag.clone(),
         completed_parts: done.clone(),
         bcpart: bcpart.clone(),
+        part_size,
     });
     *job.resume.lock().await = Some(init_state.clone());
     // The first set, before any chunk lands: `force` so a cancel-before-any-
@@ -346,6 +372,7 @@ where
         etag: etag.clone(),
         completed_parts: completed.clone(),
         bcpart: bcpart.clone(),
+        part_size,
     });
     *job.resume.lock().await = Some(landed_state.clone());
     // A per-chunk checkpoint refresh: coalesced, so a download that finishes
@@ -1024,6 +1051,15 @@ mod tests {
         plan_download(total, &TransferTuning::default()).chunks
     }
 
+    /// The download plan's `chunk_size` for `total`, under the default
+    /// (balanced) tuning -- what a real run records into `DownloadState`.
+    /// Tests that seed a resume state expecting it to be *trusted* use this
+    /// so the recorded value always agrees with what `run_download` itself
+    /// would derive.
+    fn download_chunk_size(total: u64) -> u64 {
+        plan_download(total, &TransferTuning::default()).chunk_size
+    }
+
     /// The default (balanced) preset's download threshold -- 64MB. Test
     /// sizes below derive from this and `download_floor()` rather than
     /// hardcoding numbers, so a future preset change cannot leave a
@@ -1218,6 +1254,7 @@ mod tests {
             etag: Some(OBJECT_ETAG.to_string()),
             completed_parts: vec![1],
             bcpart: rig.bcpart(),
+            part_size: download_chunk_size(total),
         })
         .await;
 
@@ -1430,6 +1467,7 @@ mod tests {
             etag: Some(OBJECT_ETAG.to_string()),
             completed_parts: vec![1],
             bcpart: rig.bcpart(),
+            part_size: download_chunk_size(total),
         })
         .await;
         assert!(
@@ -1486,6 +1524,7 @@ mod tests {
             etag: Some(OBJECT_ETAG.to_string()),
             completed_parts: vec![1],
             bcpart: rig.bcpart(),
+            part_size: download_chunk_size(total),
         })
         .await;
 
@@ -1543,6 +1582,7 @@ mod tests {
             etag: Some(OBJECT_ETAG.to_string()),
             completed_parts: vec![1],
             bcpart: rig.bcpart(),
+            part_size: download_chunk_size(total),
         })
         .await;
 
@@ -1595,6 +1635,7 @@ mod tests {
             etag: Some(OBJECT_ETAG.to_string()),
             completed_parts: vec![1],
             bcpart: rig.bcpart(),
+            part_size: download_chunk_size(total),
         })
         .await;
 
@@ -1614,5 +1655,105 @@ mod tests {
             Vec::<i32>::new(),
             "not a single chunk is fetched once the head says the object is gone"
         );
+    }
+
+    // Test 15 (Task 3, spec §4.6): a resume whose recorded `part_size` no
+    // longer matches the current plan must be discarded wholesale -- its
+    // `completed_parts` chunk numbers would otherwise map to different byte
+    // ranges under this plan and corrupt the file. The etag is left matching
+    // so the etag-based reconcile alone would happily continue; only the
+    // part_size mismatch must trigger the discard. Modelled on
+    // `download_resume_restarts_when_the_etag_changed`, with a mismatched
+    // `part_size` standing in for the changed etag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn download_resume_restarts_when_the_recorded_part_size_does_not_match_the_plan() {
+        // At the threshold -> two equal chunks.
+        let object = make_object(download_threshold() as usize);
+        let total = object.len() as u64;
+        let rig = rig(4, object.clone(), |_| {}); // default head etag == OBJECT_ETAG
+
+        // Pre-stage a stale chunk 1 recorded complete under a DIFFERENT part
+        // size, with deliberately wrong bytes so a reused-partial bug
+        // corrupts the file.
+        let plan = download_chunks(total);
+        let c1 = plan[0];
+        {
+            let pf = PartFile::create(&rig.target, total).unwrap();
+            pf.write_at(c1.offset, &vec![0xABu8; c1.length as usize])
+                .unwrap();
+            // Dropped without finish(): the .bcpart stays on disk holding the
+            // stale chunk 1.
+        }
+        assert!(rig.bcpart().exists());
+        rig.seed_resume(DownloadState {
+            etag: Some(OBJECT_ETAG.to_string()),
+            completed_parts: vec![1],
+            bcpart: rig.bcpart(),
+            // Deliberately wrong: the current plan's chunk_size is
+            // `download_chunk_size(total)`.
+            part_size: download_chunk_size(total) + 1,
+        })
+        .await;
+
+        let outcome = rig.run(total).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.chunks_seen(),
+            vec![1, 2],
+            "a mismatched recorded part_size must discard the checkpoint and re-fetch every chunk"
+        );
+        assert_eq!(
+            rig.provider.calls_of(1),
+            1,
+            "the chunk the checkpoint marked complete must be re-downloaded once the recorded \
+             part_size no longer matches the plan"
+        );
+        assert_eq!(
+            rig.read_target(),
+            object,
+            "the restart must assemble the CURRENT object, not the stale partial's garbage bytes"
+        );
+        assert!(
+            !rig.bcpart().exists(),
+            "a completed restart renames its fresh .bcpart into place"
+        );
+        assert!(rig.resume_state().await.is_none());
+    }
+
+    // Test 16 (Task 3, spec §4.6): a legacy checkpoint with no recorded
+    // `part_size` (deserializes to 0 via `#[serde(default)]`) must be treated
+    // exactly like a mismatch -- discarded wholesale rather than trusted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn download_resume_restarts_when_the_recorded_part_size_is_zero() {
+        let object = make_object(download_threshold() as usize);
+        let total = object.len() as u64;
+        let rig = rig(4, object.clone(), |_| {});
+
+        let plan = download_chunks(total);
+        let c1 = plan[0];
+        {
+            let pf = PartFile::create(&rig.target, total).unwrap();
+            pf.write_at(c1.offset, &vec![0xABu8; c1.length as usize])
+                .unwrap();
+        }
+        rig.seed_resume(DownloadState {
+            etag: Some(OBJECT_ETAG.to_string()),
+            completed_parts: vec![1],
+            bcpart: rig.bcpart(),
+            part_size: 0,
+        })
+        .await;
+
+        let outcome = rig.run(total).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.chunks_seen(),
+            vec![1, 2],
+            "a zero (legacy) part_size must discard the checkpoint and re-fetch every chunk"
+        );
+        assert_eq!(rig.read_target(), object);
+        assert!(rig.resume_state().await.is_none());
     }
 }

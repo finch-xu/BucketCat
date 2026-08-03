@@ -3694,6 +3694,7 @@ async fn resume_disabled_writes_no_checkpoint_and_skips_restore() {
             completed: vec![],
             source_size: size,
             source_mtime: 1,
+            part_size: 0,
         }),
     };
     checkpoint::write(&cp_dir, seeded_id, &seeded).expect("seed a leftover checkpoint");

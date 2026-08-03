@@ -200,7 +200,7 @@ where
                 part_size,
                 "uploading as multipart"
             );
-            upload_multipart(job, provider, parts).await
+            upload_multipart(job, provider, parts, part_size).await
         }
     }
 }
@@ -242,6 +242,7 @@ async fn upload_multipart<P>(
     job: &UploadJob,
     provider: Arc<P>,
     plan: Vec<PartSpec>,
+    part_size: u64,
 ) -> AppResult<RunOutcome>
 where
     P: Provider + Send + Sync + 'static,
@@ -275,12 +276,19 @@ where
         (None, Vec::new(), size, mtime)
     } else {
         let (cur_size, cur_mtime) = source_fingerprint(&job.path);
-        if (cur_size, cur_mtime) != (existing.source_size, existing.source_mtime) {
-            // The bytes on disk are not the bytes this upload was created for.
-            // Continuing would splice new parts onto old ones and assemble a
-            // corrupt object, so abort the stale upload (best-effort -- its
-            // fragments would otherwise keep billing the user), forget it, and
-            // fall through to a fresh upload of the current file.
+        if (cur_size, cur_mtime) != (existing.source_size, existing.source_mtime)
+            || existing.part_size != part_size
+        {
+            // Either the bytes on disk are not the bytes this upload was
+            // created for, or the recorded part size no longer matches the
+            // current plan (chunking is user-configurable -- M6+ -- so a
+            // checkpoint cut under a different tuning cannot be trusted: its
+            // `completed` part numbers would map to different byte ranges
+            // under this plan). Continuing either way would splice mismatched
+            // parts onto old ones and assemble a corrupt object, so abort the
+            // stale upload (best-effort -- its fragments would otherwise keep
+            // billing the user), forget it, and fall through to a fresh
+            // upload of the current file.
             if let Err(err) = provider
                 .multipart_abort(&job.bucket, &job.key, &existing.upload_id)
                 .await
@@ -335,6 +343,7 @@ where
                 completed: carried.clone(),
                 source_size,
                 source_mtime,
+                part_size,
             });
             *job.resume.lock().await = Some(init_state.clone());
             // The first set, before any part lands: `force` so a cancel-before-
@@ -411,6 +420,7 @@ where
         completed: done.clone(),
         source_size,
         source_mtime,
+        part_size,
     });
     *job.resume.lock().await = Some(landed_state.clone());
     // A per-part checkpoint refresh: coalesced, so a task that finishes many
@@ -1319,6 +1329,7 @@ mod tests {
                 etag: "\"etag-1\"".to_string(),
                 size: part_floor(),
             }],
+            part_size: part_floor(),
             ..Default::default()
         })
         .await;
@@ -1504,6 +1515,7 @@ mod tests {
                 etag: "\"stale\"".to_string(),
                 size: part_floor(),
             }],
+            part_size: part_floor(),
             ..Default::default()
         })
         .await;
@@ -1559,6 +1571,7 @@ mod tests {
                 etag: "\"etag-1\"".to_string(),
                 size: part_floor(),
             }],
+            part_size: part_floor(),
             ..Default::default()
         })
         .await;
@@ -1640,6 +1653,7 @@ mod tests {
             // mismatch is what forces the restart.
             source_size: 999,
             source_mtime: 1,
+            part_size: part_floor(),
         })
         .await;
 
@@ -1690,6 +1704,7 @@ mod tests {
             // reconciliation against the server's part list is what decides.
             source_size: 0,
             source_mtime: 0,
+            part_size: part_floor(),
         })
         .await;
 
@@ -1714,6 +1729,60 @@ mod tests {
         );
         assert_eq!(rig.provider.parts_seen(), vec![1, 2]);
         assert_eq!(rig.provider.assembled_numbers(), vec![1, 2]);
+    }
+
+    // Test (Task 3, spec §4.6): a resume whose recorded `part_size` no longer
+    // matches the current plan must be treated exactly like a changed source
+    // -- the stale upload is aborted and a brand-new one started, rather than
+    // splicing parts planned under a different part size onto the old
+    // upload id. The fingerprint is left matching (both default to (0, 0))
+    // so only the part_size mismatch can be forcing the restart. Modelled on
+    // `resume_restarts_when_the_source_changed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_restarts_when_the_recorded_part_size_does_not_match_the_plan() {
+        let rig = rig(4, |_| {});
+        rig.seed_resume(MultipartState {
+            upload_id: UPLOAD_ID.to_string(),
+            // Claims part 1 is already done -- a claim the part_size mismatch
+            // voids.
+            completed: vec![UploadedPart {
+                number: 1,
+                etag: "\"old\"".to_string(),
+                size: part_floor(),
+            }],
+            // (0, 0) matches the fingerprint of the deliberately-nonexistent
+            // stand-in path, so the source-change branch is not taken.
+            source_size: 0,
+            source_mtime: 0,
+            // Deliberately wrong: the current plan's part_size is
+            // `part_floor()` for a `threshold()`-sized upload.
+            part_size: part_floor() + 1,
+        })
+        .await;
+
+        let outcome = rig.run(threshold()).await.unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            rig.provider.aborts(),
+            1,
+            "a mismatched recorded part_size must abort the stale upload -- its fragments would \
+             otherwise keep billing the user"
+        );
+        assert_eq!(
+            rig.provider.inits(),
+            1,
+            "a mismatched part_size forces a brand-new multipart upload rather than continuing \
+             the old id"
+        );
+        assert_eq!(
+            rig.provider.parts_seen(),
+            vec![1, 2],
+            "every part is re-uploaded against the fresh upload; nothing is carried from the \
+             stale checkpoint"
+        );
+        assert_eq!(rig.provider.assembled_numbers(), vec![1, 2]);
+        assert!(rig.resume_state().await.is_none());
     }
 
     #[tokio::test]

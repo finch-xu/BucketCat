@@ -585,6 +585,7 @@ mod tests {
                 completed: vec![],
                 source_size: 100,
                 source_mtime: 0,
+                part_size: 0,
             }),
             Direction::Download => ResumeState::Download(DownloadState::default()),
         };

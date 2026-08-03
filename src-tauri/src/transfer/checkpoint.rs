@@ -118,6 +118,7 @@ mod tests {
                 completed: vec![],
                 source_size: 100,
                 source_mtime: 42,
+                part_size: 16 * 1024 * 1024,
             }),
         }
     }

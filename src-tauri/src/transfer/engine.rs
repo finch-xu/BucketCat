@@ -65,7 +65,7 @@ use crate::transfer::checkpoint::{self, Checkpoint};
 use crate::transfer::model::{
     next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto,
 };
-use crate::transfer::part::{plan_download, TransferTuning};
+use crate::transfer::part::chunks_for;
 use crate::transfer::partfile::bcpart_path;
 use crate::transfer::progress::ProgressMsg;
 
@@ -155,6 +155,15 @@ pub struct MultipartState {
     /// `source_size`. `0` means the fingerprint was never captured -- either
     /// an in-memory state predating this field, or a `stat` that failed.
     pub source_mtime: i64,
+    /// The `part_size` the multipart plan used when this upload was created
+    /// (`UploadPlan::Multipart`'s `part_size`). Chunking is user-configurable
+    /// (M6+), so a checkpoint cut under one tuning cannot be trusted under
+    /// another -- its `completed` part numbers would map to different byte
+    /// ranges. `#[serde(default)]` makes a pre-this-field checkpoint read as
+    /// `0`, which the resume path treats as an unconditional mismatch (see
+    /// `upload.rs`'s resume reconcile).
+    #[serde(default)]
+    pub part_size: u64,
 }
 
 /// In-flight download bookkeeping for an in-session pause/resume. Also
@@ -166,6 +175,16 @@ pub struct DownloadState {
     pub etag: Option<String>,
     pub completed_parts: Vec<i32>,
     pub bcpart: std::path::PathBuf,
+    /// The `chunk_size` the download plan used when this download was
+    /// started ([`crate::transfer::part::DownloadPlan`]'s `chunk_size`). Same
+    /// rationale as [`MultipartState::part_size`]: a checkpoint cut under a
+    /// different tuning cannot be trusted, since its `completed_parts` chunk
+    /// numbers would map to different byte ranges under the current plan.
+    /// `#[serde(default)]` makes a pre-this-field checkpoint read as `0`,
+    /// which the resume path treats as an unconditional mismatch (see
+    /// `download.rs`'s resume reconcile).
+    #[serde(default)]
+    pub part_size: u64,
 }
 
 /// Per-task resume state, one variant per direction. Generalized from the
@@ -436,21 +455,23 @@ struct TaskRecord {
 /// - **Upload**: the sum of the recorded multipart parts' sizes, straight from
 ///   the [`UploadedPart`]s the previous run committed.
 /// - **Download**: the sum of the plan chunks whose 1-based `number` the
-///   checkpoint marks done. The chunk boundaries are a pure function of
-///   `total` ([`plan_download`]), rebuilt here exactly as the download
-///   runner derives them, so no `.bcpart` or network read is needed to size
-///   them. Rebuilt under the default (balanced) tuning until a future task
-///   records each task's actual `part_size`, at which point this can derive
-///   the chunk table from that recorded value instead (via `chunks_for`)
-///   rather than re-deriving it from `total` alone -- the two only agree
-///   when the checkpoint was cut under the default tuning.
+///   checkpoint marks done. The chunk table is rebuilt from the recorded
+///   `part_size` ([`DownloadState::part_size`]) via [`chunks_for`], exactly
+///   reproducing the plan the previous run cut its checkpoint under -- so no
+///   `.bcpart` or network read is needed to size them, and no assumption is
+///   made about the *current* tuning. `part_size == 0` (a pre-M6 checkpoint,
+///   or one the resume path has already deemed unusable) restores `0`: the
+///   resume path discards such a checkpoint wholesale, so the displayed
+///   progress must agree that nothing survived.
 fn checkpoint_completed_bytes(cp: &Checkpoint) -> u64 {
     match &cp.resume {
         ResumeState::Upload(ms) => ms.completed.iter().map(|p| p.size).sum(),
         ResumeState::Download(ds) => {
+            if ds.part_size == 0 {
+                return 0;
+            }
             let done: std::collections::HashSet<i32> = ds.completed_parts.iter().copied().collect();
-            plan_download(cp.total, &TransferTuning::default())
-                .chunks
+            chunks_for(cp.total, ds.part_size)
                 .iter()
                 .filter(|c| done.contains(&c.number))
                 .map(|c| c.length)
@@ -2176,6 +2197,7 @@ mod tests {
             etag: Some("\"e1\"".to_string()),
             completed_parts: vec![1],
             bcpart: bcpart.clone(),
+            part_size: 8 * 1024 * 1024,
         }));
 
         h.engine.cancel(&paused.id).await.unwrap();
@@ -2381,6 +2403,7 @@ mod tests {
                 etag: Some("\"e1\"".to_string()),
                 completed_parts: vec![1, 2],
                 bcpart: std::path::PathBuf::from("/tmp/big.bin.bcpart"),
+                part_size: 32 * 1024 * 1024,
             }),
         }
     }
@@ -2456,6 +2479,7 @@ mod tests {
                 completed: vec![],
                 source_size: 100,
                 source_mtime: 0,
+                part_size: 0,
             }),
         }
     }
@@ -2532,5 +2556,69 @@ mod tests {
                 .all(|a| matches!(a, RestoreAction::DiscardOrphan(_, _))),
             "a successful read of an empty store makes every checkpoint an orphan: {plan:?}"
         );
+    }
+
+    // --- part_size: checkpoint round-trip + restored-bytes derivation ------
+    //
+    // Task 3 (spec §4.6): chunking is user-configurable (M6+), so a
+    // checkpoint cut under one tuning must never be trusted under another --
+    // its `completed_parts` chunk numbers would map to different byte
+    // ranges. These cover the serde-compat side (a legacy file with no
+    // `part_size` reads as 0) and the `checkpoint_completed_bytes` side
+    // (restored progress is derived from the *recorded* part size, not
+    // whatever tuning happens to be active now).
+
+    /// A minimal download checkpoint carrying `resume`, for the
+    /// `checkpoint_completed_bytes` tests below -- the rest of the fields are
+    /// irrelevant to that pure function.
+    fn checkpoint_with(resume: ResumeState, total: u64) -> Checkpoint {
+        Checkpoint {
+            direction: Direction::Download,
+            connection_id: "c1".to_string(),
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            local_path: "/tmp/k".to_string(),
+            file_name: "k".to_string(),
+            total,
+            resume,
+        }
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_part_size_reads_as_zero() {
+        let json = r#"{"Download":{"etag":null,"completed_parts":[1,2],"bcpart":"/tmp/x.bcpart"}}"#;
+        let ResumeState::Download(ds) = serde_json::from_str::<ResumeState>(json).unwrap() else {
+            panic!("expected a Download variant")
+        };
+        assert_eq!(ds.part_size, 0);
+    }
+
+    #[test]
+    fn restored_bytes_derive_from_the_recorded_part_size_not_current_settings() {
+        // 8MB recorded part size x completed chunks [1,2] = 16MB, no matter
+        // what the current tuning preset is.
+        let ds = DownloadState {
+            etag: None,
+            completed_parts: vec![1, 2],
+            bcpart: "/tmp/x.bcpart".into(),
+            part_size: 8 * 1024 * 1024,
+        };
+        let cp = checkpoint_with(ResumeState::Download(ds), 100 * 1024 * 1024);
+        assert_eq!(checkpoint_completed_bytes(&cp), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn zero_part_size_restores_zero_bytes() {
+        // A legacy checkpoint is discarded wholesale on resume, so the
+        // displayed progress must agree and show zero rather than a
+        // misleading partial figure.
+        let ds = DownloadState {
+            etag: None,
+            completed_parts: vec![1],
+            bcpart: "/tmp/x.bcpart".into(),
+            part_size: 0,
+        };
+        let cp = checkpoint_with(ResumeState::Download(ds), 100 * 1024 * 1024);
+        assert_eq!(checkpoint_completed_bytes(&cp), 0);
     }
 }
