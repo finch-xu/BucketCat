@@ -564,16 +564,38 @@ impl EngineInner {
     /// Updates a task's transient retry notice and broadcasts the new DTO.
     /// Unlike [`EngineInner::apply`] this never touches `status` -- a runner
     /// can emit and clear a notice many times while a task stays `Running`.
-    /// A missing task is a benign no-op: the task may have finished (and been
-    /// cleared or gone terminal) between the runner deciding to retry and this
-    /// call actually running (it is dispatched via `tokio::spawn`, so it can
-    /// land after the driver already moved on).
+    ///
+    /// Each call to the `notice` closure built in [`EngineInner::drive`]
+    /// dispatches its own `tokio::spawn`, so calls can arrive **out of
+    /// order** relative to each other and relative to the driver's own
+    /// `apply()` calls -- there is no queue, no sequence number, nothing
+    /// serializing them beyond whichever gets scheduled first. Two distinct
+    /// late-arrival races follow from that, both benign no-ops here:
+    ///
+    /// - **The task row is gone.** It finished (`Completed`/`Canceled`) and
+    ///   was later reaped by [`TransferEngine::clear_finished`] before this
+    ///   call ran. `tasks.get_mut` returns `None` and this returns early.
+    /// - **The task row is still there, but no longer `Running`.** A
+    ///   `Some(TaskNotice)` emitted right before a part/chunk permanently
+    ///   fails is never followed by a compensating `None` on that path (see
+    ///   `upload.rs`/`download.rs`'s retry loops -- the failure just returns
+    ///   `Err`), so if that emit's own `set_notice` call is still queued
+    ///   behind the driver's `apply(Fail)`, it would otherwise land *after*
+    ///   `apply` already cleared `notice` to `None` and permanently resurrect
+    ///   a stale notice on a terminal (or `Paused`) DTO -- a row with no live
+    ///   driver left to ever clear it again. Guarding on `status ==
+    ///   Running` here is what closes that window: a notice is only ever
+    ///   meaningful while the task is actively running, so a write that
+    ///   arrives once it no longer is gets dropped instead of applied.
     async fn set_notice(self: &Arc<Self>, task_id: &str, notice: Option<TaskNotice>) {
         let updated = {
             let mut tasks = self.tasks.lock().await;
             let Some(record) = tasks.get_mut(task_id) else {
                 return;
             };
+            if record.dto.status != TransferStatus::Running {
+                return;
+            }
             record.dto.notice = notice;
             record.dto.transferred = record.transferred.load(Ordering::Relaxed);
             record.dto.clone()
@@ -1876,6 +1898,56 @@ mod tests {
             h.task(&task.id).await.notice,
             None,
             "a finished task must not keep showing a stale retry notice"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_notice_arriving_after_the_task_left_running_is_dropped() {
+        // Review fix: the `notice` closure built in `EngineInner::drive`
+        // dispatches each call via its own `tokio::spawn`, with no ordering
+        // guarantee against the driver's own `apply()` calls. A `Some(..)`
+        // emitted right before a permanent failure has no compensating
+        // `None` on that path (the retry loops just return `Err`), so if
+        // its `set_notice` call is still queued when `apply(Fail)` runs and
+        // clears `notice`, the late arrival must not resurrect it on a row
+        // that has already left `Running` -- there is no driver left to
+        // ever clear it again.
+        //
+        // Called directly against `EngineInner` (not through a real retry)
+        // so the race is deterministic instead of depending on the ~1s+
+        // backoff window actually racing a spawn.
+        let h = harness(1);
+        let task = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "the task starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&task.id).last() == Some(&TransferStatus::Completed),
+            "the task completes",
+        )
+        .await;
+
+        // Simulate the late arrival: a `set_notice` call dispatched before
+        // the task finished, but only actually scheduled afterwards.
+        h.engine
+            .inner
+            .set_notice(
+                &task.id,
+                Some(TaskNotice {
+                    code: "network/throttled".to_string(),
+                    attempt: 1,
+                    max: 3,
+                }),
+            )
+            .await;
+
+        assert_eq!(
+            h.task(&task.id).await.notice,
+            None,
+            "a notice landing after the task left Running must be dropped, not resurrected"
         );
     }
 
