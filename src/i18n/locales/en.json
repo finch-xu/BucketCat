@@ -284,7 +284,6 @@
     "downloadChunkSize": "Download chunk size",
     "thresholdHint": "Files smaller than this transfer as a single request, without splitting",
     "partSizeHint": "Sets the concurrency granularity: smaller parts mean finer parallelism but more requests",
-    "partSize": "Part size",
     "verify": "Verify after transfer",
     "overwrite": "Overwrite existing files",
     "resumeTransfers": "Resumable transfers",

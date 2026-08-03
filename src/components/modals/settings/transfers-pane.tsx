@@ -336,17 +336,6 @@ export function TransfersPane() {
         {t("settings.partSizeHint")}
       </div>
 
-      <Row label={t("settings.partSize")}>
-        <Segmented<number>
-          value={transferSettings.partSizeMb}
-          onChange={(v) => setTransferSettings({ partSizeMb: v })}
-          options={[
-            { value: 8, label: "8 MB" },
-            { value: 16, label: "16 MB" },
-            { value: 64, label: "64 MB" },
-          ]}
-        />
-      </Row>
       <Row label={t("settings.verify")}>
         <Switch
           checked={transferSettings.verify}

@@ -284,7 +284,6 @@
     "downloadChunkSize": "下载分段大小",
     "thresholdHint": "小于该值的文件不分片，单请求完成",
     "partSizeHint": "决定并发的分片粒度：越小并发越细，请求次数越多",
-    "partSize": "分片大小",
     "verify": "传输完成后校验",
     "overwrite": "覆盖同名文件",
     "resumeTransfers": "断点续传",

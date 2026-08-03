@@ -24,14 +24,19 @@ export type SelectMode = "single" | "toggle" | "range";
 
 /** Transfer engine tuning knobs shown in the settings modal. NOT YET WIRED
  * to the backend: `enqueue_uploads` and the transfer engine (see
- * `src/lib/api.ts`) don't currently take a concurrency/part-size/verify/
- * overwrite input, so changing these has no effect on real transfers yet.
- * Kept here only so the settings modal has somewhere to read/write them
- * without inventing a second half-wired store; a later milestone is
- * expected to thread them through `enqueueUploads` and friends. */
+ * `src/lib/api.ts`) don't currently take a concurrency/verify/overwrite
+ * input, so changing these has no effect on real transfers yet. Kept here
+ * only so the settings modal has somewhere to read/write them without
+ * inventing a second half-wired store; a later milestone is expected to
+ * thread them through `enqueueUploads` and friends.
+ *
+ * `partSizeMb` used to live here too, backing a "分片大小" (8/16/64 MB)
+ * segmented control in the Transfers pane. It was a placebo -- nothing ever
+ * read it -- superseded by the real, backend-wired upload/download
+ * threshold + part-floor selects (spec §4.7), so it and its control were
+ * removed rather than left to mislead users into thinking it did something. */
 export interface TransferSettings {
   concurrency: number;
-  partSizeMb: number;
   verify: boolean;
   overwrite: boolean;
 }
@@ -134,7 +139,6 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
 
   const [transferSettings, setTransferSettingsState] = useState<TransferSettings>({
     concurrency: 4,
-    partSizeMb: 8,
     verify: true,
     overwrite: false,
   });
