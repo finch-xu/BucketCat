@@ -114,7 +114,8 @@
     "dropHint": "Drop to upload into this folder",
     "noticeTitle": "Upload result",
     "skippedSummary": "{{queued}} queued, {{skipped}} skipped",
-    "notReadyBody": "Still checking for existing names in this folder. Please try again in a moment."
+    "notReadyBody": "Still checking for existing names in this folder. Please try again in a moment.",
+    "noBucketBody": "Select a bucket first, then drop files to upload them."
   },
   "transfer": {
     "title": "Transfers",

@@ -114,7 +114,8 @@
     "dropHint": "松开即可上传到当前目录",
     "noticeTitle": "上传结果",
     "skippedSummary": "已加入 {{queued}} 个，跳过 {{skipped}} 个",
-    "notReadyBody": "正在检查当前目录中的同名文件，请稍后重试。"
+    "notReadyBody": "正在检查当前目录中的同名文件，请稍后重试。",
+    "noBucketBody": "请先选择一个存储桶，再拖入文件上传。"
   },
   "transfer": {
     "title": "传输任务",

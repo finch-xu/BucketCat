@@ -511,10 +511,10 @@ export function FileBrowser() {
       if (payload.type === "enter" || payload.type === "over") setDragging(true);
       else if (payload.type === "drop") {
         setDragging(false);
-        if (activeBucket) startUploads(payload.paths);
+        startUploads(payload.paths);
       } else setDragging(false);
     },
-    [activeBucket, startUploads],
+    [startUploads],
   );
 
   // Tauri's own drag-drop event, not HTML5 dragover/drop: a `File` handed to

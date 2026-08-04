@@ -76,11 +76,12 @@ export function UploadConflictDialog({
 }
 
 /** After-the-fact report for an upload gesture that did not do the obvious
- * thing: a rejected command, a partially-queued batch, or a drop refused
- * because the collision guard wasn't ready. Every one of these previously
- * ended in nothing at all appearing on screen.
+ * thing: a rejected command, a partially-queued batch, a drop refused
+ * because the collision guard wasn't ready, or a drop refused because no
+ * bucket was selected. Every one of these previously ended in nothing at all
+ * appearing on screen.
  *
- * Dedicated `upload.*` copy for all three cases: `upload.skippedSummary` for
+ * Dedicated `upload.*` copy for each case: `upload.skippedSummary` for
  * the queued/skipped counts (the delete dialog's `objects.partialSummary` is
  * about succeeded/failed deletes, not queued/skipped uploads -- reusing it
  * misdescribed what happened) and `upload.notReadyBody` for the refused drop
@@ -100,7 +101,8 @@ export function UploadNoticeDialog({
   if (notice.kind === "error") body = errorText(notice.error);
   else if (notice.kind === "skipped") {
     body = t("upload.skippedSummary", { queued: notice.queued, skipped: notice.skipped });
-  } else body = t("upload.notReadyBody");
+  } else if (notice.kind === "notReady") body = t("upload.notReadyBody");
+  else body = t("upload.noBucketBody");
 
   return (
     <Modal onClose={onClose} className="w-[420px]">

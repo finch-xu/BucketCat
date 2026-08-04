@@ -54,7 +54,12 @@ export type UploadNotice =
    * Refusing is correct (see `guardReady`), but the drag overlay's "checking
    * names" hint disappears with the drag, so the gesture would otherwise
    * vanish without a trace. */
-  | { kind: "notReady" };
+  | { kind: "notReady" }
+  /** A drop landed on the window while no bucket was selected. The overlay
+   * that would normally show a drop hint is suppressed in this state (there
+   * is no destination folder to name), so without this notice the gesture
+   * would otherwise silently evaporate. */
+  | { kind: "noBucket" };
 
 export interface UseStartUploadsResult {
   /** Enqueues `paths` (absolute local file paths) into the currently browsed
@@ -180,6 +185,14 @@ export function useStartUploads(): UseStartUploadsResult {
   const startUploads = useCallback(
     (paths: string[]) => {
       if (paths.length === 0) return;
+      // Checked before `guardReady`: with no bucket selected the listing
+      // query never runs, so `guardReady` is permanently false and would
+      // otherwise misreport this as "still checking names" instead of "no
+      // destination at all".
+      if (!activeBucket) {
+        setNotice({ kind: "noBucket" });
+        return;
+      }
       // Refuse rather than risk an unguarded overwrite -- but say so, so the
       // gesture doesn't just evaporate (the drag overlay's "checking names"
       // hint is gone the moment the drag ends).
@@ -210,7 +223,7 @@ export function useStartUploads(): UseStartUploadsResult {
       }
       setConflict({ prefix, allPaths: paths, nonCollidingPaths, collidingKeys });
     },
-    [enqueue, entries, guardReady, prefix],
+    [activeBucket, enqueue, entries, guardReady, prefix],
   );
 
   function resolveOverwrite() {
