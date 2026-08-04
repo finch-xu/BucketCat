@@ -1,5 +1,5 @@
 import { ArrowUpDown, ChevronDown, Download, Pause, Play, RotateCcw, Upload, X } from "lucide-react";
-import { memo, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { useErrorText } from "@/hooks/use-error-text";
@@ -250,6 +250,47 @@ export function TransferBar() {
   const order = useTransferOrder();
   const panelOpen = useTransferPanelOpen();
   const [clearError, setClearError] = useState<AppError | null>(null);
+  // Wraps both the panel and the footer (incl. the Toggle button), so
+  // `contains(e.target)` naturally treats a click anywhere in either as
+  // "inside" -- no separate check needed to keep the Toggle button from
+  // reopening the panel it just closed.
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Auto-collapse the panel on an outside click or Escape while it's open.
+  // Known and accepted, not worked around: with a Modal open at the same
+  // time, clicking its overlay also closes the panel (it's still a click
+  // outside the panel, which should close it), and Escape closes both the
+  // Modal and the panel (Escape means "dismiss whatever's showing").
+  useEffect(() => {
+    if (!panelOpen) return;
+
+    // pointerdown, not click: a DOM `click` fires on the common ancestor of
+    // mousedown/mouseup, so dragging to select text inside the panel and
+    // releasing outside its bounds would misfire as an outside click (see
+    // modal.tsx's `dismissOnOverlayClick` comment for the bug this caused
+    // there).
+    const onPointerDown = (e: PointerEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        useTransferStore.getState().setPanelOpen(false);
+      }
+    };
+    // Same `defaultPrevented` convention as modal.tsx: skip an Escape some
+    // other layer (e.g. a Radix `DismissableLayer`) already consumed, and
+    // never call `preventDefault()` ourselves -- doing so would swallow the
+    // Escape for a Modal open at the same time.
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !e.defaultPrevented) {
+        useTransferStore.getState().setPanelOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [panelOpen]);
 
   const summaryLine = summary.activeCount
     ? t("transfer.activeCount", { count: summary.activeCount })
@@ -278,7 +319,7 @@ export function TransferBar() {
   }
 
   return (
-    <div className="relative shrink-0">
+    <div ref={containerRef} className="relative shrink-0">
       {panelOpen && (
         <div className="absolute bottom-full left-0 right-0 max-h-[284px] overflow-y-auto border-t border-border bg-background shadow-[0_-14px_32px_-14px_var(--shadow)] [animation:bc-up_.18s_ease]">
           <div className="sticky top-0 flex items-center justify-between border-b border-border2 bg-background px-3.5 pt-[11px] pb-[7px]">

@@ -116,6 +116,26 @@ describe("transfer store", () => {
     expect(useTransferStore.getState().order).toEqual(["b"]);
     expect(useTransferStore.getState().tasks.a).toBeUndefined();
   });
+
+  it("starts with the panel closed", () => {
+    expect(useTransferStore.getState().panelOpen).toBe(false);
+  });
+
+  it("togglePanel flips panelOpen", () => {
+    const s = useTransferStore.getState();
+    s.togglePanel();
+    expect(useTransferStore.getState().panelOpen).toBe(true);
+    s.togglePanel();
+    expect(useTransferStore.getState().panelOpen).toBe(false);
+  });
+
+  it("setPanelOpen sets panelOpen directly", () => {
+    const s = useTransferStore.getState();
+    s.setPanelOpen(true);
+    expect(useTransferStore.getState().panelOpen).toBe(true);
+    s.setPanelOpen(false);
+    expect(useTransferStore.getState().panelOpen).toBe(false);
+  });
 });
 
 describe("summarize", () => {
