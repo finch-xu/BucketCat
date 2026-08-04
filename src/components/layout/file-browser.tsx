@@ -76,31 +76,29 @@ function CenterState({
 }
 
 function useEntryHandlers(orderedFileKeys: string[]) {
-  const { selectKey, clearSelection, openFolder, gotoCrumb, path } = useApp();
+  const { selectKey, openFolder, gotoCrumb, path } = useApp();
   return (entry: ObjectEntry) => {
-    // The ".." row: same double-click-to-navigate affordance as a real
-    // folder, deliberately no single-click navigation either -- clicking it
-    // only clears the selection, same as any other folder row. Checked by
-    // reference, never by key: the sentinel key exists for React only.
+    // The ".." row: same single-click-to-navigate affordance as a real
+    // folder row. Checked by reference, never by key: the sentinel key
+    // exists for React only.
     if (entry === PARENT_ENTRY) {
       return {
-        onClick: () => clearSelection(),
-        onDoubleClick: () => gotoCrumb(path.length - 2),
+        onClick: () => gotoCrumb(path.length - 2),
       };
     }
     return {
       onClick: (e: React.MouseEvent) => {
         if (entry.is_prefix) {
-          clearSelection();
+          // Single click navigates. Folder rows have no selected state to
+          // protect (selection is files-only), and the row's hover action
+          // buttons all stopPropagation, so nothing competes with this.
+          // Navigate by the entry's key, not its display name -- see the doc
+          // comment on `openFolder` in the store for why this matters
+          // whenever the current listing was reached via a search term.
+          openFolder(entry.key);
         } else {
           selectKey(entry.key, selectModeFromEvent(e), orderedFileKeys);
         }
-      },
-      onDoubleClick: () => {
-        // Navigate by the entry's key, not its display name -- see the doc
-        // comment on `openFolder` in the store for why this matters whenever
-        // the current listing was reached via a search term.
-        if (entry.is_prefix) openFolder(entry.key);
       },
     };
   };
@@ -152,9 +150,10 @@ function RowActions({
   );
 
   if (entry.is_prefix) {
-    // Folders are never selected -- clicking one clears the selection -- so
-    // this branch always renders the unselected styling in practice. It uses
-    // the same class builders anyway so the two branches don't drift.
+    // Folders are never selected -- clicking one navigates into it (which
+    // clears the selection) -- so this branch always renders the unselected
+    // styling in practice. It uses the same class builders anyway so the two
+    // branches don't drift.
     return (
       <span className={container}>
         <button
