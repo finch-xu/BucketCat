@@ -30,12 +30,15 @@ export function Toolbar() {
   }
 
   return (
-    <div className="flex h-[52px] shrink-0 items-center gap-2.5 border-b border-border bg-background px-4">
+    <div data-tauri-drag-region className="flex h-[52px] shrink-0 items-center gap-2.5 border-b border-border bg-background px-4">
+      {/* Toolbar drag region: Tauri's drag detection requires the event to hit
+       * this element directly, so we mark both the root and the spacer below.
+       * Without either, the window cannot be dragged on this overlay bar. */}
       {/* The breadcrumb used to live here. It moved to `PathBar`, along the
           bottom of the content area: a row of its own gives it ~820px, where
           this slot left it ~357px once the rigid controls to the right had
           taken theirs. This spacer keeps those controls right-aligned. */}
-      <div className="flex-1" />
+      <div data-tauri-drag-region className="flex-1" />
       <div
         className={cn(
           "flex h-8 w-[206px] shrink-0 items-center gap-[7px] rounded-[9px] border border-border bg-panel px-2.5 text-muted-foreground focus-within:border-primary focus-within:ring-[3px] focus-within:ring-primary-soft",
