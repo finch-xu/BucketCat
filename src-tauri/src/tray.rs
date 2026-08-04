@@ -27,7 +27,14 @@
 //! the tray icon's own title, next to the icon in the menu bar, so the rate
 //! is visible without opening the menu at all; `TrayIcon::set_title` is
 //! documented `Unsupported` on Windows, hence the `#[cfg(target_os =
-//! "macos")]` around that half.
+//! "macos")]` around that half. Once the last active task finishes, the
+//! title lingers on `100%` for a few seconds ([`FINISH_LINGER`]) rather than
+//! blanking immediately, so a fast glance at the menu bar still catches the
+//! completion; after that it falls back to a frozen `{pct}%` if paused tasks
+//! remain, or to blank otherwise. Paused tasks with nothing active pin the
+//! title and status line to the paused set's own transferred/total ratio --
+//! it does not idle to blank -- since that ratio is frozen until the user
+//! resumes or removes them.
 //!
 //! [`TrayState`] holds what lives between ticks. It is a plain
 //! `std::sync::Mutex`, not `tokio::sync::Mutex`: every critical section here
@@ -94,7 +101,9 @@ pub struct TrayTexts {
     pub quit: String,
     pub settings: String,
     pub check_update: String,
-    /// Status line shown while [`StatusNumbers`] is `None` -- nothing active.
+    /// Status line shown for `TrayStatus::Idle` and `TrayStatus::JustFinished`
+    /// alike -- see [`render_status`] for why the latter, despite the title
+    /// still reading `100%`, uses this same copy rather than its own.
     pub status_idle: String,
     /// Status line template for when something is transferring, with the
     /// literal placeholders `{count}`, `{pct}`, `{speed}`, filled in by
@@ -102,6 +111,12 @@ pub struct TrayTexts {
     /// deliberate, not a typo -- i18next only interpolates `{{double}}`, so
     /// this string reaches Rust unexpanded.
     pub status_active: String,
+    /// Status line template for `TrayStatus::Paused` -- nothing active, but
+    /// one or more tasks sit paused with their progress frozen. Same
+    /// single-brace placeholder convention as `status_active`, just without
+    /// `{speed}`: a paused task is not moving, so a rate would only ever
+    /// read `0 B/s`.
+    pub status_paused: String,
 }
 
 impl TrayTexts {
@@ -115,13 +130,13 @@ impl TrayTexts {
             check_update: "Check for Updates…".to_string(),
             status_idle: "No active transfers".to_string(),
             status_active: "{count} transferring · {pct}% · {speed}".to_string(),
+            status_paused: "{count} paused · {pct}%".to_string(),
         }
     }
 }
 
 /// The numbers behind an active status line -- everything [`render_status`]
-/// needs besides the template itself. `None`, in [`TrayState::last`] and
-/// [`update_status`]'s parameter, means idle, not "zero of something".
+/// needs besides the template itself, for [`TrayStatus::Active`].
 #[derive(Clone, Copy)]
 struct StatusNumbers {
     count: usize,
@@ -129,9 +144,37 @@ struct StatusNumbers {
     speed_bps: u64,
 }
 
+/// The tray's four-way status, in priority order high to low -- what
+/// [`next_status`] computes each tick and [`update_status`] renders into the
+/// status line and (macOS only) the menu-bar title. Replaces a plain
+/// `Option<StatusNumbers>`: idle used to be the only state besides "active
+/// with these numbers", but the status line now also has to tell a
+/// just-finished transfer and a merely-paused one apart from true idle, and
+/// from each other, so a bare `None` no longer carries enough information.
+#[derive(Clone, Copy)]
+enum TrayStatus {
+    /// Nothing active, nothing paused, and past any [`FINISH_LINGER`]
+    /// window. Status line reads `status_idle`; title clears.
+    Idle,
+    /// At least one task is transferring right now. Status line and title
+    /// both reflect `numbers`, recomputed fresh every tick.
+    Active(StatusNumbers),
+    /// The active set just emptied out by completing (as opposed to being
+    /// cancelled or failing) and [`FINISH_LINGER`] has not yet elapsed.
+    /// Status line still reads `status_idle` -- "finished" and "idle" say
+    /// the same thing in the menu -- but the title pins to `100%` so the
+    /// completion is visible for a beat even to someone who only glances at
+    /// the menu bar.
+    JustFinished,
+    /// Nothing active, no linger window running, but one or more tasks sit
+    /// paused. `pct` is the paused set's own transferred/total ratio, frozen
+    /// until the user resumes, cancels, or removes them.
+    Paused { count: usize, pct: u8 },
+}
+
 /// Tauri-managed state backing the tray's live parts. See this module's doc
 /// comment for why the lock is a plain `std::sync::Mutex` and what
-/// `last_rendered` is for.
+/// `last_rendered`/`last_title` are for.
 pub struct TrayState<R: Runtime> {
     texts: Mutex<TrayTexts>,
     /// The status item's handle, so [`update_status`] can retext it without
@@ -141,14 +184,19 @@ pub struct TrayState<R: Runtime> {
     /// no longer attached to the tray, so a `set_text` racing in against it
     /// from the ticker is a harmless no-op rather than an error.
     status_item: Mutex<Option<MenuItem<R>>>,
-    /// The numbers [`update_status`] last received. Re-read by [`set_labels`]
+    /// The status [`update_status`] last received. Re-read by [`set_labels`]
     /// so a locale switch can re-render the status line in the new language
     /// immediately, without waiting for the ticker's next tick.
-    last: Mutex<Option<StatusNumbers>>,
+    last: Mutex<TrayStatus>,
     /// The status text last actually pushed to the menu item, so
     /// [`update_status`] can skip the main-thread round trip when nothing
     /// changed -- see this module's doc comment.
     last_rendered: Mutex<String>,
+    /// The macOS title string last actually pushed to the tray icon, deduped
+    /// independently of `last_rendered` -- see [`update_status`] for why the
+    /// two need separate tracking. Starts `""`, matching the untitled tray
+    /// [`build`] creates (no `set_title` call has ever run yet).
+    last_title: Mutex<String>,
 }
 
 /// Builds the menu: the live status line, then the fixed actions. The status
@@ -236,7 +284,7 @@ fn on_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
 /// Creates the tray icon. Call once, from `setup`.
 pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let texts = TrayTexts::english_fallback();
-    let status_text = render_status(&texts, None);
+    let status_text = render_status(&texts, TrayStatus::Idle);
     let (menu, status_item) = build_menu(app, &texts, &status_text)?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
@@ -288,8 +336,9 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     app.manage(TrayState {
         texts: Mutex::new(texts),
         status_item: Mutex::new(Some(status_item)),
-        last: Mutex::new(None),
+        last: Mutex::new(TrayStatus::Idle),
         last_rendered: Mutex::new(status_text),
+        last_title: Mutex::new(String::new()),
     });
 
     Ok(())
@@ -355,18 +404,57 @@ fn format_speed(bps: u64) -> String {
     }
 }
 
-/// Renders the status line: the idle copy verbatim, or the active template
-/// with `{count}`/`{pct}`/`{speed}` filled in by plain string substitution --
-/// single braces are not i18next interpolation syntax, see [`TrayTexts`].
-fn render_status(texts: &TrayTexts, numbers: Option<StatusNumbers>) -> String {
-    let Some(numbers) = numbers else {
-        return texts.status_idle.clone();
-    };
-    texts
-        .status_active
-        .replace("{count}", &numbers.count.to_string())
-        .replace("{pct}", &numbers.pct.to_string())
-        .replace("{speed}", &format_speed(numbers.speed_bps))
+/// Renders the status line for `status`: the idle copy verbatim for
+/// [`TrayStatus::Idle`] and [`TrayStatus::JustFinished`] alike -- "finished"
+/// and "idle" read the same in the menu, only the title tells them apart,
+/// see [`render_title`] -- or the matching template with `{count}`/`{pct}`
+/// (and, for `Active`, `{speed}`) filled in by plain string substitution.
+/// Single braces are not i18next interpolation syntax, see [`TrayTexts`].
+fn render_status(texts: &TrayTexts, status: TrayStatus) -> String {
+    match status {
+        TrayStatus::Idle | TrayStatus::JustFinished => texts.status_idle.clone(),
+        TrayStatus::Active(numbers) => texts
+            .status_active
+            .replace("{count}", &numbers.count.to_string())
+            .replace("{pct}", &numbers.pct.to_string())
+            .replace("{speed}", &format_speed(numbers.speed_bps)),
+        TrayStatus::Paused { count, pct } => texts
+            .status_paused
+            .replace("{count}", &count.to_string())
+            .replace("{pct}", &pct.to_string()),
+    }
+}
+
+/// Renders the macOS menu-bar title for `status`: a bare percentage for
+/// `Active`/`Paused`, a pinned `100%` for `JustFinished` (the active
+/// percentage that would have been showing the instant before is gone by
+/// then, so it is spelled out rather than carried over), and an empty string
+/// for `Idle` -- see [`update_status`] for why an empty string, not `None`,
+/// is what actually clears the title.
+fn render_title(status: TrayStatus) -> String {
+    match status {
+        TrayStatus::Idle => String::new(),
+        TrayStatus::Active(numbers) => format!("{}%", numbers.pct),
+        TrayStatus::JustFinished => "100%".to_string(),
+        TrayStatus::Paused { pct, .. } => format!("{pct}%"),
+    }
+}
+
+/// Percent complete, `0..=100`, for a `transferred`-of-`total` byte pair.
+/// Used for both the active and the paused set, each computed from its own
+/// pair by [`next_status`].
+///
+/// `checked_div` folds the `total == 0` guard into the division itself;
+/// `min(100)` guards the `as u8` cast against the numerator ever nudging
+/// past the denominator (e.g. a `total` read one tick stale) -- not
+/// expected in practice, but a saturated percentage is a much cheaper
+/// mistake than a wrapped one.
+fn pct(transferred: u64, total: u64) -> u8 {
+    transferred
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(100) as u8
 }
 
 /// A fixed 5-sample sliding window over a cumulative byte counter --
@@ -424,10 +512,85 @@ impl SpeedWindow {
     }
 }
 
-/// Pushes `n` (`None` = idle) into the tray: stores it, re-renders the status
-/// line, and -- only if the rendered text actually changed, see this
-/// module's doc comment -- retexts the status menu item and, on macOS,
-/// updates the tray icon's own title.
+/// How long [`TrayStatus::JustFinished`] lingers after the active set empties
+/// out by completing, before [`next_status`] lets it fall through to
+/// `Paused` or `Idle`. Long enough to catch a glance at the menu bar that
+/// lands a second or two after the fact, short enough that the tray is not
+/// stuck claiming "100%" long after it stopped being true.
+const FINISH_LINGER: Duration = Duration::from_secs(3);
+
+/// Computes this tick's [`TrayStatus`] from the engine's latest summary, in
+/// the same high-to-low priority the type's variants are documented in.
+/// Pulled out of [`spawn_status_ticker`]'s loop as a pure function (modulo
+/// the two pieces of state it threads through by `&mut`/return) so the
+/// priority logic -- especially the linger window's edge cases -- can be
+/// unit-tested without spinning up a ticker or a real `TransferEngine`.
+///
+/// `prev_completed` and `linger_until` are the two bits of memory this needs
+/// across ticks that a single `EngineSummary` snapshot cannot supply by
+/// itself: whether `completed_count` just went up (a table of running
+/// totals gives no "just" without a previous reading to diff against), and,
+/// once it has, when the resulting linger window ends. `linger_until` is
+/// `&mut` rather than returned because it can also be *cleared* early, by a
+/// new task going active mid-linger -- a plain return value would make the
+/// caller respond to two different "here is the new value" signals instead
+/// of one.
+fn next_status(
+    summary: &crate::transfer::EngineSummary,
+    prev_completed: u64,
+    linger_until: &mut Option<Instant>,
+    now: Instant,
+    speed_bps: u64,
+) -> TrayStatus {
+    if summary.active_count > 0 {
+        // A fresh task starting mid-linger outranks the leftover "just
+        // finished" window from the previous batch -- there is something to
+        // report right now, so the stale window is dropped rather than left
+        // to expire and briefly resurrect `JustFinished` once this task
+        // itself finishes.
+        *linger_until = None;
+        return TrayStatus::Active(StatusNumbers {
+            count: summary.active_count,
+            pct: pct(summary.active_transferred, summary.active_total),
+            speed_bps,
+        });
+    }
+
+    if summary.completed_count > prev_completed {
+        *linger_until = Some(now + FINISH_LINGER);
+    }
+    if let Some(t) = *linger_until {
+        if now < t {
+            return TrayStatus::JustFinished;
+        }
+        *linger_until = None;
+    }
+
+    if summary.paused_count > 0 {
+        return TrayStatus::Paused {
+            count: summary.paused_count,
+            pct: pct(summary.paused_transferred, summary.paused_total),
+        };
+    }
+
+    TrayStatus::Idle
+}
+
+/// Pushes `status` into the tray: stores it, re-renders the status line and
+/// (macOS only) the menu-bar title, and retexts/retitles only whichever of
+/// the two actually changed.
+///
+/// The two are deliberately deduped against *separate* "last rendered"
+/// records (`last_rendered` for the menu text, `last_title` for the title)
+/// rather than one combined check. `JustFinished` and `Idle` render the same
+/// menu text -- see [`render_status`] -- but a different title (`"100%"`
+/// lingering vs. cleared, see [`render_title`]); a single shared dedup keyed
+/// off the menu text would see "text unchanged" on that transition and skip
+/// the title update along with it, leaving `"100%"` stuck in the menu bar
+/// forever. Checking them independently means each of the two proxied calls
+/// below only ever fires when its own rendered output actually moved, and
+/// -- the idle steady state this module's doc comment calls out -- neither
+/// fires when nothing did.
 ///
 /// Every fallible step warns and continues rather than propagating: the
 /// caller is a 1Hz background ticker with no one to report an `Err` to, and
@@ -436,9 +599,9 @@ impl SpeedWindow {
 ///
 /// Not `pub`: [`spawn_status_ticker`], its only caller, lives right here in
 /// this module, and keeping it module-private is also what lets
-/// [`StatusNumbers`] itself stay private -- nothing outside `tray.rs` needs
-/// to name either.
-fn update_status<R: Runtime>(app: &AppHandle<R>, n: Option<StatusNumbers>) {
+/// [`TrayStatus`] itself stay private -- nothing outside `tray.rs` needs to
+/// name either.
+fn update_status<R: Runtime>(app: &AppHandle<R>, status: TrayStatus) {
     // `try_state`, not `state`: `spawn_status_ticker` (this function's only
     // caller) is only started after `build` succeeds in `lib.rs`, so
     // `TrayState` is expected to exist by the time any tick lands here. Still
@@ -447,40 +610,72 @@ fn update_status<R: Runtime>(app: &AppHandle<R>, n: Option<StatusNumbers>) {
     let Some(state) = app.try_state::<TrayState<R>>() else {
         return;
     };
-    *state.last.lock().unwrap() = n;
+    *state.last.lock().unwrap() = status;
 
     let texts = state.texts.lock().unwrap().clone();
-    let rendered = render_status(&texts, n);
-    {
+    let rendered = render_status(&texts, status);
+    let text_changed = {
         let mut last_rendered = state.last_rendered.lock().unwrap();
-        if *last_rendered == rendered {
-            return;
+        let changed = *last_rendered != rendered;
+        if changed {
+            *last_rendered = rendered.clone();
         }
-        *last_rendered = rendered.clone();
-    }
+        changed
+    };
 
-    // The `MutexGuard` must not still be held when `set_text` runs: it
-    // proxies to the main thread and blocks this task until that thread
-    // services it (see this module's doc comment). If the main thread is
-    // meanwhile inside `set_labels`, blocked acquiring this very lock (a
-    // locale switch races an in-flight tick), neither side can move --
-    // the main thread never gets back to its event loop to run the proxied
-    // closure, and this task never releases the lock the main thread wants.
-    // Cloning the handle (an `Arc` bump -- `MenuItem`'s `Clone` impl, the
-    // same thing `run_item_main_thread!` does internally before proxying)
-    // and letting the guard drop *before* the call sidesteps that cycle.
-    let item = state.status_item.lock().unwrap().clone();
-    if let Some(item) = item {
-        if let Err(err) = item.set_text(&rendered) {
-            tracing::warn!("updating tray status text failed: {err}");
+    if text_changed {
+        // The `MutexGuard` must not still be held when `set_text` runs: it
+        // proxies to the main thread and blocks this task until that thread
+        // services it (see this module's doc comment). If the main thread is
+        // meanwhile inside `set_labels`, blocked acquiring this very lock (a
+        // locale switch races an in-flight tick), neither side can move --
+        // the main thread never gets back to its event loop to run the
+        // proxied closure, and this task never releases the lock the main
+        // thread wants. Cloning the handle (an `Arc` bump -- `MenuItem`'s
+        // `Clone` impl, the same thing `run_item_main_thread!` does
+        // internally before proxying) and letting the guard drop *before*
+        // the call sidesteps that cycle.
+        let item = state.status_item.lock().unwrap().clone();
+        if let Some(item) = item {
+            if let Err(err) = item.set_text(&rendered) {
+                tracing::warn!("updating tray status text failed: {err}");
+            }
         }
     }
 
     #[cfg(target_os = "macos")]
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let title = n.map(|numbers| format!("{}%", numbers.pct));
-        if let Err(err) = tray.set_title(title) {
-            tracing::warn!("updating tray title failed: {err}");
+    {
+        let title = render_title(status);
+        let title_changed = {
+            let mut last_title = state.last_title.lock().unwrap();
+            let changed = *last_title != title;
+            if changed {
+                *last_title = title.clone();
+            }
+            changed
+        };
+
+        if title_changed {
+            if let Some(tray) = app.tray_by_id(TRAY_ID) {
+                // Must always pass `Some`, never `None`, even to clear the
+                // title down to nothing. tray-icon 0.24.1's
+                // `set_title_inner` (`platform_impl/macos/mod.rs:169-191` in
+                // that crate) is `if let Some(title) = title { ... }` with no
+                // `else` branch at all -- `set_title(None)` reaches the
+                // `NSStatusItem` and does *nothing*, silently returning as if
+                // it had succeeded, rather than clearing whatever title was
+                // already showing. tauri 2.11.5's `TrayIcon::set_title`
+                // forwards the `Option` straight through to that function
+                // unchanged. `Some("")` is the only way to actually clear a
+                // title: it takes the `Some` branch, calls
+                // `setTitle(@"")`, and (back in `set_title`, not
+                // `set_title_inner`) runs `update_dimensions()` afterwards
+                // either way, which is what shrinks the status item back
+                // down once there is no text left to make room for.
+                if let Err(err) = tray.set_title(Some(title.as_str())) {
+                    tracing::warn!("updating tray title failed: {err}");
+                }
+            }
         }
     }
 }
@@ -497,6 +692,16 @@ pub fn spawn_status_ticker<R: Runtime>(app: &AppHandle<R>) {
         // of catch-up polls once it gets scheduled again.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // `prev_completed` starts at `0`, not read from a first summary
+        // before the loop: `completed_count` is a process-lifetime counter
+        // that itself starts at `0` (see `EngineSummary::completed_count`),
+        // so seeding this at `0` too still correctly reports "no new
+        // completions" on the very first tick even if tasks somehow
+        // completed in the instant between engine startup and this task's
+        // first poll.
+        let mut prev_completed = 0u64;
+        let mut linger_until: Option<Instant> = None;
+
         loop {
             ticker.tick().await;
 
@@ -507,27 +712,19 @@ pub fn spawn_status_ticker<R: Runtime>(app: &AppHandle<R>) {
                 .summary()
                 .await;
 
-            window.push(Instant::now(), summary.all_transferred);
+            let now = Instant::now();
+            window.push(now, summary.all_transferred);
 
-            // `checked_div` folds the `active_total == 0` guard into the
-            // division itself; `min(100)` guards the `as u8` cast against
-            // the numerator ever nudging past the denominator (e.g. a
-            // `total` read one tick stale) -- not expected in practice, but
-            // a saturated percentage is a much cheaper mistake than a
-            // wrapped one.
-            let pct = summary
-                .active_transferred
-                .saturating_mul(100)
-                .checked_div(summary.active_total)
-                .unwrap_or(0)
-                .min(100) as u8;
+            let status = next_status(
+                &summary,
+                prev_completed,
+                &mut linger_until,
+                now,
+                window.bps(),
+            );
+            prev_completed = summary.completed_count;
 
-            let numbers = (summary.active_count > 0).then_some(StatusNumbers {
-                count: summary.active_count,
-                pct,
-                speed_bps: window.bps(),
-            });
-            update_status(&app, numbers);
+            update_status(&app, status);
         }
     });
 }
@@ -598,9 +795,23 @@ mod tests {
     // ---- render_status ----
 
     #[test]
-    fn render_status_is_the_idle_copy_verbatim_when_nothing_is_active() {
+    fn render_status_is_the_idle_copy_verbatim_when_idle() {
         let texts = TrayTexts::english_fallback();
-        assert_eq!(render_status(&texts, None), "No active transfers");
+        assert_eq!(
+            render_status(&texts, TrayStatus::Idle),
+            "No active transfers"
+        );
+    }
+
+    #[test]
+    fn render_status_is_also_the_idle_copy_when_just_finished() {
+        // JustFinished and Idle share menu copy -- only the title (see
+        // render_title below) tells them apart.
+        let texts = TrayTexts::english_fallback();
+        assert_eq!(
+            render_status(&texts, TrayStatus::JustFinished),
+            "No active transfers"
+        );
     }
 
     #[test]
@@ -612,9 +823,189 @@ mod tests {
             speed_bps: 12_595,
         };
         assert_eq!(
-            render_status(&texts, Some(numbers)),
+            render_status(&texts, TrayStatus::Active(numbers)),
             "3 transferring · 42% · 12.3 KB/s"
         );
+    }
+
+    #[test]
+    fn render_status_fills_in_the_paused_template() {
+        let texts = TrayTexts::english_fallback();
+        assert_eq!(
+            render_status(&texts, TrayStatus::Paused { count: 2, pct: 55 }),
+            "2 paused · 55%"
+        );
+    }
+
+    // ---- render_title ----
+
+    #[test]
+    fn render_title_maps_all_four_states() {
+        let numbers = StatusNumbers {
+            count: 3,
+            pct: 42,
+            speed_bps: 0,
+        };
+        assert_eq!(render_title(TrayStatus::Idle), "");
+        assert_eq!(render_title(TrayStatus::Active(numbers)), "42%");
+        assert_eq!(render_title(TrayStatus::JustFinished), "100%");
+        assert_eq!(
+            render_title(TrayStatus::Paused { count: 2, pct: 55 }),
+            "55%"
+        );
+    }
+
+    // ---- pct ----
+
+    #[test]
+    fn pct_is_zero_for_an_empty_total() {
+        assert_eq!(pct(0, 0), 0);
+        assert_eq!(pct(5, 0), 0);
+    }
+
+    #[test]
+    fn pct_saturates_at_100_when_transferred_exceeds_total() {
+        // A `total` read one tick stale can leave `transferred` briefly
+        // ahead of it; that must clamp, not wrap the `as u8` cast.
+        assert_eq!(pct(150, 100), 100);
+    }
+
+    #[test]
+    fn pct_divides_normally_within_range() {
+        assert_eq!(pct(50, 100), 50);
+    }
+
+    // ---- next_status ----
+
+    /// Builds a synthetic [`crate::transfer::EngineSummary`] with only the
+    /// fields a given test cares about spelled out at the call site; the
+    /// rest default to "nothing going on" so every test only has to name
+    /// what it is actually exercising.
+    fn summary(
+        active_count: usize,
+        active_transferred: u64,
+        active_total: u64,
+        completed_count: u64,
+        paused_count: usize,
+        paused_transferred: u64,
+        paused_total: u64,
+    ) -> crate::transfer::EngineSummary {
+        crate::transfer::EngineSummary {
+            active_count,
+            active_transferred,
+            active_total,
+            all_transferred: active_transferred + paused_transferred,
+            completed_count,
+            paused_count,
+            paused_transferred,
+            paused_total,
+        }
+    }
+
+    #[test]
+    fn next_status_lingers_on_just_finished_then_falls_back_to_idle() {
+        let t0 = Instant::now();
+        let mut linger_until = None;
+
+        // Active set just emptied out by completing: completed_count ticked
+        // up from the 0 `prev_completed` this test starts from.
+        let finished = summary(0, 0, 0, 1, 0, 0, 0);
+        let status = next_status(&finished, 0, &mut linger_until, t0, 0);
+        assert!(matches!(status, TrayStatus::JustFinished));
+        assert_eq!(linger_until, Some(t0 + FINISH_LINGER));
+
+        // Same summary, no further completions, polled right as the linger
+        // window closes: falls through to Idle (nothing paused).
+        let status = next_status(&finished, 1, &mut linger_until, t0 + FINISH_LINGER, 0);
+        assert!(matches!(status, TrayStatus::Idle));
+        assert_eq!(linger_until, None);
+    }
+
+    #[test]
+    fn next_status_falls_back_to_paused_when_the_linger_window_closes() {
+        let t0 = Instant::now();
+        let mut linger_until = None;
+
+        let finished_with_paused = summary(0, 0, 0, 1, 2, 40, 200);
+        let status = next_status(&finished_with_paused, 0, &mut linger_until, t0, 0);
+        assert!(matches!(status, TrayStatus::JustFinished));
+
+        let status = next_status(
+            &finished_with_paused,
+            1,
+            &mut linger_until,
+            t0 + FINISH_LINGER,
+            0,
+        );
+        match status {
+            TrayStatus::Paused { count, pct } => {
+                assert_eq!(count, 2);
+                assert_eq!(pct, 20);
+            }
+            _ => panic!("expected Paused"),
+        }
+    }
+
+    #[test]
+    fn next_status_is_idle_immediately_when_a_paused_set_clears_without_a_completion() {
+        // paused_count dropping to 0 (cancelled/removed, not completed)
+        // with completed_count unchanged: no linger window ever opens, so
+        // this reads as Idle on the very next tick, not JustFinished.
+        let t0 = Instant::now();
+        let mut linger_until = None;
+        let cleared = summary(0, 0, 0, 3, 0, 0, 0);
+        let status = next_status(&cleared, 3, &mut linger_until, t0, 0);
+        assert!(matches!(status, TrayStatus::Idle));
+        assert_eq!(linger_until, None);
+    }
+
+    #[test]
+    fn next_status_lets_a_new_active_task_interrupt_the_linger_window() {
+        let t0 = Instant::now();
+        // Mid-linger from some earlier completion.
+        let mut linger_until = Some(t0 + Duration::from_secs(1));
+
+        let active = summary(1, 30, 100, 5, 0, 0, 0);
+        let status = next_status(&active, 5, &mut linger_until, t0, 999);
+        match status {
+            TrayStatus::Active(numbers) => {
+                assert_eq!(numbers.count, 1);
+                assert_eq!(numbers.pct, 30);
+                assert_eq!(numbers.speed_bps, 999);
+            }
+            _ => panic!("expected Active"),
+        }
+        // The stale window must not survive to resurrect JustFinished once
+        // this task itself finishes.
+        assert_eq!(linger_until, None);
+    }
+
+    #[test]
+    fn next_status_ignores_a_completed_count_bump_while_still_active() {
+        // completed_count rising alongside active_count > 0 (one task
+        // finished while another is still running) must not open a linger
+        // window -- the active branch returns before that check ever runs.
+        let t0 = Instant::now();
+        let mut linger_until = None;
+        let still_active = summary(1, 10, 100, 1, 0, 0, 0);
+        let status = next_status(&still_active, 0, &mut linger_until, t0, 0);
+        assert!(matches!(status, TrayStatus::Active(_)));
+        assert_eq!(linger_until, None);
+    }
+
+    #[test]
+    fn next_status_reports_paused_with_its_own_percentage() {
+        let t0 = Instant::now();
+        let mut linger_until = None;
+        let paused_only = summary(0, 0, 0, 0, 3, 75, 100);
+        let status = next_status(&paused_only, 0, &mut linger_until, t0, 0);
+        match status {
+            TrayStatus::Paused { count, pct } => {
+                assert_eq!(count, 3);
+                assert_eq!(pct, 75);
+            }
+            _ => panic!("expected Paused"),
+        }
     }
 
     // ---- SpeedWindow ----

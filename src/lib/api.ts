@@ -704,6 +704,7 @@ export interface TrayLabels {
   check_update: string;
   status_idle: string;
   status_active: string;
+  status_paused: string;
 }
 
 /** Replaces the tray menu's labels -- including the status line's idle and

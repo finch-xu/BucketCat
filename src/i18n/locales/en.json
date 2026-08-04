@@ -9,7 +9,8 @@
     "settings": "Settings…",
     "checkUpdate": "Check for Updates…",
     "statusIdle": "No active transfers",
-    "statusActive": "{count} transferring · {pct}% · {speed}"
+    "statusActive": "{count} transferring · {pct}% · {speed}",
+    "statusPaused": "{count} paused · {pct}%"
   },
   "sidebar": {
     "connections": "Connections",

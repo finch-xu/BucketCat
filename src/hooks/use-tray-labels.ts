@@ -27,6 +27,7 @@ export function useTrayLabels() {
       check_update: t("tray.checkUpdate"),
       status_idle: t("tray.statusIdle"),
       status_active: t("tray.statusActive"),
+      status_paused: t("tray.statusPaused"),
     }).catch((err) => {
       console.error("Failed to localize the tray menu", err);
     });
