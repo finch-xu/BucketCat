@@ -20,7 +20,14 @@ import { setTrayLabels } from "@/lib/api";
 export function useTrayLabels() {
   const { t, i18n } = useTranslation();
   useEffect(() => {
-    setTrayLabels(t("tray.show"), t("tray.quit")).catch((err) => {
+    setTrayLabels({
+      show: t("tray.show"),
+      quit: t("tray.quit"),
+      settings: t("tray.settings"),
+      check_update: t("tray.checkUpdate"),
+      status_idle: t("tray.statusIdle"),
+      status_active: t("tray.statusActive"),
+    }).catch((err) => {
       console.error("Failed to localize the tray menu", err);
     });
   }, [t, i18n.language]);

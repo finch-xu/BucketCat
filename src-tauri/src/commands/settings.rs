@@ -398,15 +398,16 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> AppResult<()> {
     })
 }
 
-/// Replaces the tray menu's labels with localized ones.
+/// Replaces the tray menu's labels -- including the status line's idle and
+/// active copy -- with localized ones.
 ///
 /// The tray is built in `setup` with English fallbacks because the chosen
 /// locale lives only in the webview's `localStorage` (`bucketcat.locale`, see
 /// `src/i18n/index.ts`) and Rust cannot read it. The frontend calls this as
 /// soon as i18n has resolved, and again on every language switch.
 #[tauri::command]
-pub fn set_tray_labels(app: AppHandle, show: String, quit: String) -> AppResult<()> {
-    crate::tray::set_labels(&app, &show, &quit).map_err(|e| AppError::Internal {
+pub fn set_tray_labels(app: AppHandle, labels: crate::tray::TrayTexts) -> AppResult<()> {
+    crate::tray::set_labels(&app, labels).map_err(|e| AppError::Internal {
         message: format!("update tray menu: {e}"),
     })
 }

@@ -5,7 +5,11 @@
   },
   "tray": {
     "show": "Show BucketCat",
-    "quit": "Quit"
+    "quit": "Quit",
+    "settings": "Settings…",
+    "checkUpdate": "Check for Updates…",
+    "statusIdle": "No active transfers",
+    "statusActive": "{count} transferring · {pct}% · {speed}"
   },
   "sidebar": {
     "connections": "Connections",

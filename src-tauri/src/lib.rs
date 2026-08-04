@@ -217,9 +217,12 @@ pub fn run() {
             app.manage(engine);
 
             // Built before the window is shown: during a silent start the tray
-            // icon is the only evidence the app came up at all.
-            if let Err(err) = tray::build(app.handle()) {
-                tracing::error!("tray icon unavailable: {err}");
+            // icon is the only evidence the app came up at all. The status
+            // ticker is only worth starting once the tray (and the
+            // `TrayState` it manages) actually exists.
+            match tray::build(app.handle()) {
+                Ok(()) => tray::spawn_status_ticker(app.handle()),
+                Err(err) => tracing::error!("tray icon unavailable: {err}"),
             }
 
             // The window is created hidden (`"visible": false` in

@@ -5,7 +5,11 @@
   },
   "tray": {
     "show": "显示 BucketCat",
-    "quit": "退出"
+    "quit": "退出",
+    "settings": "设置…",
+    "checkUpdate": "检查更新…",
+    "statusIdle": "无传输任务",
+    "statusActive": "{count} 个任务传输中 · {pct}% · {speed}"
   },
   "sidebar": {
     "connections": "连接",

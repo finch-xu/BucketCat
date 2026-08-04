@@ -694,11 +694,41 @@ export function setAutostart(enabled: boolean): Promise<void> {
   return invokeCommand<void>("set_autostart", { enabled });
 }
 
-/** Replaces the tray menu's labels with localized ones. The tray is built in
- * Rust at startup with English fallbacks because the chosen locale lives only
- * in this webview's `localStorage`; see `src-tauri/src/tray.rs`. */
-export function setTrayLabels(show: string, quit: string): Promise<void> {
-  return invokeCommand<void>("set_tray_labels", { show, quit });
+/** Localized copy for every tray menu item and its status line. Mirrors
+ * `TrayTexts` in `src-tauri/src/tray.rs` -- field names match exactly,
+ * `snake_case` and all, since serde deserializes it with no `rename_all`. */
+export interface TrayLabels {
+  show: string;
+  quit: string;
+  settings: string;
+  check_update: string;
+  status_idle: string;
+  status_active: string;
+}
+
+/** Replaces the tray menu's labels -- including the status line's idle and
+ * active copy -- with localized ones. The tray is built in Rust at startup
+ * with English fallbacks because the chosen locale lives only in this
+ * webview's `localStorage`; see `src-tauri/src/tray.rs`. */
+export function setTrayLabels(labels: TrayLabels): Promise<void> {
+  return invokeCommand<void>("set_tray_labels", { labels });
+}
+
+/** Tauri event the tray's "Settings…" and "Check for Updates…" items emit,
+ * carrying an `OpenSettingsPayload`, so the frontend can bring Settings to
+ * the front already on the right pane. */
+export const OPEN_SETTINGS_EVENT = "app://open-settings";
+
+/** Tauri event the tray's clickable status line emits, so the frontend can
+ * bring the transfers list to the front. */
+export const OPEN_TRANSFERS_EVENT = "app://open-transfers";
+
+/** Payload of `OPEN_SETTINGS_EVENT`: which pane to land on (`null` for the
+ * general list) and whether to kick off an update check immediately. Mirrors
+ * the inline JSON `src-tauri/src/tray.rs`'s menu-event handler emits. */
+export interface OpenSettingsPayload {
+  pane: "update" | null;
+  auto_check: boolean;
 }
 
 /** Result of `cleanCheckpointResidue`: how many orphan checkpoints were
