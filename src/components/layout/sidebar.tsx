@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import logoIcon from "@/assets/logo-icon.png";
+import logoFlat from "@/assets/logo-flat.png";
 import { ProviderChip } from "@/components/icons/provider-chip";
 import { BucketInfoDialog } from "@/components/modals/bucket-info-dialog";
 import { cn } from "@/lib/utils";
@@ -328,20 +328,21 @@ export function Sidebar() {
       <div
         data-tauri-drag-region
         className={cn(
-          "flex shrink-0 items-center gap-2.5 px-3.5",
+          "flex shrink-0 items-center gap-2.5 px-4",
           isMac ? "h-20 pt-7" : "h-[52px]",
         )}
       >
-        <img
-          src={logoIcon}
-          alt="BucketCat"
-          className="pointer-events-none size-[30px] rounded-lg shadow-[0_0_0_1px_var(--border)]"
-        />
-        <span className="pointer-events-none text-[15.5px] font-bold tracking-[0.1px]">
+        {/* The background-free artwork, not the app icon: that one's drawing
+          * covers only ~64% of its canvas, so it read as small at any size
+          * that fits this strip. Carrying no rounding or hairline border
+          * either -- both only ever framed the icon's white squircle, and
+          * around a free-standing drawing they would frame empty space. */}
+        <img src={logoFlat} alt="BucketCat" className="pointer-events-none size-[34px]" />
+        <span className="pointer-events-none text-[16.5px] font-bold tracking-[0.1px]">
           {t("app.name")}
         </span>
       </div>
-      <div className="flex items-center justify-between px-3.5 pt-[9px] pb-2">
+      <div className="flex items-center justify-between px-4 pt-[9px] pb-2">
         <span className="text-[11px] font-semibold tracking-[0.7px] text-muted-foreground uppercase">
           {t("sidebar.connections")}
         </span>
@@ -405,7 +406,7 @@ export function Sidebar() {
         <button
           type="button"
           onClick={openSettings}
-          className="flex flex-1 cursor-pointer items-center gap-[9px] rounded-[9px] px-2.5 py-2 text-[13px] text-fg2 hover:bg-hover"
+          className="flex flex-1 cursor-pointer items-center gap-[9px] rounded-[9px] px-2 py-2 text-[13px] text-fg2 hover:bg-hover"
         >
           <Settings className="size-4" />
           {t("sidebar.settings")}

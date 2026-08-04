@@ -58,16 +58,25 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip("BucketCat")
-        // The app icon is full-color artwork. Left as a non-template image so
-        // macOS renders it as-is; as a template it would be flattened to a
-        // black silhouette and the bucket-and-cats would be unreadable at
-        // menu-bar size.
+        // Full-color artwork. Left as a non-template image so macOS renders it
+        // as-is; as a template it would be flattened to a black silhouette and
+        // the bucket-and-cats would be unreadable at menu-bar size.
         .icon_as_template(false)
         .on_menu_event(on_menu_event);
 
-    if let Some(icon) = app.default_window_icon().cloned() {
-        builder = builder.icon(icon);
-    }
+    // A dedicated icon rather than `default_window_icon()`: that one is macOS
+    // app-icon artwork -- a white squircle whose bucket-and-cats cover only
+    // ~64% of the canvas -- so the drawing came out tiny once the system
+    // scaled the whole square down to menu-bar height. This is the same
+    // artwork with the squircle floodfilled away and cropped flush, bringing
+    // the drawing to ~91%.
+    //
+    // `include_image!` decodes at compile time and embeds raw RGBA, which is
+    // why it needs no `image-png` feature (and adds no lock entries) but makes
+    // the icon's dimensions a direct binary cost. 64x64 is the deliberate
+    // ceiling: it downsamples to a Retina menu bar (44px) and a 200%-DPI
+    // notification area (32px) without ever upscaling, for 16KB.
+    builder = builder.icon(tauri::include_image!("./icons/tray.png"));
 
     // Platform conventions differ and neither is a matter of taste: on macOS a
     // menu-bar extra opens its menu on a plain left click, while on Windows a
