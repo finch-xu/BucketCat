@@ -196,6 +196,12 @@ pub struct TrayState<R: Runtime> {
     /// independently of `last_rendered` -- see [`update_status`] for why the
     /// two need separate tracking. Starts `""`, matching the untitled tray
     /// [`build`] creates (no `set_title` call has ever run yet).
+    ///
+    /// Only read inside `update_status`'s `#[cfg(target_os = "macos")]`
+    /// block -- Windows/Linux trays have no `set_title` to dedupe against --
+    /// so a non-macOS build never reads it and would otherwise warn "field
+    /// is never read".
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     last_title: Mutex<String>,
 }
 
@@ -431,6 +437,12 @@ fn render_status(texts: &TrayTexts, status: TrayStatus) -> String {
 /// then, so it is spelled out rather than carried over), and an empty string
 /// for `Idle` -- see [`update_status`] for why an empty string, not `None`,
 /// is what actually clears the title.
+///
+/// Only called from `update_status`'s `#[cfg(target_os = "macos")]` branch
+/// (and from tests, which compile on every platform) -- Windows/Linux trays
+/// have no `set_title` equivalent -- so a non-macOS build never calls it
+/// outside `cfg(test)` and would otherwise warn `dead_code`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn render_title(status: TrayStatus) -> String {
     match status {
         TrayStatus::Idle => String::new(),
@@ -695,10 +707,12 @@ pub fn spawn_status_ticker<R: Runtime>(app: &AppHandle<R>) {
         // `prev_completed` starts at `0`, not read from a first summary
         // before the loop: `completed_count` is a process-lifetime counter
         // that itself starts at `0` (see `EngineSummary::completed_count`),
-        // so seeding this at `0` too still correctly reports "no new
-        // completions" on the very first tick even if tasks somehow
+        // so seeding this at `0` too still correctly reports tasks that
         // completed in the instant between engine startup and this task's
-        // first poll.
+        // first poll -- the first tick's `completed_count > prev_completed`
+        // check still trips, and surfacing that as `JustFinished` rather
+        // than silently swallowing it is the right call: those tasks really
+        // did just finish, from the user's point of view.
         let mut prev_completed = 0u64;
         let mut linger_until: Option<Instant> = None;
 

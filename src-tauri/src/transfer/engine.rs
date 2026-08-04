@@ -1225,8 +1225,9 @@ impl TransferEngine {
         out
     }
 
-    /// The tray status line's data source: one lock, one pass, four numbers.
-    /// See [`EngineSummary`] for what each field means and why it exists.
+    /// The tray status line's data source: one lock, one pass over the task
+    /// table, filling in every [`EngineSummary`] field. See that type for
+    /// what each field means and why it exists.
     pub async fn summary(&self) -> EngineSummary {
         let tasks = self.inner.tasks.lock().await;
         let mut summary = EngineSummary {
