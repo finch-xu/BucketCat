@@ -1,6 +1,6 @@
 [package]
 name = "bucketcat"
-version = "0.4.0"
+version = "0.6.0"
 description = "BucketCat — a small and beautiful object storage manager"
 authors = ["虚拟世界的懒猫"]
 license = "Apache-2.0"
