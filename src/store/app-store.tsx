@@ -18,6 +18,13 @@ import {
 
 export type ViewMode = "list" | "grid";
 
+/** Which category the settings modal is showing. Mirrors the `CategoryId`
+ * union `src/components/modals/settings/index.tsx` used to own locally --
+ * lifted up here so the tray's "Settings…"/"Check for Updates…" items can
+ * land the modal on a specific pane from outside the modal's own tree (see
+ * `TrayEventBridge`). */
+export type SettingsPane = "general" | "transfers" | "advanced" | "update" | "about";
+
 /** How a row click modifies the selection: plain click replaces it,
  * cmd/ctrl-click toggles, shift-click extends a range from the anchor. */
 export type SelectMode = "single" | "toggle" | "range";
@@ -103,7 +110,13 @@ interface AppStore {
   closeDeleteConnection: () => void;
 
   showSettings: boolean;
-  openSettings: () => void;
+  settingsPane: SettingsPane;
+  /** Opens the settings modal, landing it on `pane` (default "general").
+   * Sets the pane on *every* call, including while the modal is already
+   * open -- that's what lets the tray's "Check for Updates…" item retarget
+   * an already-open modal onto the update pane. */
+  openSettings: (pane?: SettingsPane) => void;
+  setSettingsPane: (pane: SettingsPane) => void;
   closeSettings: () => void;
 
   transferSettings: TransferSettings;
@@ -136,6 +149,7 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
   const [editingConnection, setEditingConnection] = useState<ConnectionDto | null>(null);
   const [deletingConnection, setDeletingConnection] = useState<ConnectionDto | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsPane, setSettingsPaneState] = useState<SettingsPane>("general");
 
   const [transferSettings, setTransferSettingsState] = useState<TransferSettings>({
     concurrency: 4,
@@ -271,7 +285,12 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
     openDeleteConnection: (conn) => setDeletingConnection(conn),
     closeDeleteConnection: () => setDeletingConnection(null),
     showSettings,
-    openSettings: () => setShowSettings(true),
+    settingsPane,
+    openSettings: (pane = "general") => {
+      setSettingsPaneState(pane);
+      setShowSettings(true);
+    },
+    setSettingsPane: (pane) => setSettingsPaneState(pane),
     closeSettings: () => setShowSettings(false),
     transferSettings,
     setTransferSettings: (patch) => setTransferSettingsState((s) => ({ ...s, ...patch })),

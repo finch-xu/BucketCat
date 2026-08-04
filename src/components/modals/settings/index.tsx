@@ -1,9 +1,8 @@
 import { ArrowUpDown, Info, RefreshCw, Settings2, Wrench, X, type LucideIcon } from "lucide-react";
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
-import { useApp } from "@/store/app-store";
+import { useApp, type SettingsPane } from "@/store/app-store";
 import { useUpdater } from "@/store/updater-store";
 import { AboutPane } from "./about-pane";
 import { AdvancedPane } from "./advanced-pane";
@@ -12,10 +11,8 @@ import { SectionTitle } from "./shared";
 import { TransfersPane } from "./transfers-pane";
 import { UpdatePane } from "./update-pane";
 
-type CategoryId = "general" | "transfers" | "advanced" | "update" | "about";
-
 const CATEGORIES: {
-  id: CategoryId;
+  id: SettingsPane;
   icon: LucideIcon;
   navKey: string;
   titleKey: string;
@@ -36,22 +33,24 @@ export function SettingsModal() {
   const { showSettings } = useApp();
   // `SettingsModal` is rendered unconditionally by `app-shell.tsx`, so this
   // guard must sit in the outermost component: it's the only way to make
-  // `SettingsContent` -- and the `active` state it owns -- actually unmount
-  // when the modal closes, rather than merely rendering null while staying
-  // resident. See the comment on `active` below for why that matters.
+  // `SettingsContent` -- and the panes' own local state (pending flags,
+  // fetched values) -- actually unmount when the modal closes, rather than
+  // merely rendering null while staying resident. The active pane itself no
+  // longer depends on this; it lives in the app store (see below).
   if (!showSettings) return null;
   return <SettingsContent />;
 }
 
 function SettingsContent() {
   const { t } = useTranslation();
-  const { closeSettings } = useApp();
+  const { closeSettings, settingsPane: active, setSettingsPane: setActive } = useApp();
   const { hasUpdate } = useUpdater();
-  // Pane-local view state, deliberately not in the app store: reopening the
-  // modal back on "General" is the intuitive default. It stays that way
-  // because this component unmounts on close (see `SettingsModal` above),
-  // so there is nothing to persist.
-  const [active, setActive] = useState<CategoryId>("general");
+  // Pane state lives in the app store, not a local `useState`, even though
+  // this component remounts fresh every time the modal opens (see
+  // `SettingsModal` above) and so never needs to *persist* it: the tray's
+  // "Check for Updates…" item needs to retarget the pane from outside this
+  // subtree, including while the modal is already open, and only the store
+  // is reachable from there.
 
   return (
     <Modal

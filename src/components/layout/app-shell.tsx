@@ -9,6 +9,7 @@ import { PathBar } from "./path-bar";
 import { Sidebar } from "./sidebar";
 import { Toolbar } from "./toolbar";
 import { TransferBar } from "./transfer-bar";
+import { TrayEventBridge } from "./tray-event-bridge";
 
 export function AppShell() {
   useTrayLabels();
@@ -34,6 +35,7 @@ export function AppShell() {
         <ConnectionModals />
         <ObjectDialogs />
         <SettingsModal />
+        <TrayEventBridge />
       </div>
     </AppStoreProvider>
   );
