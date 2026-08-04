@@ -526,6 +526,13 @@ struct EngineInner {
     /// it (M4c Task 6/9) turns checkpoint writing on or off without rebuilding
     /// the engine.
     resume_enabled: Arc<AtomicBool>,
+    /// Process-lifetime count of tasks that have reached [`TransferStatus::Completed`].
+    /// Monotonic on purpose: `clear_finished` reaps terminal rows (and the
+    /// `Completed`-transition bookkeeping in [`EngineInner::drive`] can run
+    /// before a row is ever swept), so a table scan for `Completed` rows would
+    /// undercount or miss tasks the tray still needs to know finished. See
+    /// [`EngineSummary::completed_count`].
+    completed_tasks: AtomicU64,
 }
 
 impl EngineInner {
@@ -772,7 +779,16 @@ impl EngineInner {
                         .store(record.dto.total, Ordering::Relaxed);
                 }
                 self.forget_progress(&task_id);
-                self.apply(&task_id, TransferCommand::Complete, None).await;
+                // `apply` only mutates -- and returns `true` -- when
+                // `next_status` actually allows `Running -> Completed` (the
+                // row exists and isn't already terminal from a race with
+                // `cancel`/a second driver). Gating the counter on that
+                // return value, rather than incrementing unconditionally, is
+                // what keeps `completed_tasks` counting real transitions
+                // one-for-one instead of every call to this arm.
+                if self.apply(&task_id, TransferCommand::Complete, None).await {
+                    self.completed_tasks.fetch_add(1, Ordering::Relaxed);
+                }
                 // Terminal: the object is on the server (or on disk), so the
                 // checkpoint has nothing left to resume. Paused/Failed keep
                 // theirs; only Completed and Canceled reap it.
@@ -950,6 +966,24 @@ pub struct EngineSummary {
     /// summaries into a speed without the number jumping backwards the
     /// instant a task leaves the active set (e.g. completes) mid-interval.
     pub all_transferred: u64,
+    /// Process-lifetime count of tasks that reached [`TransferStatus::Completed`],
+    /// read straight off [`EngineInner::completed_tasks`]. This is a
+    /// monotonic counter rather than a table scan for `Completed` rows
+    /// because completed rows do not stay in the table: `clear_finished`
+    /// reaps every terminal row, so by the time the tray polls, the task
+    /// that just finished may already be gone. The counter is the only
+    /// record left that it ever happened.
+    pub completed_count: u64,
+    /// Tasks whose status is [`TransferStatus::Paused`], counted in the same
+    /// pass as `active_count` above.
+    pub paused_count: usize,
+    /// Sum of `transferred` across the paused tasks above, read off each
+    /// task's atomic counter -- the same live-not-`dto` source
+    /// `active_transferred` uses, so a paused task's frozen progress is
+    /// exact even between `state_changed` broadcasts.
+    pub paused_transferred: u64,
+    /// Sum of `total` across the paused tasks above.
+    pub paused_total: u64,
 }
 
 /// The transfer engine. Cheap to clone conceptually (everything is behind one
@@ -980,6 +1014,7 @@ impl TransferEngine {
                 seq: AtomicU64::new(0),
                 checkpoint_dir,
                 resume_enabled,
+                completed_tasks: AtomicU64::new(0),
             }),
         }
     }
@@ -1199,6 +1234,10 @@ impl TransferEngine {
             active_transferred: 0,
             active_total: 0,
             all_transferred: 0,
+            completed_count: self.inner.completed_tasks.load(Ordering::Relaxed),
+            paused_count: 0,
+            paused_transferred: 0,
+            paused_total: 0,
         };
         for record in tasks.values() {
             let transferred = record.transferred.load(Ordering::Relaxed);
@@ -1207,6 +1246,10 @@ impl TransferEngine {
                 summary.active_count += 1;
                 summary.active_transferred += transferred;
                 summary.active_total += record.dto.total;
+            } else if record.dto.status == TransferStatus::Paused {
+                summary.paused_count += 1;
+                summary.paused_transferred += transferred;
+                summary.paused_total += record.dto.total;
             }
         }
         summary
@@ -2325,6 +2368,27 @@ mod tests {
         )
         .await;
         h.runner.finish.store(false, Ordering::SeqCst);
+        h.runner.report_bytes.store(300, Ordering::SeqCst);
+        let paused = h
+            .engine
+            .enqueue(EnqueueSpec {
+                total: 900,
+                ..spec("paused")
+            })
+            .await
+            .unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 3,
+            "task paused starts",
+        )
+        .await;
+        h.engine.pause(&paused.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&paused.id).last() == Some(&TransferStatus::Paused),
+            "task paused reaches Paused",
+        )
+        .await;
+
         h.runner.report_bytes.store(500, Ordering::SeqCst);
         let running = h
             .engine
@@ -2335,7 +2399,7 @@ mod tests {
             .await
             .unwrap();
         eventually(
-            || h.runner.started.load(Ordering::SeqCst) == 3,
+            || h.runner.started.load(Ordering::SeqCst) == 4,
             "task running starts",
         )
         .await;
@@ -2354,7 +2418,7 @@ mod tests {
         let summary = h.engine.summary().await;
         assert_eq!(
             summary.active_count, 2,
-            "only running + queued are active; done and failed are terminal"
+            "only running + queued are active; done, failed, paused are not"
         );
         assert_eq!(
             summary.active_transferred, 500,
@@ -2366,9 +2430,22 @@ mod tests {
             "active_total sums only the active tasks' totals"
         );
         assert_eq!(
-            summary.all_transferred, 1700,
-            "all_transferred = done(1000) + failed(200) + running(500) + queued(0), \
-             regardless of status"
+            summary.all_transferred, 2000,
+            "all_transferred = done(1000) + failed(200) + paused(300) + running(500) + \
+             queued(0), regardless of status"
+        );
+        assert_eq!(summary.completed_count, 1, "only \"done\" ever completed");
+        assert_eq!(
+            summary.paused_count, 1,
+            "only \"paused\" sits in the Paused bucket"
+        );
+        assert_eq!(
+            summary.paused_transferred, 300,
+            "paused_transferred reads \"paused\"'s live atomic, not a stale dto"
+        );
+        assert_eq!(
+            summary.paused_total, paused.total,
+            "paused_total sums only the paused tasks' totals"
         );
     }
 
@@ -2475,6 +2552,68 @@ mod tests {
             kept, expected,
             "clear_finished may drop only terminal tasks; Paused and Failed are still resumable \
              or retryable, so sweeping them would destroy actionable work"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_count_survives_clear_finished() {
+        // `completed_count` exists precisely because `Completed` rows do not:
+        // `clear_finished` reaps them. So the counter has to be read *before*
+        // the row is gone (it isn't -- it's a separate atomic, not derived
+        // from the table) and it must not reset or drop when the row does.
+        // A Paused task rides along to prove the sweep -- which does touch
+        // the table -- leaves the other summary buckets alone too.
+        let h = harness(2);
+
+        let done = h.engine.enqueue(spec("a")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task a starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&done.id).last() == Some(&TransferStatus::Completed),
+            "task a reaches Completed",
+        )
+        .await;
+        h.runner.finish.store(false, Ordering::SeqCst);
+
+        let paused = h.engine.enqueue(spec("b")).await.unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "task b starts",
+        )
+        .await;
+        h.engine.pause(&paused.id).await.unwrap();
+        eventually(
+            || h.sink.statuses_of(&paused.id).last() == Some(&TransferStatus::Paused),
+            "task b reaches Paused",
+        )
+        .await;
+
+        let before = h.engine.summary().await;
+        assert_eq!(
+            before.completed_count, 1,
+            "the one task that ran to completion is counted exactly once"
+        );
+        assert_eq!(before.paused_count, 1, "the paused task is in the bucket");
+
+        h.engine.clear_finished().await;
+
+        let after = h.engine.summary().await;
+        assert_eq!(
+            after.completed_count, 1,
+            "clear_finished reaps the Completed row, but the monotonic counter \
+             that already recorded it must not move"
+        );
+        assert_eq!(
+            after.paused_count, 1,
+            "clear_finished must not touch the still-actionable Paused row either"
+        );
+        assert_eq!(
+            after.active_count, 0,
+            "no active tasks were ever enqueued in this test"
         );
     }
 
