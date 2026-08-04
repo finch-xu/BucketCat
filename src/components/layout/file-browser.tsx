@@ -9,6 +9,7 @@ import {
 } from "react";
 import {
   AlertTriangle,
+  CornerLeftUp,
   Download,
   FolderDown,
   FolderOpen,
@@ -23,7 +24,7 @@ import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import logoIcon from "@/assets/logo-icon.png";
 import { cn } from "@/lib/utils";
 import type { ObjectEntry } from "@/lib/api";
-import { basename } from "@/lib/entries";
+import { basename, PARENT_ENTRY, withParentRow } from "@/lib/entries";
 import { fileMeta } from "@/lib/file-meta";
 import { extFromName, formatDate, formatSize } from "@/lib/format";
 import { useBrowse, type BrowseQuery } from "@/hooks/use-browse";
@@ -75,22 +76,34 @@ function CenterState({
 }
 
 function useEntryHandlers(orderedFileKeys: string[]) {
-  const { selectKey, clearSelection, openFolder } = useApp();
-  return (entry: ObjectEntry) => ({
-    onClick: (e: React.MouseEvent) => {
-      if (entry.is_prefix) {
-        clearSelection();
-      } else {
-        selectKey(entry.key, selectModeFromEvent(e), orderedFileKeys);
-      }
-    },
-    onDoubleClick: () => {
-      // Navigate by the entry's key, not its display name -- see the doc
-      // comment on `openFolder` in the store for why this matters whenever
-      // the current listing was reached via a search term.
-      if (entry.is_prefix) openFolder(entry.key);
-    },
-  });
+  const { selectKey, clearSelection, openFolder, gotoCrumb, path } = useApp();
+  return (entry: ObjectEntry) => {
+    // The ".." row: same double-click-to-navigate affordance as a real
+    // folder, deliberately no single-click navigation either -- clicking it
+    // only clears the selection, same as any other folder row. Checked by
+    // reference, never by key: the sentinel key exists for React only.
+    if (entry === PARENT_ENTRY) {
+      return {
+        onClick: () => clearSelection(),
+        onDoubleClick: () => gotoCrumb(path.length - 2),
+      };
+    }
+    return {
+      onClick: (e: React.MouseEvent) => {
+        if (entry.is_prefix) {
+          clearSelection();
+        } else {
+          selectKey(entry.key, selectModeFromEvent(e), orderedFileKeys);
+        }
+      },
+      onDoubleClick: () => {
+        // Navigate by the entry's key, not its display name -- see the doc
+        // comment on `openFolder` in the store for why this matters whenever
+        // the current listing was reached via a search term.
+        if (entry.is_prefix) openFolder(entry.key);
+      },
+    };
+  };
 }
 
 /** Per-row hover actions, revealed on hover and kept keyboard-reachable via
@@ -327,14 +340,19 @@ function ListView({
       <div className="relative" style={{ height: rowVirtualizer.getTotalSize() }}>
         {virtualItems.map((vi) => {
           const entry = entries[vi.index];
+          const isParent = entry === PARENT_ENTRY;
           const ext = entry.is_prefix ? "" : extFromName(entry.name);
-          const meta = fileMeta(entry.is_prefix ? "folder" : "file", ext);
-          const Icon = meta.icon;
+          // The parent row has no file-type meaning, so it deliberately
+          // never goes through `fileMeta` -- it gets its own icon below and
+          // the type column shows "—" instead of a `meta.labelKey`.
+          const meta = isParent ? null : fileMeta(entry.is_prefix ? "folder" : "file", ext);
+          const Icon = isParent ? CornerLeftUp : meta!.icon;
           const selected = selectedKeys.includes(entry.key);
           return (
             <div
               key={entry.key}
               {...handlers(entry)}
+              title={isParent ? t("main.goToParent") : undefined}
               className={cn(
                 "group absolute inset-x-0 flex cursor-pointer items-center border-b border-border2 px-4",
                 selected ? "bg-active" : "hover:bg-hover",
@@ -345,7 +363,10 @@ function ListView({
                * which already makes it the containing block for this. */}
               {selected && <span className="absolute inset-y-0 left-0 w-[2px] bg-primary" />}
               <span className="flex min-w-0 flex-1 items-center gap-[11px]">
-                <Icon className="size-[18px] shrink-0" style={{ color: meta.color }} />
+                <Icon
+                  className="size-[18px] shrink-0"
+                  style={isParent ? undefined : { color: meta!.color }}
+                />
                 <span
                   className={cn(
                     "truncate text-[13.5px] text-foreground",
@@ -359,17 +380,21 @@ function ListView({
                 {entry.is_prefix ? "—" : formatSize(entry.size)}
               </span>
               <span className="w-[120px] truncate pl-5 text-[12.5px] text-muted-foreground">
-                {t(meta.labelKey)}
+                {isParent ? "—" : t(meta!.labelKey)}
               </span>
               <span className="w-[150px] pl-5 text-[12.5px] text-muted-foreground tabular-nums">
                 {entry.is_prefix ? "—" : formatDate(entry.last_modified)}
               </span>
-              <RowActions
-                entry={entry}
-                selected={selected}
-                onDownloadFile={onDownloadFile}
-                onDownloadFolder={onDownloadFolder}
-              />
+              {isParent ? (
+                <span className="w-[92px] shrink-0" />
+              ) : (
+                <RowActions
+                  entry={entry}
+                  selected={selected}
+                  onDownloadFile={onDownloadFile}
+                  onDownloadFolder={onDownloadFolder}
+                />
+              )}
             </div>
           );
         })}
@@ -401,21 +426,26 @@ function GridView({
     <div className="min-w-0 flex-1 overflow-y-auto">
       <div className="grid grid-cols-[repeat(auto-fill,minmax(148px,1fr))] gap-3.5 p-[18px]">
         {entries.map((entry) => {
+          const isParent = entry === PARENT_ENTRY;
           const ext = entry.is_prefix ? "" : extFromName(entry.name);
-          const meta = fileMeta(entry.is_prefix ? "folder" : "file", ext);
-          const Icon = meta.icon;
+          const meta = isParent ? null : fileMeta(entry.is_prefix ? "folder" : "file", ext);
+          const Icon = isParent ? CornerLeftUp : meta!.icon;
           const selected = selectedKeys.includes(entry.key);
           return (
             <div
               key={entry.key}
               {...handlers(entry)}
+              title={isParent ? t("main.goToParent") : undefined}
               className={cn(
                 "flex cursor-pointer flex-col items-center gap-[11px] rounded-[13px] border px-3 pt-[18px] pb-3.5 hover:border-primary",
                 selected ? "border-primary bg-active" : "border-border bg-background",
               )}
             >
               <span className="flex size-[58px] items-center justify-center rounded-[13px] bg-panel">
-                <Icon className="size-[30px]" style={{ color: meta.color }} />
+                <Icon
+                  className="size-[30px]"
+                  style={isParent ? undefined : { color: meta!.color }}
+                />
               </span>
               <span className="max-w-full truncate text-center text-[12.5px] font-medium text-foreground">
                 {entry.name}
@@ -492,6 +522,21 @@ export function FileBrowser() {
   const errorText = useErrorText();
   const { activeBucket, path, view } = useApp();
   const { query, entries, searching } = useBrowse();
+
+  // ".." only makes sense once inside a folder (the bucket root has no
+  // parent to go to) and never while searching (a search listing's rows can
+  // live under different parents, so a single "up" target isn't well
+  // defined -- see `listPrefix`). `rows` is what actually reaches the row
+  // grid; every other consumer below (the empty-state check, ordered file
+  // keys for range-select, `SelectionBar`) deliberately keeps using the raw
+  // `entries`, since none of them should ever see the synthetic row. One
+  // consequence: an EMPTY folder still falls into the `entries.length === 0`
+  // branch and shows the empty-state message rather than a lone ".." row --
+  // the breadcrumb bar already covers "go back" there, so this is a
+  // deliberate simplification, not an oversight.
+  const showParent = path.length > 0 && !searching;
+  const rows = useMemo(() => withParentRow(entries, showParent), [entries, showParent]);
+
   const { startUploads, guardReady, dialog } = useStartUploads();
   const { startFileDownload, startFolderDownload, startBatchDownload, dialog: downloadDialog } =
     useStartDownloads();
@@ -586,14 +631,14 @@ export function FileBrowser() {
       <>
         {view === "list" ? (
           <ListView
-            entries={entries}
+            entries={rows}
             query={query}
             orderedFileKeys={orderedFileKeys}
             onDownloadFile={startFileDownload}
             onDownloadFolder={startFolderDownload}
           />
         ) : (
-          <GridView entries={entries} query={query} orderedFileKeys={orderedFileKeys} />
+          <GridView entries={rows} query={query} orderedFileKeys={orderedFileKeys} />
         )}
         <SelectionBar entries={entries} onDownload={startBatchDownload} />
       </>

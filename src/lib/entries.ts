@@ -15,6 +15,48 @@ export function sortEntries(entries: ObjectEntry[]): ObjectEntry[] {
   });
 }
 
+/** Synthetic ".." row `FileBrowser` prepends to a folder listing so the row
+ * grid itself offers a way up, not just the breadcrumb bar. Its `key` opens
+ * with a NUL byte (written in source as the escape `"\u0000.."`), which can
+ * never appear in a real S3 XML ListObjectsV2 response, so it can never
+ * collide with an actual object or prefix key -- but that string is a
+ * courtesy to React's `key` prop only.
+ * Every BEHAVIORAL check against this row (is this the parent row? should a
+ * click navigate instead of select?) must use referential equality,
+ * `entry === PARENT_ENTRY`, never a key comparison. Deliberately still
+ * shaped as a plain `ObjectEntry` rather than a new union member: carrying a
+ * second entry type through every consumer of a listing (sort, selection,
+ * the rename/upload collision guards) for the sake of one render-layer row
+ * isn't worth the signature churn. */
+export const PARENT_ENTRY: ObjectEntry = {
+  key: "\u0000..",
+  name: "..",
+  size: null,
+  last_modified: null,
+  storage_class: null,
+  is_prefix: true,
+};
+
+/** Prepends `PARENT_ENTRY` to `entries` when `show` is true; returns
+ * `entries` unchanged otherwise. Never mutates the input.
+ *
+ * Deliberately an explicit unshift, not something `sortEntries` could be
+ * taught to do: `sortEntries`'s folders-first + `localeCompare` ordering
+ * would NOT put ".." first -- `".."` sorts after names like `"_x"` in
+ * locale order, so relying on sort would occasionally bury the parent row
+ * mid-list instead of pinning it to the top.
+ *
+ * Deliberately called only from the render layer (`FileBrowser`), never
+ * from `sortEntries` or `useObjects` itself: `object-dialogs.tsx` and
+ * `use-start-uploads.ts` flatten a listing straight into their
+ * rename/new-folder/upload collision guards, and those guards must see only
+ * real keys -- injecting the sentinel any earlier than the row-rendering
+ * step would leak a fake entry into a safety check it was never meant to
+ * see. */
+export function withParentRow(entries: ObjectEntry[], show: boolean): ObjectEntry[] {
+  return show ? [PARENT_ENTRY, ...entries] : entries;
+}
+
 /** `["docs","2026"]` → `"docs/2026/"`; `[]` → `""` (bucket root). */
 export function pathToPrefix(path: string[]): string {
   return path.map((segment) => `${segment}/`).join("");

@@ -43,6 +43,7 @@
     "colSize": "大小",
     "colType": "类型",
     "colModified": "修改时间",
+    "goToParent": "返回上一级",
     "breadcrumbPlaceholder": "选择左侧的一个存储桶开始",
     "breadcrumbMore": "展开中间层级"
   },

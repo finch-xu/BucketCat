@@ -7,12 +7,14 @@ import {
   listPrefix,
   listingGuard,
   nameCollides,
+  PARENT_ENTRY,
   parentPrefix,
   pathToPrefix,
   renameKey,
   sortEntries,
   uploadBaseName,
   uploadKey,
+  withParentRow,
 } from "./entries";
 import type { ObjectEntry } from "./api";
 
@@ -40,6 +42,40 @@ describe("sortEntries", () => {
     const input = [e("b", false), e("a", false)];
     sortEntries(input);
     expect(input.map((x) => x.name)).toEqual(["b", "a"]);
+  });
+});
+
+describe("PARENT_ENTRY", () => {
+  it("is a folder row, so orderedFileKeys' !is_prefix filter excludes it", () => {
+    expect(PARENT_ENTRY.is_prefix).toBe(true);
+  });
+
+  it("carries the NUL sentinel key, so it can never collide with a real S3 key", () => {
+    expect(PARENT_ENTRY.key.startsWith("\u0000")).toBe(true);
+  });
+});
+
+describe("withParentRow", () => {
+  it("unshifts PARENT_ENTRY by reference and does not mutate the input", () => {
+    const input = [e("a.txt", false), e("photos", true)];
+    const result = withParentRow(input, true);
+    expect(result[0]).toBe(PARENT_ENTRY);
+    expect(result.slice(1)).toEqual(input);
+    expect(input).toEqual([e("a.txt", false), e("photos", true)]);
+  });
+
+  it("returns the entries unchanged when show is false", () => {
+    const input = [e("a.txt", false), e("photos", true)];
+    expect(withParentRow(input, false)).toEqual(input);
+  });
+
+  it("puts .. first even ahead of an entry that would sort before it (explicit unshift, not sort)", () => {
+    // "_x" sorts BEFORE ".." under localeCompare -- relying on sortEntries
+    // to place the sentinel would bury it here instead of pinning it to the
+    // top, which is exactly the trap withParentRow's unshift avoids.
+    const input = [e("_x", true)];
+    const result = withParentRow(input, true);
+    expect(result[0]).toBe(PARENT_ENTRY);
   });
 });
 

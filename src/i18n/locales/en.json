@@ -43,6 +43,7 @@
     "colSize": "Size",
     "colType": "Type",
     "colModified": "Modified",
+    "goToParent": "Go to parent folder",
     "breadcrumbPlaceholder": "Pick a bucket on the left to get started",
     "breadcrumbMore": "Show hidden levels"
   },
