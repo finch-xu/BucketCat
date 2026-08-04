@@ -298,8 +298,17 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 /// Swaps in localized menu labels and re-renders the status line in the new
 /// language. See this module's doc comment for why the menu is not simply
 /// built with them in the first place.
+///
+/// `try_state`, not `state`: [`TrayState`] is only `manage`d after
+/// [`build`]'s `builder.build(app)?` succeeds, and `lib.rs` keeps running
+/// with a merely logged error if that fails. This command is still wired up
+/// unconditionally on that path, so a missing `TrayState` has to degrade to a
+/// no-op rather than the panic `state()` would give -- the same graceful
+/// fallback the old `tray_by_id`-returns-`None` code path had.
 pub fn set_labels<R: Runtime>(app: &AppHandle<R>, texts: TrayTexts) -> tauri::Result<()> {
-    let state = app.state::<TrayState<R>>();
+    let Some(state) = app.try_state::<TrayState<R>>() else {
+        return Ok(());
+    };
 
     // Each `lock()` below is its own statement, released at the semicolon --
     // never held across `build_menu` or `set_menu`, both of which proxy to
@@ -430,7 +439,14 @@ impl SpeedWindow {
 /// [`StatusNumbers`] itself stay private -- nothing outside `tray.rs` needs
 /// to name either.
 fn update_status<R: Runtime>(app: &AppHandle<R>, n: Option<StatusNumbers>) {
-    let state = app.state::<TrayState<R>>();
+    // `try_state`, not `state`: `spawn_status_ticker` (this function's only
+    // caller) is only started after `build` succeeds in `lib.rs`, so
+    // `TrayState` is expected to exist by the time any tick lands here. Still
+    // guarded rather than assumed, the same defensive no-op as `set_labels`,
+    // in case that call order ever changes.
+    let Some(state) = app.try_state::<TrayState<R>>() else {
+        return;
+    };
     *state.last.lock().unwrap() = n;
 
     let texts = state.texts.lock().unwrap().clone();
