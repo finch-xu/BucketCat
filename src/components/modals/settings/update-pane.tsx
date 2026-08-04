@@ -105,11 +105,6 @@ export function UpdatePane() {
         label={
           <div>
             <div>{t("settings.updateSource")}</div>
-            {selectedSource && (
-              <div className="mt-0.5 max-w-[360px] truncate text-[11.5px] text-muted-foreground">
-                {selectedSource.manifest_url}
-              </div>
-            )}
             {sourceError && (
               <div className="mt-0.5 text-[11.5px] text-destructive">{errorText(sourceError)}</div>
             )}

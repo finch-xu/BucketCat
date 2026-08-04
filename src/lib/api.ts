@@ -727,10 +727,10 @@ export function cleanCheckpointResidue(): Promise<CleanResult> {
 
 /** One selectable update source. Mirrors `UpdateSourceDto` in
  * `src-tauri/src/commands/updater.rs`. `id` is also the i18n lookup key
- * (`settings.updateSourceName.<id>`); `manifest_url` is display-only, shown so
- * users can see which host their app talks to. The list is a compile-time
- * constant on the Rust side -- users choose among these and cannot enter a URL
- * of their own. */
+ * (`settings.updateSourceName.<id>`) and the only thing the UI shows --
+ * `manifest_url` is carried for parity with the Rust DTO but is deliberately
+ * not rendered. The list is a compile-time constant on the Rust side -- users
+ * choose among these and cannot enter a URL of their own. */
 export interface UpdateSourceDto {
   id: string;
   manifest_url: string;
