@@ -928,6 +928,30 @@ impl EngineInner {
     }
 }
 
+/// A single-pass rollup of the task table -- the tray status line's data
+/// source. The tray polls at 1Hz and only ever needs a handful of aggregate
+/// numbers, so [`TransferEngine::summary`] walks `tasks` once under one lock
+/// acquisition rather than cloning every [`TransferTaskDto`] the way
+/// [`TransferEngine::snapshot`] does; that keeps a fast poll cheap and stops
+/// it from holding the lock long enough to contend with the runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineSummary {
+    /// Tasks whose status is [`TransferStatus::is_active`] -- `Queued` or
+    /// `Running`, i.e. the ones a live driver still owns.
+    pub active_count: usize,
+    /// Sum of `transferred` across the active tasks above, read straight off
+    /// each task's atomic counter (not the possibly-stale `dto` field), so
+    /// the tray sees live progress even between `state_changed` broadcasts.
+    pub active_transferred: u64,
+    /// Sum of `total` across the active tasks above.
+    pub active_total: u64,
+    /// Sum of `transferred` across *every* task, active or not. Kept apart
+    /// from `active_transferred` so a caller can diff two successive
+    /// summaries into a speed without the number jumping backwards the
+    /// instant a task leaves the active set (e.g. completes) mid-interval.
+    pub all_transferred: u64,
+}
+
 /// The transfer engine. Cheap to clone conceptually (everything is behind one
 /// `Arc`), and reachable without Tauri's `State` so it can be handed to
 /// non-IPC callers.
@@ -1164,6 +1188,28 @@ impl TransferEngine {
             .collect();
         out.sort_unstable_by_key(|t| std::cmp::Reverse(t.seq));
         out
+    }
+
+    /// The tray status line's data source: one lock, one pass, four numbers.
+    /// See [`EngineSummary`] for what each field means and why it exists.
+    pub async fn summary(&self) -> EngineSummary {
+        let tasks = self.inner.tasks.lock().await;
+        let mut summary = EngineSummary {
+            active_count: 0,
+            active_transferred: 0,
+            active_total: 0,
+            all_transferred: 0,
+        };
+        for record in tasks.values() {
+            let transferred = record.transferred.load(Ordering::Relaxed);
+            summary.all_transferred += transferred;
+            if record.dto.status.is_active() {
+                summary.active_count += 1;
+                summary.active_transferred += transferred;
+                summary.active_total += record.dto.total;
+            }
+        }
+        summary
     }
 
     /// Drops finished tasks. `Paused` and `Failed` stay: the user can still
@@ -2222,6 +2268,108 @@ mod tests {
             .map(|t| t.id)
             .collect();
         assert_eq!(ids, vec![c.id, b.id, a.id]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summary_aggregates_only_active_tasks_but_all_transferred_bytes() {
+        // One of each status the state machine can produce, all live in the
+        // table at once, so `summary()` has to actually filter by
+        // `is_active()` rather than just summing everything. `max_tasks(1)`
+        // is what makes "queued" deterministically Queued: once "running" is
+        // admitted and left parked, the one slot never frees, so nothing else
+        // can start.
+        let h = harness(1);
+
+        h.runner.report_bytes.store(1000, Ordering::SeqCst);
+        let done = h
+            .engine
+            .enqueue(EnqueueSpec {
+                total: 1000,
+                ..spec("done")
+            })
+            .await
+            .unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 1,
+            "task done starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&done.id).last() == Some(&TransferStatus::Completed),
+            "task done reaches Completed",
+        )
+        .await;
+        // Both flags are sticky (checked at the top of every run), so the next
+        // task must not inherit them.
+        h.runner.finish.store(false, Ordering::SeqCst);
+        h.runner.report_bytes.store(200, Ordering::SeqCst);
+        *h.runner.fail_with.lock().unwrap() = Some(AppError::AccessDenied);
+        let failed = h
+            .engine
+            .enqueue(EnqueueSpec {
+                total: 2000,
+                ..spec("failed")
+            })
+            .await
+            .unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 2,
+            "task failed starts",
+        )
+        .await;
+        h.runner.finish.store(true, Ordering::SeqCst);
+        eventually(
+            || h.sink.statuses_of(&failed.id).last() == Some(&TransferStatus::Failed),
+            "task failed reaches Failed",
+        )
+        .await;
+        h.runner.finish.store(false, Ordering::SeqCst);
+        h.runner.report_bytes.store(500, Ordering::SeqCst);
+        let running = h
+            .engine
+            .enqueue(EnqueueSpec {
+                total: 4000,
+                ..spec("running")
+            })
+            .await
+            .unwrap();
+        eventually(
+            || h.runner.started.load(Ordering::SeqCst) == 3,
+            "task running starts",
+        )
+        .await;
+        // Left parked: `finish` stays false and nobody cancels it, so it
+        // never yields the one slot back.
+        h.runner.report_bytes.store(0, Ordering::SeqCst);
+        let queued = h
+            .engine
+            .enqueue(EnqueueSpec {
+                total: 3000,
+                ..spec("queued")
+            })
+            .await
+            .unwrap();
+
+        let summary = h.engine.summary().await;
+        assert_eq!(
+            summary.active_count, 2,
+            "only running + queued are active; done and failed are terminal"
+        );
+        assert_eq!(
+            summary.active_transferred, 500,
+            "running has reported 500 bytes; queued has never run and reports 0"
+        );
+        assert_eq!(
+            summary.active_total,
+            running.total + queued.total,
+            "active_total sums only the active tasks' totals"
+        );
+        assert_eq!(
+            summary.all_transferred, 1700,
+            "all_transferred = done(1000) + failed(200) + running(500) + queued(0), \
+             regardless of status"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

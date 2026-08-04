@@ -20,9 +20,9 @@ pub use checkpoint::{checkpoint_dir, remove, scan, write, Checkpoint};
 pub use dispatch::DispatchRunner;
 pub use download::DownloadRunner;
 pub use engine::{
-    plan_restore, restore_all, DownloadState, EnqueueSpec, MultipartState, ProgressHandle,
-    RestoreAction, ResumeState, RunOutcome, StopKind, TaskContext, TaskControl, TransferEngine,
-    TransferRunner, TransferSink,
+    plan_restore, restore_all, DownloadState, EngineSummary, EnqueueSpec, MultipartState,
+    ProgressHandle, RestoreAction, ResumeState, RunOutcome, StopKind, TaskContext, TaskControl,
+    TransferEngine, TransferRunner, TransferSink,
 };
 pub use limits::SharedLimits;
 pub use model::{next_status, Direction, TransferCommand, TransferStatus, TransferTaskDto};
