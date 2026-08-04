@@ -19,6 +19,15 @@ import { useTransferStore } from "@/store/transfer-store";
  * window is dropped rather than queued. Same class of gap as the tray's
  * English-label fallback before the webview reports its locale -- narrow and
  * accepted rather than engineered around.
+ *
+ * That gap only stays that narrow because `openSettings` (`app-store.tsx`)
+ * and `check` (`updater-store.tsx`) are both stable (`useCallback`, `[]`
+ * deps) across re-renders. If either ever goes back to being an inline
+ * closure in its provider's `value` object, this effect's `[openSettings,
+ * check]` dependency array churns on every unrelated re-render anywhere
+ * under those providers, and the listeners get torn down and
+ * re-`listen()`'d (an async IPC round trip) constantly instead of once --
+ * turning this into a gap that spans the whole session, not just launch.
  */
 export function TrayEventBridge() {
   const { openSettings } = useApp();

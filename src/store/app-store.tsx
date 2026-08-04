@@ -180,6 +180,28 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
     setAnchorKey(null);
   }, []);
 
+  // Stable references, like `setThemeMode` above: `TrayEventBridge` depends
+  // on `openSettings` to (re)register its Tauri event listeners, and a
+  // reference that changed on every provider render (as an inline closure
+  // in `value` below would) forces that effect to tear down and re-`listen`
+  // on every unrelated re-render of anything under `AppStoreProvider` --
+  // widening the "tray event arrives while nobody is listening" gap from
+  // "just after launch" to "constantly". `setSettingsPaneState` and
+  // `setShowSettings` are `useState` setters, themselves stable across
+  // renders, so `[]` is a correct dependency array here.
+  const openSettings = useCallback((pane: SettingsPane = "general") => {
+    setSettingsPaneState(pane);
+    setShowSettings(true);
+  }, []);
+
+  const setSettingsPane = useCallback((pane: SettingsPane) => {
+    setSettingsPaneState(pane);
+  }, []);
+
+  const closeSettings = useCallback(() => {
+    setShowSettings(false);
+  }, []);
+
   const value: AppStore = {
     themeMode,
     dark,
@@ -286,12 +308,9 @@ export function AppStoreProvider({ children }: { children: ReactNode }) {
     closeDeleteConnection: () => setDeletingConnection(null),
     showSettings,
     settingsPane,
-    openSettings: (pane = "general") => {
-      setSettingsPaneState(pane);
-      setShowSettings(true);
-    },
-    setSettingsPane: (pane) => setSettingsPaneState(pane),
-    closeSettings: () => setShowSettings(false),
+    openSettings,
+    setSettingsPane,
+    closeSettings,
     transferSettings,
     setTransferSettings: (patch) => setTransferSettingsState((s) => ({ ...s, ...patch })),
   };
