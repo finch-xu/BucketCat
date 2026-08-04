@@ -44,6 +44,18 @@
 //! A call from off the main thread blocks until the event loop gets to it,
 //! and returns `Err` if the loop is gone (the app is exiting), which is why
 //! every call site here logs and swallows rather than unwrapping.
+//!
+//! That blocking is also why no `TrayState` lock may ever be *held across*
+//! one of these proxied calls (`set_text`, `set_title`, `set_menu`, or
+//! `MenuItem`/`Menu::with_items` building a new item). [`set_labels`]
+//! normally runs on the main thread itself (a synchronous
+//! `#[tauri::command]` executes inline on the IPC thread); if it, or the
+//! ticker's [`update_status`], blocked inside a proxied call while still
+//! holding a lock the other side needs, the two would deadlock -- the main
+//! thread stuck waiting on the lock, the ticker stuck waiting for the main
+//! thread's event loop to come back around. Every lock acquisition here is
+//! kept to a self-contained read or write of plain data for exactly that
+//! reason.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -289,6 +301,15 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 pub fn set_labels<R: Runtime>(app: &AppHandle<R>, texts: TrayTexts) -> tauri::Result<()> {
     let state = app.state::<TrayState<R>>();
 
+    // Each `lock()` below is its own statement, released at the semicolon --
+    // never held across `build_menu` or `set_menu`, both of which proxy to
+    // the main thread and block. That matters here specifically because this
+    // function typically *runs on* the main thread (a synchronous
+    // `#[tauri::command]` executes inline on the IPC thread): holding one of
+    // these locks into a proxied call would let it deadlock against
+    // `update_status`'s ticker task the same way fixed there -- one side
+    // blocked in the proxy waiting for the main thread's event loop, the
+    // other blocked on the lock the main thread is holding.
     *state.texts.lock().unwrap() = texts.clone();
 
     let last = *state.last.lock().unwrap();
@@ -422,7 +443,18 @@ fn update_status<R: Runtime>(app: &AppHandle<R>, n: Option<StatusNumbers>) {
         *last_rendered = rendered.clone();
     }
 
-    if let Some(item) = state.status_item.lock().unwrap().as_ref() {
+    // The `MutexGuard` must not still be held when `set_text` runs: it
+    // proxies to the main thread and blocks this task until that thread
+    // services it (see this module's doc comment). If the main thread is
+    // meanwhile inside `set_labels`, blocked acquiring this very lock (a
+    // locale switch races an in-flight tick), neither side can move --
+    // the main thread never gets back to its event loop to run the proxied
+    // closure, and this task never releases the lock the main thread wants.
+    // Cloning the handle (an `Arc` bump -- `MenuItem`'s `Clone` impl, the
+    // same thing `run_item_main_thread!` does internally before proxying)
+    // and letting the guard drop *before* the call sidesteps that cycle.
+    let item = state.status_item.lock().unwrap().clone();
+    if let Some(item) = item {
         if let Err(err) = item.set_text(&rendered) {
             tracing::warn!("updating tray status text failed: {err}");
         }
