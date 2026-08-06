@@ -350,32 +350,35 @@ export function TransferBar() {
           )}
         </div>
       )}
-      <footer className="flex h-10 items-center gap-2.5 border-t border-border bg-titlebar px-3.5 text-xs text-muted-foreground">
-        <ArrowUpDown
-          className={cn("size-[13px]", summary.activeCount ? "text-primary" : "text-muted-foreground")}
-        />
-        <span className="text-fg2">{summaryLine}</span>
-        {summary.activeCount > 0 && (
-          <>
-            <div className="h-[5px] w-[120px] overflow-hidden rounded-[3px] bg-border2">
-              <div
-                className="h-full rounded-[3px] bg-primary transition-[width] duration-400"
-                style={{ width: `${summary.pct}%` }}
-              />
-            </div>
-            <span className="text-fg2 tabular-nums">{summary.pct}%</span>
-            <span className="text-muted2 tabular-nums">{formatSpeed(summary.speed)}</span>
-          </>
-        )}
+      <footer className="border-t border-border bg-titlebar">
         <button
           type="button"
+          aria-expanded={panelOpen}
           onClick={() => useTransferStore.getState().togglePanel()}
-          className="ml-auto flex cursor-pointer items-center gap-1.5 rounded-[7px] px-[9px] py-[5px] text-xs text-muted-foreground hover:bg-hover hover:text-fg2"
+          className="group flex h-10 w-full cursor-pointer items-center gap-2.5 px-3.5 text-xs text-muted-foreground hover:bg-hover"
         >
-          {t("transfer.toggle")}
-          <ChevronDown
-            className={cn("size-3.5 transition-transform duration-200", panelOpen && "rotate-180")}
+          <ArrowUpDown
+            className={cn("size-[13px]", summary.activeCount ? "text-primary" : "text-muted-foreground")}
           />
+          <span className="text-fg2">{summaryLine}</span>
+          {summary.activeCount > 0 && (
+            <>
+              <div className="h-[5px] w-[120px] overflow-hidden rounded-[3px] bg-border2">
+                <div
+                  className="h-full rounded-[3px] bg-primary transition-[width] duration-400"
+                  style={{ width: `${summary.pct}%` }}
+                />
+              </div>
+              <span className="text-fg2 tabular-nums">{summary.pct}%</span>
+              <span className="text-muted2 tabular-nums">{formatSpeed(summary.speed)}</span>
+            </>
+          )}
+          <span className="ml-auto flex items-center gap-1.5 rounded-[7px] px-[9px] py-[5px] text-xs text-muted-foreground group-hover:text-fg2">
+            {t("transfer.toggle")}
+            <ChevronDown
+              className={cn("size-3.5 transition-transform duration-200", panelOpen && "rotate-180")}
+            />
+          </span>
         </button>
       </footer>
     </div>
