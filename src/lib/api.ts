@@ -589,10 +589,10 @@ export interface Settings {
   close_to_tray: boolean;
   update_source: string;
   auto_check_update: boolean;
-  /** Which transfer tuning preset is active: `"conservative"`, `"balanced"`,
-   * `"aggressive"`, or `"custom"` once any of the six fields below has been
-   * hand-edited (never written by a `max_tasks`/`max_parts`-only change --
-   * see `setMaxTasks`/`setMaxParts`). */
+  /** Which transfer tuning preset is active: `"serial"`, `"conservative"`,
+   * `"balanced"`, `"aggressive"`, or `"custom"` once any of the six fields
+   * below has been hand-edited (never written by a `max_tasks`/`max_parts`-
+   * only change -- see `setMaxTasks`/`setMaxParts`). */
   transfer_preset: string;
   /** Files smaller than this upload as a single `PutObject`, in bytes. */
   upload_threshold: number;
@@ -629,11 +629,11 @@ export function setMaxParts(n: number): Promise<void> {
   return invokeCommand<void>("set_max_parts", { n });
 }
 
-/** Applies a built-in transfer tuning preset (spec §4.2): `"conservative"`,
- * `"balanced"`, or `"aggressive"`. The backend writes all six tuning fields
- * plus the preset's linked `max_tasks`/`max_parts` as one atomic group,
- * records the choice as `transfer_preset`, and hot-applies everything to the
- * running engine -- no restart. Rejects any other `name`. */
+/** Applies a built-in transfer tuning preset (spec §4.2): `"serial"`,
+ * `"conservative"`, `"balanced"`, or `"aggressive"`. The backend writes all
+ * six tuning fields plus the preset's linked `max_tasks`/`max_parts` as one
+ * atomic group, records the choice as `transfer_preset`, and hot-applies
+ * everything to the running engine -- no restart. Rejects any other `name`. */
 export function setTransferPreset(name: string): Promise<void> {
   return invokeCommand<void>("set_transfer_preset", { name });
 }

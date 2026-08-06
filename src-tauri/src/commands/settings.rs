@@ -144,6 +144,7 @@ pub struct TransferTuningPatch {
 /// wrong write.
 fn preset_group(name: &str) -> Option<(TransferTuning, usize, usize)> {
     match name {
+        "serial" => Some((TransferTuning::conservative(), 1, 1)),
         "conservative" => Some((TransferTuning::conservative(), 2, 2)),
         "balanced" => Some((TransferTuning::balanced(), 3, 4)),
         "aggressive" => Some((TransferTuning::aggressive(), 5, 8)),
@@ -753,6 +754,33 @@ mod tests {
             loaded.share_expiry_secs, 999,
             "unrelated fields must survive a preset write"
         );
+    }
+
+    #[test]
+    fn serial_preset_writes_conservative_tuning_with_tasks_and_parts_pinned_to_one() {
+        // "serial" differs from "conservative" only in concurrency
+        // (max_tasks=1, max_parts=1) -- it reuses TransferTuning::conservative()
+        // for the split plan itself, per the task brief.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let (tuning, max_tasks, max_parts) = apply_transfer_preset(&path, "serial").unwrap();
+
+        assert_eq!(tuning, TransferTuning::conservative());
+        assert_eq!(max_tasks, 1);
+        assert_eq!(max_parts, 1);
+
+        let loaded = settings::load(&path);
+        assert_eq!(loaded.transfer_preset, "serial");
+        assert_eq!(loaded.max_tasks, 1);
+        assert_eq!(loaded.max_parts, 1);
+        let conservative = TransferTuning::conservative();
+        assert_eq!(loaded.upload_threshold, conservative.upload_threshold);
+        assert_eq!(loaded.upload_part_floor, conservative.upload_part_floor);
+        assert_eq!(loaded.upload_target_parts, conservative.upload_target_parts);
+        assert_eq!(loaded.download_threshold, conservative.download_threshold);
+        assert_eq!(loaded.download_chunk_floor, conservative.download_chunk_floor);
+        assert_eq!(loaded.download_target_parts, conservative.download_target_parts);
     }
 
     #[test]

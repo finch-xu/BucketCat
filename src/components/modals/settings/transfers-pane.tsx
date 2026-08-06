@@ -30,9 +30,9 @@ const THRESHOLD_OPTIONS_MB = [16, 32, 64, 128, 256, 512, 1024];
  * (spec §4.7). */
 const PART_OPTIONS_MB = [8, 16, 32, 64, 128, 256];
 
-/** Mirrors `Settings.transfer_preset` on the wire: one of the three built-in
+/** Mirrors `Settings.transfer_preset` on the wire: one of the four built-in
  * presets, or `"custom"` once any advanced field has been hand-edited. */
-type TransferPreset = "conservative" | "balanced" | "aggressive" | "custom";
+type TransferPreset = "serial" | "conservative" | "balanced" | "aggressive" | "custom";
 
 export function TransfersPane() {
   const { t } = useTranslation();
@@ -125,7 +125,7 @@ export function TransfersPane() {
    * single-field handlers below, a successful persist here re-seeds every
    * one of those local copies from the freshly invalidated query cache
    * rather than just flipping the one value the user touched. */
-  function handlePresetChange(name: "conservative" | "balanced" | "aggressive") {
+  function handlePresetChange(name: "serial" | "conservative" | "balanced" | "aggressive") {
     const previous = {
       preset,
       maxTasks,
@@ -197,6 +197,11 @@ export function TransfersPane() {
             handlePresetChange(v);
           }}
           options={[
+            {
+              value: "serial",
+              label: t("settings.presetSerial"),
+              disabled: presetPending,
+            },
             {
               value: "conservative",
               label: t("settings.presetConservative"),
