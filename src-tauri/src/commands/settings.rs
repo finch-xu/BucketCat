@@ -136,12 +136,13 @@ pub struct TransferTuningPatch {
 }
 
 /// The [`TransferTuning`] + linked `(max_tasks, max_parts)` a built-in preset
-/// writes as one atomic group (spec §4.2's table). `None` for any name this
-/// build does not recognize, so the caller can turn that into
-/// `AppError::Internal` rather than silently falling back to a default --
-/// an unknown name reaching here is either a stale/typo'd frontend build or a
-/// hand-built invoke call, and both deserve a loud rejection over a silently
-/// wrong write.
+/// writes as one atomic group (spec §4.2's table); `"serial"` is an additional
+/// preset defined outside the spec, using conservative tuning with max_tasks=1
+/// and max_parts=1. `None` for any name this build does not recognize, so the
+/// caller can turn that into `AppError::Internal` rather than silently falling
+/// back to a default -- an unknown name reaching here is either a stale/typo'd
+/// frontend build or a hand-built invoke call, and both deserve a loud rejection
+/// over a silently wrong write.
 fn preset_group(name: &str) -> Option<(TransferTuning, usize, usize)> {
     match name {
         "serial" => Some((TransferTuning::conservative(), 1, 1)),

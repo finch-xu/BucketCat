@@ -44,8 +44,8 @@ pub struct Settings {
     /// appears -- so this defaults on.
     #[serde(default = "default_true")]
     pub auto_check_update: bool,
-    /// Which transfer tuning preset to use: "conservative", "balanced", or
-    /// "aggressive". Defaults to "balanced".
+    /// Which transfer tuning preset to use: "serial", "conservative",
+    /// "balanced", "aggressive", or "custom". Defaults to "balanced".
     #[serde(default = "default_transfer_preset")]
     pub transfer_preset: String,
     /// File upload threshold in bytes; files below this use single-part
