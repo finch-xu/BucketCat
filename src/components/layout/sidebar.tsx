@@ -13,7 +13,7 @@ import {
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import logoFlat from "@/assets/logo-flat.png";
-import { ProviderChip } from "@/components/icons/provider-chip";
+import { ProviderGlyph } from "@/components/icons/provider-chip";
 import { BucketInfoDialog } from "@/components/modals/bucket-info-dialog";
 import { cn } from "@/lib/utils";
 import { isMac } from "@/lib/platform";
@@ -101,12 +101,13 @@ function BucketList({ conn, isOpen, activeConn, activeBucket, onSelect }: Bucket
         key={name}
         onClick={() => onSelect(name)}
         className={cn(
-          "group/bucket flex cursor-pointer items-center gap-2 rounded-lg px-[9px] py-1.5",
+          "group/bucket flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2",
           active ? "bg-active text-primary" : "text-fg2 hover:bg-hover",
         )}
       >
         <Folder className={cn("size-3.5", active ? "text-primary" : "text-muted-foreground")} />
         <span
+          title={name}
           className={cn(
             "min-w-0 flex-1 truncate text-[12.5px]",
             active ? "font-semibold" : "font-medium",
@@ -152,7 +153,7 @@ function BucketList({ conn, isOpen, activeConn, activeBucket, onSelect }: Bucket
   };
 
   return (
-    <div className="mt-px mb-1 ml-[22px] border-l border-border pl-1.5">
+    <div className="mt-1 mb-3 ml-[22px] space-y-0.5 pl-1.5">
       {infoBucket && (
         <BucketInfoDialog
           connectionId={conn.id}
@@ -225,30 +226,27 @@ function ConnectionRow({
   const meta = providerMeta(conn.provider);
 
   return (
-    <div className="mb-px">
+    <div className="mb-2">
       <div
         onClick={onToggle}
-        className={cn(
-          "group flex cursor-pointer items-center gap-[9px] rounded-[9px] px-2 py-[7px]",
-          isOpen ? "bg-raised shadow-[0_1px_2px_var(--shadow)]" : "hover:bg-hover",
-        )}
+        className="group relative flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 hover:bg-hover"
       >
         <span className="flex w-3 justify-center text-muted2">
           {isOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
         </span>
-        <ProviderChip meta={meta} size="sm" />
-        <span className="min-w-0 flex-1">
-          <span className="block truncate text-[13px] font-semibold text-foreground">
+        <ProviderGlyph meta={meta} className="size-[18px] shrink-0" />
+        <span className="min-w-0 flex-1 group-focus-within:pr-[52px] group-hover:pr-[52px]">
+          <span title={conn.name} className="block truncate text-[13px] font-semibold text-foreground">
             {conn.name}
           </span>
-          <span className="block truncate text-[11px] text-muted-foreground">
+          <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
             {meta.nameKey ? t(meta.nameKey) : meta.name}
           </span>
         </span>
         {/* Hover/focus-only actions -- kept keyboard-reachable via
          * group-focus-within so tabbing to either button reveals them even
          * without a mouse hover. */}
-        <span className="flex shrink-0 items-center gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
+        <span className="absolute right-2 flex items-center gap-0.5 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100">
           <button
             type="button"
             onClick={(e) => {
@@ -306,7 +304,7 @@ export function Sidebar() {
   const { hasUpdate } = useUpdater();
 
   return (
-    <aside className="flex w-[248px] shrink-0 flex-col border-r border-border bg-sidebar">
+    <aside className="flex w-[216px] shrink-0 flex-col border-r border-border bg-sidebar">
       {/* Brand strip, doubling as the window's drag region. The title bar is
        * gone (see `titleBarStyle: "Overlay"` in tauri.conf.json), and Tauri
        * documents that Overlay leaves a window with NO default draggable
@@ -337,20 +335,20 @@ export function Sidebar() {
           * that fits this strip. Carrying no rounding or hairline border
           * either -- both only ever framed the icon's white squircle, and
           * around a free-standing drawing they would frame empty space. */}
-        <img src={logoFlat} alt="BucketCat" className="pointer-events-none size-[34px]" />
-        <span className="pointer-events-none text-[16.5px] font-bold tracking-[0.1px]">
+        <img src={logoFlat} alt="BucketCat" className="pointer-events-none size-[30px]" />
+        <span className="pointer-events-none text-[17px] font-semibold tracking-[-0.3px]">
           {t("app.name")}
         </span>
       </div>
-      <div className="flex items-center justify-between px-4 pt-[9px] pb-2">
-        <span className="text-[11px] font-semibold tracking-[0.7px] text-muted-foreground uppercase">
+      <div className="flex items-center justify-between px-4 pt-5 pb-2">
+        <span className="text-[11px] font-medium tracking-[0.4px] text-muted-foreground">
           {t("sidebar.connections")}
         </span>
         <button
           type="button"
           onClick={openAdd}
           title={t("sidebar.addConnection")}
-          className="flex size-6 cursor-pointer items-center justify-center rounded-[7px] border border-accent-border bg-raised text-primary hover:border-primary hover:bg-accent-tint"
+          className="flex size-6 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-hover hover:text-primary"
         >
           <Plus className="size-[15px]" />
         </button>
@@ -402,7 +400,7 @@ export function Sidebar() {
             />
           ))}
       </div>
-      <div className="flex items-center gap-1.5 border-t border-border p-2">
+      <div className="flex items-center gap-1.5 border-t border-border px-3 py-2.5">
         <button
           type="button"
           onClick={() => openSettings()}

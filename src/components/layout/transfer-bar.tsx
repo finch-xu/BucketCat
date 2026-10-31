@@ -138,7 +138,7 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
   };
 
   return (
-    <div className="flex items-center gap-[11px] rounded-[10px] px-2 py-[9px] hover:bg-hover">
+    <div className="flex items-center gap-3 rounded-md px-3 py-3 hover:bg-hover">
       <span
         className={cn(
           "flex size-[30px] shrink-0 items-center justify-center rounded-lg border",
@@ -155,7 +155,7 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
           </span>
         </div>
         <div
-          className="mt-0.5 flex min-w-0 items-center gap-1 text-[10.5px] text-muted2"
+          className="mt-0.5 flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground"
           title={provenanceTitle(conn?.name, task.connection_id, task.bucket)}
         >
           <ProviderGlyph meta={meta} className="size-3 shrink-0" />
@@ -179,7 +179,7 @@ function TransferRowImpl({ taskId }: { taskId: string }) {
             "mt-1 truncate text-[10.5px]",
             tone === "warning" && "text-warning",
             tone === "destructive" && "text-destructive",
-            tone === "muted" && "text-muted2",
+            tone === "muted" && "text-muted-foreground",
           )}
         >
           {subtitle}
@@ -321,8 +321,8 @@ export function TransferBar() {
   return (
     <div ref={containerRef} className="relative shrink-0">
       {panelOpen && (
-        <div className="absolute bottom-full left-0 right-0 max-h-[284px] overflow-y-auto border-t border-border bg-background shadow-[0_-14px_32px_-14px_var(--shadow)] [animation:bc-up_.18s_ease]">
-          <div className="sticky top-0 flex items-center justify-between border-b border-border2 bg-background px-3.5 pt-[11px] pb-[7px]">
+        <div className="absolute bottom-full left-0 right-0 max-h-[284px] overflow-y-auto border-t border-border bg-background shadow-[0_-8px_24px_-16px_var(--shadow)] [animation:bc-up_.18s_ease]">
+          <div className="sticky top-0 z-1 flex items-center justify-between border-b border-border2 bg-panel px-5 py-2.5">
             <span className="text-xs font-semibold text-fg2">{t("transfer.title")}</span>
             <button
               type="button"
@@ -355,7 +355,7 @@ export function TransferBar() {
           type="button"
           aria-expanded={panelOpen}
           onClick={() => useTransferStore.getState().togglePanel()}
-          className="group flex h-10 w-full cursor-pointer items-center gap-2.5 px-3.5 text-xs text-muted-foreground hover:bg-hover"
+          className="group flex h-9 w-full cursor-pointer items-center gap-2.5 px-5 text-[11px] text-muted-foreground hover:bg-hover"
         >
           <ArrowUpDown
             className={cn("size-[13px]", summary.activeCount ? "text-primary" : "text-muted-foreground")}
@@ -370,7 +370,7 @@ export function TransferBar() {
                 />
               </div>
               <span className="text-fg2 tabular-nums">{summary.pct}%</span>
-              <span className="text-muted2 tabular-nums">{formatSpeed(summary.speed)}</span>
+              <span className="text-muted-foreground tabular-nums">{formatSpeed(summary.speed)}</span>
             </>
           )}
           <span className="ml-auto flex items-center gap-1.5 rounded-[7px] px-[9px] py-[5px] text-xs text-muted-foreground group-hover:text-fg2">

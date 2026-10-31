@@ -5,7 +5,7 @@
 
 @theme inline {
     --font-heading: var(--font-sans);
-    --font-sans: "Noto Sans SC", ui-sans-serif, system-ui, -apple-system, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
     --color-background: var(--background);
     --color-foreground: var(--foreground);
     --color-fg2: var(--fg2);
@@ -45,25 +45,25 @@
 
 :root {
     --background: #ffffff;
-    --foreground: #1c2329;
-    --fg2: #4c5865;
+    --foreground: #253341;
+    --fg2: #506172;
     --muted: #eef2f6;
-    --muted-foreground: #8794a1;
+    --muted-foreground: #687887;
     --muted2: #b3bdc7;
-    --panel: #fafbfc;
-    --sidebar: #f4f6f8;
-    --titlebar: #f4f6f8;
-    --border: #e3e8ed;
-    --border2: #eef1f4;
-    --hover: #eef2f6;
-    --active: #e7f1f9;
+    --panel: #f8fafc;
+    --sidebar: #f4f6f9;
+    --titlebar: #f6f8fa;
+    --border: #dfe5ec;
+    --border2: #edf1f5;
+    --hover: #f0f4f8;
+    --active: #e7f0f8;
     --input: #e3e8ed;
-    --ring: #3f87bd;
-    --primary: #3f87bd;
-    --primary-strong: #32719f;
+    --ring: #3479ac;
+    --primary: #3479ac;
+    --primary-strong: #28658f;
     --primary-soft: color-mix(in srgb, var(--primary) 16%, transparent);
     --primary-foreground: #ffffff;
-    --primary-shadow: rgba(63, 135, 189, 0.5);
+    --primary-shadow: transparent;
     --secondary: #eef2f6;
     --secondary-foreground: #1c2329;
     --destructive: #c8503f;
@@ -74,7 +74,7 @@
     --accent-surface: #f6fafd;
     --raised: #ffffff;
     --shadow: rgba(28, 35, 41, 0.22);
-    --radius: 0.625rem;
+    --radius: 0.5rem;
 }
 
 .dark {
@@ -149,4 +149,45 @@
 @keyframes bc-up {
   from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: none; }
+}
+
+/* The list's available width changes when the inspector opens. Keep the
+   filename and row actions usable independently of the window width. */
+.file-list-viewport {
+  container: file-list / inline-size;
+}
+.file-column-size { width: 80px; flex-shrink: 0; }
+.file-column-type { width: 104px; flex-shrink: 0; }
+.file-column-modified { width: 154px; flex-shrink: 0; }
+.file-column-actions { width: 84px; flex-shrink: 0; }
+@container file-list (max-width: 760px) {
+  .file-column-type { display: none; }
+}
+@container file-list (max-width: 600px) {
+  .file-column-modified { display: none; }
+}
+@container file-list (max-width: 380px) {
+  .file-column-size { display: none; }
+}
+
+.workbench-toolbar { container: toolbar / inline-size; }
+@container toolbar (max-width: 800px) {
+  .new-folder-label { display: none; }
+}
+
+.workbench-details { width: 280px; }
+@media (max-width: 1000px) {
+  .workbench-details { width: 248px; }
+}
+
+.workbench :where(button, [role="button"]):focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .workbench *, .workbench *::before, .workbench *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

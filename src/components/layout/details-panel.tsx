@@ -274,35 +274,36 @@ export function DetailsPanel() {
   }
 
   return (
-    <aside className="flex w-[308px] shrink-0 flex-col border-l border-border bg-background">
-      <div className="flex h-[46px] shrink-0 items-center justify-between border-b border-border pr-3 pl-4">
-        <span className="text-[13px] font-semibold">{t("details.title")}</span>
+    <aside className="workbench-details flex min-h-0 shrink-0 flex-col border-l border-border bg-panel">
+      <div className="flex h-11 shrink-0 items-center justify-between pr-3 pl-4">
+        <span className="text-[12px] font-medium text-fg2">{t("details.title")}</span>
         <button
           type="button"
           onClick={clearSelection}
+          aria-label={t("objects.close")}
           className="flex size-[26px] cursor-pointer items-center justify-center rounded-[7px] text-muted-foreground hover:bg-hover hover:text-fg2"
         >
           <X className="size-3.5" />
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto p-4">
-        <div className="flex h-[148px] w-full items-center justify-center overflow-hidden rounded-xl border border-border bg-[repeating-linear-gradient(45deg,var(--panel),var(--panel)_11px,var(--border2)_11px,var(--border2)_22px)]">
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-5">
+        <div className="flex h-[148px] w-full items-center justify-center overflow-hidden rounded-lg border border-border2 bg-muted">
           {previewBody}
         </div>
-        <div className="mt-3.5 text-[15px] leading-[1.35] font-semibold break-all">{entry.name}</div>
+        <div className="mt-4 text-[14px] leading-relaxed font-semibold break-all">{entry.name}</div>
         <div className="mt-[3px] text-xs text-muted-foreground">{t(meta.labelKey)}</div>
         <div className="my-4 grid grid-cols-2 gap-2">
           <button
             type="button"
             onClick={() => startFileDownload(entry)}
-            className="inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] bg-primary text-[12.5px] font-semibold text-primary-foreground hover:bg-primary-strong"
+            className="inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-border bg-background text-[12px] font-medium text-fg2 hover:bg-hover"
           >
             <Download className="size-3.5" />
             {t("details.download")}
           </button>
           <button
             type="button"
-            className="inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] border border-border bg-background text-[12.5px] font-medium text-fg2 hover:bg-hover"
+            className="inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-border bg-background text-[12px] font-medium text-fg2 hover:bg-hover"
           >
             <Link2 className="size-3.5" />
             {t("details.copyLink")}
@@ -310,10 +311,8 @@ export function DetailsPanel() {
           <button
             type="button"
             onClick={() => setShareOpen((open) => !open)}
-            // Share is this panel's marquee action, so it carries the accent
-            // treatment at rest rather than only once expanded. `shareOpen`
-            // still controls the panel below it.
-            className="inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] border border-primary bg-accent-tint text-[12.5px] font-medium text-primary hover:bg-accent-surface"
+            aria-expanded={shareOpen}
+            className="inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-border bg-background text-[12px] font-medium text-fg2 hover:bg-hover"
           >
             <Share2 className="size-3.5" />
             {t("details.share")}
@@ -321,7 +320,7 @@ export function DetailsPanel() {
           <button
             type="button"
             onClick={() => openDeleteObjects([entry.key])}
-            className="inline-flex h-[34px] cursor-pointer items-center justify-center gap-1.5 rounded-[9px] bg-destructive/10 text-[12.5px] font-medium text-destructive hover:bg-destructive/20"
+            className="inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-md text-[12px] font-medium text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
           >
             <Trash2 className="size-3.5" />
             {t("details.delete")}
@@ -333,14 +332,14 @@ export function DetailsPanel() {
               <div className="mb-[5px] text-[10.5px] tracking-[0.4px] text-muted-foreground uppercase">
                 {t("details.shareExpiry")}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-col gap-2">
                 <select
                   value={expirySecs}
                   onChange={(e) => {
                     expiryTouchedRef.current = true;
                     setExpirySecs(Number(e.target.value));
                   }}
-                  className="h-[30px] flex-1 rounded-[7px] border border-border bg-background px-2 text-[12px] text-fg2 outline-none focus:border-primary"
+                  className="h-8 w-full min-w-0 rounded-md border border-border bg-background px-2 text-[12px] text-fg2 outline-none focus:border-primary"
                 >
                   {EXPIRY_OPTIONS.map((opt) => (
                     <option key={opt.secs} value={opt.secs}>
@@ -352,7 +351,7 @@ export function DetailsPanel() {
                   type="button"
                   onClick={() => presignMutation.mutate({ secs: expirySecs, key: entry.key })}
                   disabled={presignMutation.isPending}
-                  className="h-[30px] shrink-0 cursor-pointer rounded-[7px] bg-primary px-3 text-[12px] font-semibold text-primary-foreground hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
+                  className="h-8 cursor-pointer rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary-strong disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {presignMutation.isPending ? t("details.generating") : t("details.generateLink")}
                 </button>
@@ -382,7 +381,7 @@ export function DetailsPanel() {
             )}
           </div>
         )}
-        <div className="flex flex-col gap-3 border-t border-border2 pt-3.5">
+        <div className="flex flex-col gap-3.5 border-t border-border pt-4">
           <div>
             <div className="mb-[3px] text-[10.5px] tracking-[0.4px] text-muted-foreground uppercase">
               {t("details.objectKey")}

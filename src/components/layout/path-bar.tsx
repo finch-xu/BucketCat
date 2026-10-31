@@ -92,10 +92,10 @@ export function PathBar() {
     <div
       ref={ref}
       title={noBucket ? undefined : `${crumbs.join("/")}/`}
-      className="flex h-7 shrink-0 items-center gap-px overflow-hidden border-t border-border bg-background px-4"
+      className="flex h-8 shrink-0 items-center gap-px overflow-hidden border-t border-border bg-panel px-5"
     >
       {noBucket ? (
-        // Rendered even with no bucket so the bar keeps its 28px and the
+        // Rendered even with no bucket so the bar keeps its 32px and the
         // layout does not jump when a bucket is picked.
         <span className="truncate text-[12.5px] text-muted-foreground">
           {t("main.breadcrumbPlaceholder")}

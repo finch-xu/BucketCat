@@ -62,7 +62,7 @@ function CenterState({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex h-full min-h-[340px] flex-col items-center justify-center gap-1.5 text-muted-foreground">
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 py-8 text-center text-muted-foreground">
       {image ? (
         <img src={image} alt="" className="mb-1.5 size-[92px] rounded-[20px] opacity-90" />
       ) : (
@@ -132,20 +132,19 @@ function RowActions({
   const { t } = useTranslation();
   const { openRename, openDeleteObjects } = useApp();
 
-  // A selected row keeps its actions on screen and floats them on a raised
-  // surface; an unselected row still reveals them only on hover/focus.
+  // A selected row keeps its actions visible; other rows reveal on hover/focus.
   const container = cn(
-    "flex w-[92px] shrink-0 items-center justify-end gap-0.5",
+    "file-column-actions flex items-center justify-end gap-0.5",
     !selected && "opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
   );
   const neutralAction = cn(
     "flex size-6 cursor-pointer items-center justify-center rounded-[6px] hover:bg-active hover:text-primary",
-    selected ? "bg-raised text-primary shadow-[0_1px_2px_var(--shadow)]" : "text-muted-foreground",
+    selected ? "text-primary" : "text-muted-foreground",
   );
   const dangerAction = cn(
     "flex size-6 cursor-pointer items-center justify-center rounded-[6px] hover:bg-destructive/10 hover:text-destructive",
     selected
-      ? "bg-raised text-destructive shadow-[0_1px_2px_var(--shadow)]"
+      ? "text-destructive"
       : "text-muted-foreground",
   );
 
@@ -328,13 +327,13 @@ function ListView({
   }, [virtualItems, entries.length, hasNextPage, isFetchingNextPage, isPlaceholderData, fetchNextPage]);
 
   return (
-    <div ref={parentRef} className="min-w-0 flex-1 overflow-y-auto">
-      <div className="sticky top-0 z-1 flex h-[34px] items-center border-b border-border2 bg-panel px-4 text-[11px] font-semibold tracking-[0.4px] text-muted-foreground">
-        <span className="flex-1">{t("main.colName")}</span>
-        <span className="w-24 text-right">{t("main.colSize")}</span>
-        <span className="w-[120px] pl-5">{t("main.colType")}</span>
-        <span className="w-[150px] pl-5">{t("main.colModified")}</span>
-        <span className="w-[92px]" />
+    <div ref={parentRef} className="file-list-viewport min-w-0 flex-1 overflow-y-auto">
+      <div className="sticky top-0 z-1 flex h-9 items-center border-b border-border2 bg-panel px-5 text-[11px] font-medium text-muted-foreground">
+        <span className="min-w-0 flex-1">{t("main.colName")}</span>
+        <span className="file-column-size text-right">{t("main.colSize")}</span>
+        <span className="file-column-type pl-4">{t("main.colType")}</span>
+        <span className="file-column-modified pl-4">{t("main.colModified")}</span>
+        <span className="file-column-actions" />
       </div>
       <div className="relative" style={{ height: rowVirtualizer.getTotalSize() }}>
         {virtualItems.map((vi) => {
@@ -353,39 +352,38 @@ function ListView({
               {...handlers(entry)}
               title={isParent ? t("main.goToParent") : undefined}
               className={cn(
-                "group absolute inset-x-0 flex cursor-pointer items-center border-b border-border2 px-4",
+                "group absolute inset-x-0 flex cursor-pointer items-center border-b border-border2 px-5",
                 selected ? "bg-active" : "hover:bg-hover",
               )}
               style={{ height: vi.size, transform: `translateY(${vi.start}px)` }}
             >
-              {/* Selection marker. The row is itself absolutely positioned,
-               * which already makes it the containing block for this. */}
-              {selected && <span className="absolute inset-y-0 left-0 w-[2px] bg-primary" />}
               <span className="flex min-w-0 flex-1 items-center gap-[11px]">
                 <Icon
                   className="size-[18px] shrink-0"
                   style={isParent ? undefined : { color: meta!.color }}
                 />
                 <span
+                  title={entry.name}
                   className={cn(
-                    "truncate text-[13.5px] text-foreground",
-                    entry.is_prefix ? "font-semibold" : "font-medium",
+                    "truncate text-[13px]",
+                    selected ? "font-medium text-primary" : "text-foreground",
+                    entry.is_prefix && "font-medium",
                   )}
                 >
                   {entry.name}
                 </span>
               </span>
-              <span className="w-24 text-right text-[12.5px] text-muted-foreground tabular-nums">
+              <span className="file-column-size text-right text-[12px] text-muted-foreground tabular-nums">
                 {entry.is_prefix ? "—" : formatSize(entry.size)}
               </span>
-              <span className="w-[120px] truncate pl-5 text-[12.5px] text-muted-foreground">
+              <span className="file-column-type truncate pl-4 text-[12px] text-muted-foreground">
                 {isParent ? "—" : t(meta!.labelKey)}
               </span>
-              <span className="w-[150px] pl-5 text-[12.5px] text-muted-foreground tabular-nums">
+              <span className="file-column-modified pl-4 text-[12px] text-muted-foreground tabular-nums">
                 {entry.is_prefix ? "—" : formatDate(entry.last_modified)}
               </span>
               {isParent ? (
-                <span className="w-[92px] shrink-0" />
+                <span className="file-column-actions" />
               ) : (
                 <RowActions
                   entry={entry}
@@ -423,7 +421,7 @@ function GridView({
   const { hasNextPage, isFetchingNextPage, isPlaceholderData, fetchNextPage } = query;
   return (
     <div className="min-w-0 flex-1 overflow-y-auto">
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(148px,1fr))] gap-3.5 p-[18px]">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(148px,1fr))] gap-3 p-5">
         {entries.map((entry) => {
           const isParent = entry === PARENT_ENTRY;
           const ext = entry.is_prefix ? "" : extFromName(entry.name);
@@ -436,11 +434,11 @@ function GridView({
               {...handlers(entry)}
               title={isParent ? t("main.goToParent") : undefined}
               className={cn(
-                "flex cursor-pointer flex-col items-center gap-[11px] rounded-[13px] border px-3 pt-[18px] pb-3.5 hover:border-primary",
+                "flex cursor-pointer flex-col items-center gap-3 rounded-lg border px-3 pt-5 pb-3.5 hover:border-primary",
                 selected ? "border-primary bg-active" : "border-border bg-background",
               )}
             >
-              <span className="flex size-[58px] items-center justify-center rounded-[13px] bg-panel">
+              <span className="flex size-[58px] items-center justify-center rounded-lg bg-panel">
                 <Icon
                   className="size-[30px]"
                   style={isParent ? undefined : { color: meta!.color }}
@@ -645,7 +643,7 @@ export function FileBrowser() {
   }
 
   return (
-    <div className="relative flex min-w-0 flex-1 flex-col">
+    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       {body}
       {dragging && activeBucket && (
         <div className="pointer-events-none absolute inset-2 z-20 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-primary bg-primary-soft text-primary">
