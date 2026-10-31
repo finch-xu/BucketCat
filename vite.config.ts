@@ -8,8 +8,12 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
+  // Preserve Vite 7's WebView baseline when upgrading the build toolchain.
+  build: {
+    target: ["chrome107", "edge107", "firefox104", "safari16"],
+  },
   resolve: {
-    alias: { "@": path.resolve(__dirname, "./src") },
+    alias: { "@": path.resolve(import.meta.dirname, "./src") },
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

@@ -39,15 +39,10 @@ pub struct OssBucket {
     pub creation_date: Option<String>,
 }
 
-/// Decodes a `quick_xml` text event to a plain `String`: charset-decode
-/// (`BytesText::decode`) then XML-entity-unescape (`&amp;` -> `&`, etc. --
-/// `quick_xml::escape::unescape`, since `BytesText` itself has no
-/// `unescape()` method in this quick-xml version).
+/// Unescapes XML entities in a text event. quick-xml 0.42 exposes already
+/// decoded UTF-8 strings, including for events read from a byte buffer.
 fn xml_text(t: &BytesText<'_>) -> AppResult<String> {
-    let decoded = t.decode().map_err(|e| AppError::Internal {
-        message: format!("oss list-buckets: xml decode error: {e}"),
-    })?;
-    let unescaped = quick_xml::escape::unescape(&decoded).map_err(|e| AppError::Internal {
+    let unescaped = quick_xml::escape::unescape(t.as_ref()).map_err(|e| AppError::Internal {
         message: format!("oss list-buckets: xml unescape error: {e}"),
     })?;
     Ok(unescaped.into_owned())
@@ -84,7 +79,7 @@ pub fn parse_list_all_my_buckets(xml: &str) -> AppResult<Vec<OssBucket>> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let tag = e.name().as_ref().to_vec();
+                let tag = e.name().as_ref().as_bytes().to_vec();
                 match tag.as_slice() {
                     b"ListAllMyBucketsResult" => saw_root = true,
                     b"Bucket" => {
@@ -109,7 +104,7 @@ pub fn parse_list_all_my_buckets(xml: &str) -> AppResult<Vec<OssBucket>> {
                 }
             }
             Ok(Event::End(e)) => {
-                if e.name().as_ref() == b"Bucket" && in_bucket {
+                if e.name().as_ref() == "Bucket" && in_bucket {
                     let Some(bucket_name) = name.take() else {
                         return Err(AppError::Internal {
                             message: "oss list-buckets: <Bucket> missing <Name>".to_string(),
@@ -169,7 +164,7 @@ fn parse_error_fields(xml: &str) -> (Option<String>, Option<String>) {
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => current_tag = e.name().as_ref().to_vec(),
+            Ok(Event::Start(e)) => current_tag = e.name().as_ref().as_bytes().to_vec(),
             Ok(Event::Text(t)) => {
                 let Ok(text) = xml_text(&t) else { continue };
                 match current_tag.as_slice() {

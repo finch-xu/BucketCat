@@ -17,121 +17,55 @@ name = "bucketcat_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
-# `tray-icon` costs nothing here: `tray-icon` 0.24.1 and `muda` 0.19.3 are
-# already resolved in Cargo.lock as optional dependencies of `tauri` itself,
-# so turning the feature on adds zero new lock entries.
-tauri = { version = "2", features = ["tray-icon"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
-tokio-util = { version = "0.7.18", features = ["rt"] }
-# `default-features = false` + the four features below == the upstream `default`
-# set MINUS `rustls`. That one name is misleading: it does NOT select the TLS
-# stack the SDK actually dials with -- `default-https-client` does, and it
-# resolves to `aws-smithy-http-client/rustls-aws-lc`, i.e. rustls 0.23 +
-# rustls-webpki 0.103.x. `rustls` is the deprecated hyper-0.14 escape hatch
-# (`aws-smithy-runtime/tls-rustls` -> `aws-smithy-http-client/legacy-rustls-ring`),
-# only reachable by hand-building a legacy connector, which this crate never does.
-# Leaving it on cost a second, dead TLS stack in Cargo.lock -- rustls 0.21.12 with
-# rustls-webpki 0.101.7, a version line that has no patched release and therefore
-# permanently trips RUSTSEC-2026-0104 / -0099 / -0098. Turning it off drops nine
-# lock entries (hyper 0.14, h2 0.3, rustls 0.21, rustls-webpki 0.101, tokio-rustls
-# 0.24, hyper-rustls 0.24, sct, httpdate, socket2 0.5) and adds none.
-aws-sdk-s3 = { version = "1.137.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
-aes-gcm = "0.11.0"
+# Native tray integration.
+tauri = { version = "2.12.5", features = ["tray-icon"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+# Use the current HTTPS transport only. The SDK default `rustls` feature
+# enables a deprecated hyper 0.14 / rustls 0.21 stack that this app never uses
+# and that brings unpatched rustls-webpki advisories into the lockfile.
+aws-sdk-s3 = { version = "1.157.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aes-gcm = "0.11.1"
 hkdf = "0.13.0"
-sha2 = "0.11.0"
-rand = "0.10.2"
+sha2 = "0.11.1"
+rand = "0.10.3"
 machine-uid = "0.6.0"
-async-trait = "0.1.91"
-uuid = { version = "1.24.0", features = ["v4"] }
-percent-encoding = "2.3"
+async-trait = "0.1.92"
+uuid = { version = "1.29.0", features = ["v4"] }
+percent-encoding = "2.3.2"
 hmac = "0.13.0"
-quick-xml = "0.41"
-# --- OSS native ListBuckets transport (see `provider::oss_admin`) ---
-#
-# Deliberately NOT `reqwest`: `reqwest` 0.13.4 (as already resolved in
-# Cargo.lock, pulled in transitively as a *target-specific* dependency of
-# `tauri` for Android/iOS only) cannot get TLS support without its `rustls`
-# or `rustls-no-provider` feature, and BOTH of those unconditionally require
-# the `rustls-platform-verifier` optional dependency -- confirmed by actually
-# enabling each and inspecting `Cargo.lock`: it adds 7 new `[[package]]`
-# nodes (`rustls-platform-verifier`, `rustls-platform-verifier-android`,
-# `jni`, `jni-macros`, `simd_cesu8`, `simdutf8`, `webpki-root-certs`), none
-# of which exist in the lock today. That violates this task's hard
-# "zero new dependency-graph nodes" requirement. The crates below give the
-# same capability (build one signed HTTPS GET, read the response) using only
-# packages already resolved in Cargo.lock -- `hyper-rustls` 0.27.9 is already
-# pulled in by `aws-smithy-http-client` (aws-sdk-s3's own transport), with
-# `rustls-native-certs` and `aws-lc-rs` already active on that exact
-# `rustls` 0.23.42 instance -- so promoting these to direct dependencies adds
-# zero new lock entries (verified: `git diff Cargo.lock | grep -c '^+name = '`
-# is 0).
-rustls = "0.23"
-hyper-rustls = "0.27"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
-http = "1"
-http-body-util = "0.1"
-# Promoted to a direct dependency for `provider::s3`'s counting upload body,
-# which implements `http_body::Body` itself (to wrap a file read in a
-# progress-emitting adapter passed to `SdkBody::from_body_1_x`). Already
-# resolved at 1.1.0 in Cargo.lock -- both as `http-body-util`'s own
-# dependency and, via `aws-smithy-types`'s `http-body-1-x` feature (already
-# enabled transitively by `aws-sdk-s3`'s own `http-1x` feature), as
-# `aws-smithy-types`'s renamed `http-body-1-0` dependency -- so this adds
-# zero new lock entries, same test as the `rustls`/`hyper-rustls` block
-# above.
-http-body = "1"
-bytes = "1"
+quick-xml = "0.42.0"
+# OSS and B2 native API transport, sharing the AWS SDK HTTP/TLS stack.
+rustls = "0.23.46"
+hyper-rustls = "0.27.10"
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1", "tokio"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+# Counting upload body for progress reporting through SdkBody::from_body_1_x.
+http-body = "1.1.0"
+bytes = "1.12.1"
 # HTTP Basic auth for Backblaze's native `b2_authorize_account` (see
 # `provider::b2_admin`), which is the only credential scheme that API accepts.
-# Already resolved at 0.22.1 in Cargo.lock as a dependency of the AWS SDK's own
-# transport, so promoting it to a direct dependency adds zero new lock entries
-# -- the same test the hyper/rustls block above had to pass.
-base64 = "0.22"
+base64 = "0.23.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2.5"
-tauri-plugin-dialog = "2"
-# Launch-at-login. Unlike every other dependency here this one does add lock
-# entries (`auto-launch` and its own deps) -- the alternative was hand-rolling
-# a LaunchAgent plist, a HKCU\...\Run registry write and an XDG .desktop file,
-# of which only the macOS third could be tested from this machine. Used from
-# Rust only (see `commands::settings::set_autostart`): no npm package, and no
-# capability entry, since the frontend never invokes the plugin's own
-# commands.
-tauri-plugin-autostart = "2"
-# In-app updates. The second deliberate exception to the "zero new lock
-# entries" rule above (`tauri-plugin-autostart` was the first), and a much
-# larger one -- it pulls minisign verification, an archive reader and the
-# per-platform install machinery. Hand-rolling that means owning signature
-# verification of a downloaded executable, macOS bundle replacement, and the
-# Windows path where the NSIS installer takes over and kills the running
-# process. Getting any of those subtly wrong ships a remote-code-execution
-# hole, not a bug. The plugin is the same code Tauri's own release tooling
-# signs artifacts for, so it stays in lockstep with `createUpdaterArtifacts`.
-# Used from Rust only (see `commands::updater`): no npm package and no
-# capability entry, because the frontend never invokes the plugin's own
-# commands -- exactly the arrangement `tauri-plugin-autostart` already has.
-tauri-plugin-updater = "2"
-# Opening the two external links the UI has (the repo in Settings > About, the
-# release page in Settings > Update) in the user's browser. `<a target="_blank">`
-# cannot do this: inside the webview it asks the host to spawn a second webview,
-# wry registers no handler, and the click is silently dropped -- while dropping
-# the attribute would navigate the app's own webview away instead. The third
-# deliberate exception to the "zero new lock entries" rule; the entries it adds
-# are listed in Cargo.lock and come from the `open` crate. Preferred over
-# hand-rolling `Command::new("open" | "xdg-open" | "cmd /c start")` because that
-# spawns a shell with a URL on Windows and needs its own argument-injection
-# guard, whereas this plugin's capability entry pins the allowed URLs at build
-# time -- see `capabilities/default.json`, which permits exactly this repo's
-# GitHub paths and nothing else.
-tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2.8.4"
+# Launch-at-login, invoked only from Rust commands (no frontend capability).
+tauri-plugin-autostart = "2.7.0"
+# Signed in-app updates, matching Tauri createUpdaterArtifacts. Invoked only
+# from Rust so the frontend cannot call the plugin commands directly.
+tauri-plugin-updater = "2.14.1"
+# External links use the system browser, limited by capabilities/default.json
+# to the configured GitHub release/repository URLs.
+tauri-plugin-opener = "2.7.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -140,10 +74,8 @@ tempfile = "3.27.0"
 # with the very crate `tauri-plugin-opener` uses for that check, so the test
 # cannot drift from the runtime rule. Already resolved via `tauri`, so it adds
 # no lock entry.
-glob = "0.3"
-tokio = { version = "1.53.1", features = ["test-util", "macros", "rt-multi-thread"] }
-# Already resolved at 0.11.0 in the main dependency tree (see `[dependencies]`
-# above and Cargo.lock), so adding it here as a dev-dependency for the MinIO
-# end-to-end hash checks pulls no new crate and no extra compile.
-sha2 = "0.11.0"
+glob = "0.3.4"
+tokio = { version = "1.54.1", features = ["test-util", "macros", "rt-multi-thread"] }
+# Same SHA-256 implementation as production for MinIO end-to-end hash checks.
+sha2 = "0.11.1"
 

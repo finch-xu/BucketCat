@@ -1,0 +1,3 @@
+# Keep pnpm's one-day release quarantine, including during explicit updates.
+minimumReleaseAge: 1440
+minimumReleaseAgeStrict: true

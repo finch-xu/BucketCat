@@ -64,7 +64,7 @@
 
 ## 开发
 
-需要 Node 22+、pnpm 9+、Rust 1.94.1+。Linux 上另需 `libwebkit2gtk-4.1-dev`、`librsvg2-dev`、`libayatana-appindicator3-dev`、`patchelf`。
+需要 Node 22.12+（推荐 Node 24 LTS）、pnpm 12.16.1、Rust 1.94.1+。Linux 上另需 `libwebkit2gtk-4.1-dev`、`librsvg2-dev`、`libayatana-appindicator3-dev`、`patchelf`。
 
 ```bash
 pnpm install          # 安装前端依赖

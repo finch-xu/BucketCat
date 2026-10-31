@@ -64,7 +64,7 @@ Once installed, BucketCat checks for updates once at startup. A new version show
 
 ## Development
 
-You'll need Node 22+, pnpm 9+, and Rust 1.94.1+. On Linux, also install `libwebkit2gtk-4.1-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev`, and `patchelf`.
+You'll need Node 22.12+ (Node 24 LTS recommended), pnpm 12.16.1, and Rust 1.94.1+. On Linux, also install `libwebkit2gtk-4.1-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev`, and `patchelf`.
 
 ```bash
 pnpm install          # install frontend dependencies
