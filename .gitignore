@@ -53,3 +53,5 @@ dist-ssr
 
 # Tauri build-time generated files (ACL schemas, mobile projects)
 src-tauri/gen/
+
+designs/
